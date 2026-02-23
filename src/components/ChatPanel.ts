@@ -1,15 +1,15 @@
 /**
- * Chat Panel — slide-out AI assistant for querying dashboard data.
+ * Chat Panel — slide-out intelligence analyst for querying dashboard data.
  *
  * How it works:
  *   1. User opens chat via a button in the header
  *   2. Types a question about current events / dashboard data
  *   3. We gather context from visible panels (headlines, signals, alerts)
- *   4. Send question + context to the summarization chain (Ollama → Groq → OpenRouter → browser T5)
+ *   4. Send question + context + conversation history to /api/chat (multi-turn)
  *   5. Display the AI response in the chat
  *
- * The chat uses the existing summarizeArticle RPC with a 'chat' prompt mode.
- * If that's not supported, falls back to browser-side ML worker.
+ * Primary: POST /api/chat  (server-side LLM via Groq / OpenRouter)
+ * Fallback: browser-side ML worker (Transformers.js T5) if API is unreachable.
  */
 
 import { mlWorker } from '@/services/ml-worker';
@@ -100,7 +100,7 @@ export class ChatPanel {
 
     const title = document.createElement('span');
     title.className = 'chat-panel-title';
-    title.textContent = 'AI Assistant';
+    title.textContent = 'Monitor';
     header.appendChild(title);
 
     const closeBtn = document.createElement('button');
@@ -118,7 +118,7 @@ export class ChatPanel {
     // Welcome message
     const welcome = document.createElement('div');
     welcome.className = 'chat-message assistant';
-    welcome.textContent = 'Ask me anything about current events, signals, or the data on your dashboard.';
+    welcome.textContent = 'I\'m Monitor, your intelligence analyst. Ask me about any region, threat, market move, or pattern on the dashboard.';
     messagesContainer.appendChild(welcome);
 
     this.panelEl.appendChild(messagesContainer);
@@ -130,7 +130,7 @@ export class ChatPanel {
     const input = document.createElement('input');
     input.className = 'chat-input';
     input.type = 'text';
-    input.placeholder = 'Ask about current events...';
+    input.placeholder = 'Ask Monitor anything...';
     inputArea.appendChild(input);
 
     const sendBtn = document.createElement('button');
@@ -176,24 +176,48 @@ export class ChatPanel {
     loadingEl.classList.add('loading');
 
     try {
-      // Gather dashboard context
+      // Gather dashboard context from visible panels
       const context = this.contextGetter?.() ?? '';
 
-      // Build prompt: question + context
-      const prompt = context
-        ? `Dashboard context:\n${context}\n\nUser question: ${trimmed}\n\nAnswer concisely based on the dashboard data above.`
-        : trimmed;
+      // Build conversation history (last 10 messages) for multi-turn context
+      const history = this.messages.slice(-10).map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      }));
 
-      // Try browser-side ML worker (Transformers.js T5)
       let response = '';
-      if (mlWorker.isAvailable) {
-        const results = await mlWorker.summarize([prompt]);
-        response = results[0] || 'I could not generate a response. Try rephrasing your question.';
-      } else {
-        response = 'AI model is loading. Please try again in a few seconds.';
+
+      // Primary path: call the server-side /api/chat endpoint
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: trimmed, context, history }),
+        });
+
+        if (!res.ok) {
+          throw new Error(`API returned ${res.status}`);
+        }
+
+        const data = await res.json();
+        response = data.reply;
+      } catch (apiError) {
+        // Fallback: browser-side ML worker (Transformers.js T5)
+        console.warn('Chat API unavailable, falling back to ML worker:', apiError);
+
+        const prompt = context
+          ? `Dashboard context:\n${context}\n\nUser question: ${trimmed}\n\nAnswer concisely based on the dashboard data above.`
+          : trimmed;
+
+        if (mlWorker.isAvailable) {
+          const results = await mlWorker.summarize([prompt]);
+          response = results[0] || 'I could not generate a response. Try rephrasing your question.';
+        } else {
+          response = 'Monitor is temporarily unavailable. Please try again in a few seconds.';
+        }
       }
 
-      // Replace loading with actual response
+      // Replace loading indicator with actual response
       loadingEl.textContent = response;
       loadingEl.classList.remove('loading');
       this.messages.push({ role: 'assistant', content: response, timestamp: Date.now() });
