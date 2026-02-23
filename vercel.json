@@ -47,5 +47,11 @@
         { "key": "Cache-Control", "value": "public, max-age=86400" }
       ]
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily-digest",
+      "schedule": "0 0 * * *"
+    }
   ]
 }
