@@ -75,6 +75,9 @@ const MAX_HISTORY_LENGTH = 20;
 /** Positions older than this are pruned (1 hour in ms) */
 const HISTORY_WINDOW_MS = 60 * 60 * 1000;
 
+/** Hard cap on tracked callsigns to prevent unbounded memory growth */
+const MAX_TRACKED_CALLSIGNS = 5000;
+
 // ---------------------------------------------------------------------------
 // Circling detection thresholds
 // ---------------------------------------------------------------------------
@@ -367,6 +370,22 @@ export function detectAnomalies(flights: MilitaryFlight[]): FlightAnomaly[] {
   // Prune stale position histories so memory doesn't grow unbounded
   // ---------------------------------------------------------------
   pruneOldHistories(now);
+
+  // Hard cap: evict oldest callsigns if map exceeds maximum size
+  if (positionHistory.size > MAX_TRACKED_CALLSIGNS) {
+    const entries = [...positionHistory.entries()];
+    // Sort by most recent position timestamp (oldest first)
+    entries.sort((a, b) => {
+      const aLatest = a[1][a[1].length - 1]?.ts ?? 0;
+      const bLatest = b[1][b[1].length - 1]?.ts ?? 0;
+      return aLatest - bLatest;
+    });
+    const excessCount = positionHistory.size - MAX_TRACKED_CALLSIGNS;
+    for (let i = 0; i < excessCount; i++) {
+      const entry = entries[i];
+      if (entry) positionHistory.delete(entry[0]);
+    }
+  }
 
   return anomalies;
 }

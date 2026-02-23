@@ -22,6 +22,12 @@ import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 const RATE_LIMIT = 30;
 const RATE_WINDOW_SECONDS = 60;
 
+// --- Input validation limits ---
+const MAX_MESSAGE_LENGTH = 5000;
+const MAX_CONTEXT_LENGTH = 50000;
+const MAX_HISTORY_ENTRIES = 10;
+const MAX_HISTORY_MESSAGE_LENGTH = 5000;
+
 // --- LLM settings ---
 const TEMPERATURE = 0.3;
 const MAX_TOKENS = 500;
@@ -106,12 +112,33 @@ export default async function handler(request) {
 
   const { message, context, history } = payload;
 
-  // --- Validate: message is required ---
+  // --- Validate: message is required and within size limits ---
   if (!message || typeof message !== 'string') {
     return new Response(JSON.stringify({ error: 'Missing or invalid message' }), {
       status: 400,
       headers: { ...getCorsHeaders(request, 'POST, OPTIONS'), 'Content-Type': 'application/json' },
     });
+  }
+
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    return new Response(
+      JSON.stringify({ error: `Message too long (max ${MAX_MESSAGE_LENGTH} characters)` }),
+      {
+        status: 400,
+        headers: { ...getCorsHeaders(request, 'POST, OPTIONS'), 'Content-Type': 'application/json' },
+      }
+    );
+  }
+
+  // --- Validate context size (dashboard data can be large but not unbounded) ---
+  if (context && (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH)) {
+    return new Response(
+      JSON.stringify({ error: `Context too long (max ${MAX_CONTEXT_LENGTH} characters)` }),
+      {
+        status: 400,
+        headers: { ...getCorsHeaders(request, 'POST, OPTIONS'), 'Content-Type': 'application/json' },
+      }
+    );
   }
 
   // --- Build the messages array for the LLM ---
@@ -187,15 +214,19 @@ function buildMessages(message, context, history) {
     });
   }
 
-  // Include recent conversation history for continuity (max 10 turns)
+  // Include recent conversation history for continuity (max 10 turns, each capped)
   if (Array.isArray(history)) {
     const validRoles = new Set(['user', 'assistant']);
     const recentHistory = history
       .filter((msg) => validRoles.has(msg?.role) && typeof msg?.content === 'string')
-      .slice(-10); // Keep only the last 10 messages
+      .slice(-MAX_HISTORY_ENTRIES);
 
     for (const msg of recentHistory) {
-      messages.push({ role: msg.role, content: msg.content });
+      // Truncate individual history messages to prevent payload abuse
+      const content = msg.content.length > MAX_HISTORY_MESSAGE_LENGTH
+        ? msg.content.slice(0, MAX_HISTORY_MESSAGE_LENGTH)
+        : msg.content;
+      messages.push({ role: msg.role, content });
     }
   }
 

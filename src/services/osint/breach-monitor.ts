@@ -122,8 +122,13 @@ function indexByDomain(breaches: BreachInfo[]): void {
     // Skip breaches with no domain (some HIBP entries have empty domains)
     if (!domainKey) continue;
 
-    const existing = cachedBreaches.get(domainKey) ?? [];
-    cachedBreaches.set(domainKey, [...existing, breach]);
+    // Group breaches by domain — push to existing array to avoid O(n^2) spreading
+    const existing = cachedBreaches.get(domainKey);
+    if (existing) {
+      existing.push(breach);
+    } else {
+      cachedBreaches.set(domainKey, [breach]);
+    }
   }
 }
 

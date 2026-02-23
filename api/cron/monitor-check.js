@@ -36,10 +36,12 @@ const MAX_ARTICLE_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours
 // Main handler
 // ---------------------------------------------------------------------------
 export default async function handler(request) {
-  // Verify cron secret — Vercel sends this header on scheduled invocations
+  // Verify cron secret — Vercel sends this header on scheduled invocations.
+  // Block if secret is missing OR if the header doesn't match (prevents
+  // open-access when CRON_SECRET is accidentally unset in env vars).
   const authHeader = request.headers.get('authorization');
   const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new Response(JSON.stringify({ error: 'Unauthorized' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' },

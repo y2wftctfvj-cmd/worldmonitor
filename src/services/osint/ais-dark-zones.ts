@@ -72,6 +72,9 @@ const DARK_THRESHOLD_MS = 30 * 60 * 1000;
 /** Vessels not seen in 24 hours are pruned from the registry */
 const PRUNE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 
+/** Hard cap on registry size to prevent unbounded memory growth */
+const MAX_REGISTRY_SIZE = 10_000;
+
 // ---- Severity Thresholds ----
 
 const HIGH_SEVERITY_MS = 6 * 60 * 60 * 1000;   // > 6 hours dark
@@ -177,6 +180,17 @@ export function updateVesselPositions(
   for (const [mmsi, track] of vesselRegistry) {
     if (track.lastSeen < pruneThreshold) {
       vesselRegistry.delete(mmsi);
+    }
+  }
+
+  // Hard cap: evict oldest entries if registry exceeds maximum size
+  if (vesselRegistry.size > MAX_REGISTRY_SIZE) {
+    const sorted = [...vesselRegistry.entries()]
+      .sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    const excessCount = vesselRegistry.size - MAX_REGISTRY_SIZE;
+    for (let i = 0; i < excessCount; i++) {
+      const entry = sorted[i];
+      if (entry) vesselRegistry.delete(entry[0]);
     }
   }
 }

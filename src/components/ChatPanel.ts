@@ -179,8 +179,10 @@ export class ChatPanel {
       // Gather dashboard context from visible panels
       const context = this.contextGetter?.() ?? '';
 
-      // Build conversation history (last 10 messages) for multi-turn context
-      const history = this.messages.slice(-10).map((msg) => ({
+      // Build conversation history (last 10 messages) for multi-turn context.
+      // Exclude the current message (already sent as `message` field) to avoid
+      // duplication — the API endpoint appends it as the final user turn.
+      const history = this.messages.slice(-11, -1).map((msg) => ({
         role: msg.role,
         content: msg.content,
       }));
