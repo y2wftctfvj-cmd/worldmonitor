@@ -210,7 +210,7 @@ function parseChannelHtml(channel: string, html: string): TelegramPost[] {
     const textMatch = block.match(
       /class="tgme_widget_message_text"[^>]*>([\s\S]*?)<\/div>/
     );
-    const rawText = textMatch ? textMatch[1] : '';
+    const rawText = textMatch?.[1] ?? '';
     // Strip HTML tags and decode basic entities for clean text
     const text = stripHtml(rawText);
 
@@ -221,11 +221,11 @@ function parseChannelHtml(channel: string, html: string): TelegramPost[] {
     const viewsMatch = block.match(
       /class="tgme_widget_message_views"[^>]*>([^<]+)</
     );
-    const views = viewsMatch ? parseViewCount(viewsMatch[1].trim()) : 0;
+    const views = viewsMatch?.[1] ? parseViewCount(viewsMatch[1].trim()) : 0;
 
     // Extract timestamp from the <time> element's datetime attribute
     const timeMatch = block.match(/datetime="([^"]+)"/);
-    const timestamp = timeMatch ? new Date(timeMatch[1]).getTime() : 0;
+    const timestamp = timeMatch?.[1] ? new Date(timeMatch[1]).getTime() : 0;
 
     // Only include posts with valid text and a parseable timestamp
     if (text && timestamp > 0) {

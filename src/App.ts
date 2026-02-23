@@ -105,6 +105,8 @@ import { STOCK_EXCHANGES, FINANCIAL_CENTERS, CENTRAL_BANKS, COMMODITY_HUBS } fro
 import { fetchRedditIntel, type RedditIntel } from '@/services/osint/reddit';
 import { detectAnomalies as detectFlightAnomalies } from '@/services/osint/flight-anomalies';
 import { updateVesselPositions, detectDarkZones } from '@/services/osint/ais-dark-zones';
+import { fetchTelegramChannelIntel, type TelegramChannelIntel } from '@/services/osint/telegram-channels';
+import { aggregateThreatsByCountry } from '@/services/osint/virustotal-campaigns';
 import { evaluateScenarios, type DashboardState } from '@/services/prediction-engine';
 import { checkWatchlist } from '@/services/watchlist';
 import { isDesktopRuntime } from '@/services/runtime';
@@ -212,6 +214,7 @@ export class App {
   private alertCenter: AlertCenter;
   private chatPanel: ChatPanel;
   private latestRedditIntel: RedditIntel | null = null;
+  private latestTelegramIntel: TelegramChannelIntel | null = null;
 
   constructor(containerId: string) {
     const el = document.getElementById(containerId);
@@ -3177,6 +3180,14 @@ export class App {
       }
     }
 
+    // Telegram OSINT channel trending topics (if available)
+    if (this.latestTelegramIntel && this.latestTelegramIntel.trendingTopics.length > 0) {
+      lines.push('\nTelegram OSINT trending:');
+      for (const topic of this.latestTelegramIntel.trendingTopics.slice(0, 5)) {
+        lines.push(`- ${topic}`);
+      }
+    }
+
     // Active focus mode
     lines.push(`\nActive focus mode: ${this.activeFocusMode}`);
 
@@ -3330,6 +3341,11 @@ export class App {
     fetchRedditIntel()
       .then(intel => { this.latestRedditIntel = intel; })
       .catch(() => { /* Reddit intel is optional */ });
+
+    // Fetch Telegram channel intelligence (non-blocking background fetch)
+    fetchTelegramChannelIntel()
+      .then(intel => { this.latestTelegramIntel = intel; })
+      .catch(() => { /* Telegram intel is optional */ });
 
     // Always update search index regardless of individual task failures
     this.updateSearchIndex();
@@ -4282,6 +4298,24 @@ export class App {
       this.statusPanel?.updateFeed('Cyber Threats', { status: 'ok', itemCount: threats.length });
       this.statusPanel?.updateApi('Cyber Threats API', { status: 'ok' });
       dataFreshness.recordUpdate('cyber_threats', threats.length);
+
+      // Aggregate threats by country for geographic heatmap data
+      const threatsWithCountry = threats
+        .filter((t): t is typeof t & { country: string } => t.country != null && t.country !== '')
+        .map(t => ({ country: t.country, severity: t.severity, tags: t.tags }));
+      if (threatsWithCountry.length > 0) {
+        const geoSummary = aggregateThreatsByCountry(threatsWithCountry);
+        for (const geo of geoSummary) {
+          if (geo.severity === 'critical' || geo.severity === 'high') {
+            this.alertCenter.push(
+              geo.severity === 'critical' ? 'critical' : 'warning',
+              `Cyber Hotspot: ${geo.countryName}`,
+              `${geo.threatCount} threats detected — top malware: ${geo.topMalware.slice(0, 3).join(', ') || 'unknown'}`,
+              'cyber-geo',
+            );
+          }
+        }
+      }
     } catch (error) {
       this.map?.setLayerReady('cyberThreats', false);
       this.statusPanel?.updateFeed('Cyber Threats', { status: 'error', errorMessage: String(error) });
@@ -4859,5 +4893,12 @@ export class App {
         this.latestRedditIntel = await fetchRedditIntel();
       } catch { /* Reddit intel is optional */ }
     }, 15 * 60 * 1000);
+
+    // Refresh Telegram OSINT channel intel (every 10 minutes)
+    this.scheduleRefresh('telegram', async () => {
+      try {
+        this.latestTelegramIntel = await fetchTelegramChannelIntel();
+      } catch { /* Telegram intel is optional */ }
+    }, 10 * 60 * 1000);
   }
 }
