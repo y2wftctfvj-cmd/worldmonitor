@@ -151,14 +151,16 @@ const COUNTRY_NAMES: Record<string, string> = {
  * Returns immediately if enough time has passed since the last request.
  */
 async function enforceVtRateLimit(): Promise<void> {
-  const elapsed = Date.now() - lastVtRequest;
+  const now = Date.now();
+  const elapsed = now - lastVtRequest;
   const waitMs = VT_REQUEST_INTERVAL_MS - elapsed;
+
+  // Reserve the time slot immediately so concurrent callers see the updated timestamp
+  lastVtRequest = now + Math.max(0, waitMs);
 
   if (waitMs > 0) {
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
-
-  lastVtRequest = Date.now();
 }
 
 /**
@@ -264,10 +266,14 @@ export function aggregateThreatsByCountry(threats: ReadonlyArray<ThreatInput>): 
       confidenceCount: 0,
     };
 
-    // Increment threat count
-    const updated = {
+    // Create a new Map from existing tag counts (immutability: never mutate the shared Map)
+    const newTagCounts = new Map(existing.tagCounts);
+
+    // Increment threat count with a fresh tagCounts Map
+    let updated = {
       ...existing,
       threats: existing.threats + 1,
+      tagCounts: newTagCounts,
     };
 
     // Count tag occurrences for extracting top malware families
@@ -278,21 +284,34 @@ export function aggregateThreatsByCountry(threats: ReadonlyArray<ThreatInput>): 
       // Skip generic tags that are not malware-specific
       if (['botnet', 'c2', 'malware', 'phishing', 'spam'].includes(normalizedTag)) continue;
 
-      // Skip score tags from AbuseIPDB (e.g., "score:95")
-      if (normalizedTag.startsWith('score:')) continue;
+      // Extract confidence score from AbuseIPDB "score:XX" tags (Bug 2 fix)
+      if (normalizedTag.startsWith('score:')) {
+        const scoreVal = Number(normalizedTag.slice(6));
+        if (Number.isFinite(scoreVal) && scoreVal >= 0 && scoreVal <= 100) {
+          updated = {
+            ...updated,
+            confidenceSum: updated.confidenceSum + scoreVal,
+            confidenceCount: updated.confidenceCount + 1,
+          };
+        }
+        continue;
+      }
 
-      updated.tagCounts.set(normalizedTag, (existing.tagCounts.get(normalizedTag) || 0) + 1);
+      newTagCounts.set(normalizedTag, (newTagCounts.get(normalizedTag) || 0) + 1);
     }
 
-    // Accumulate confidence scores (only when present and valid)
+    // Also accumulate confidence from the abuseConfidence field (if present)
     if (
       typeof threat.abuseConfidence === 'number'
       && Number.isFinite(threat.abuseConfidence)
       && threat.abuseConfidence >= 0
       && threat.abuseConfidence <= 100
     ) {
-      updated.confidenceSum = existing.confidenceSum + threat.abuseConfidence;
-      updated.confidenceCount = existing.confidenceCount + 1;
+      updated = {
+        ...updated,
+        confidenceSum: updated.confidenceSum + threat.abuseConfidence,
+        confidenceCount: updated.confidenceCount + 1,
+      };
     }
 
     countryMap.set(countryCode, updated);
@@ -408,8 +427,8 @@ export async function checkDomainVt(
     vtDomainCache.set(cleanDomain, { report, cachedAt: Date.now() });
 
     return report;
-  } catch {
-    // Return null on any failure (timeout, network error, parse error)
+  } catch (error) {
+    console.warn('[VT] checkDomainVt failed:', error instanceof Error ? error.message : String(error));
     return null;
   } finally {
     clearTimeout(timeoutId);
@@ -504,8 +523,8 @@ export async function checkUrlVt(
     vtUrlCache.set(trimmedUrl, { report, cachedAt: Date.now() });
 
     return report;
-  } catch {
-    // Return null on any failure (timeout, network error, parse error)
+  } catch (error) {
+    console.warn('[VT] checkUrlVt failed:', error instanceof Error ? error.message : String(error));
     return null;
   } finally {
     clearTimeout(timeoutId);

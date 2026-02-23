@@ -6,7 +6,7 @@
  * Extracts trending topics by tokenizing post titles and counting word frequency.
  */
 
-import { STOP_WORDS } from '@/utils/analysis-constants';
+import { STOP_WORDS, SUPPRESSED_TRENDING_TERMS } from '@/utils/analysis-constants';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -132,12 +132,13 @@ export async function fetchRedditIntel(): Promise<RedditIntel> {
 /**
  * Fetch hot posts from a single subreddit.
  *
- * Uses Reddit's public JSON API (no auth required).
- * Includes a User-Agent header (Reddit blocks default fetch UA)
- * and an 8-second timeout to avoid hanging on slow responses.
+ * Uses Reddit's public JSON API (no auth required), proxied through
+ * /api/reddit to avoid browser CORS restrictions. The proxy (Vite dev
+ * server or Vercel Edge Function) sets the User-Agent header server-side.
+ * Includes an 8-second timeout to avoid hanging on slow responses.
  */
 async function fetchSubreddit(name: string): Promise<RedditPost[]> {
-  const url = `https://www.reddit.com/r/${name}/hot.json?limit=${POSTS_PER_SUBREDDIT}&raw_json=1`;
+  const url = `/api/reddit/r/${name}/hot.json?limit=${POSTS_PER_SUBREDDIT}&raw_json=1`;
 
   // AbortController gives us a clean timeout mechanism
   const controller = new AbortController();
@@ -146,10 +147,6 @@ async function fetchSubreddit(name: string): Promise<RedditPost[]> {
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        // Reddit requires a descriptive User-Agent; generic ones get 429s
-        'User-Agent': 'worldmonitor:osint-reddit:v1.0 (by worldmonitor)',
-      },
     });
 
     if (!response.ok) {
@@ -204,7 +201,7 @@ function extractTrendingTopics(titles: string[]): string[] {
       .toLowerCase()
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
-      .filter(word => word.length > 2 && !STOP_WORDS.has(word));
+      .filter(word => word.length > 2 && !STOP_WORDS.has(word) && !SUPPRESSED_TRENDING_TERMS.has(word));
 
     // Use a Set per title so each word only counts once per title
     // (prevents a single verbose title from dominating the counts)

@@ -666,6 +666,13 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/yahoo/, ''),
       },
+      // Reddit API — browser CORS blocks direct reddit.com fetches
+      '/api/reddit': {
+        target: 'https://www.reddit.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/reddit/, ''),
+        headers: { 'User-Agent': 'worldmonitor:osint-reddit:v1.0 (by worldmonitor)' },
+      },
       // Polymarket handled by polymarketPlugin() — no prod proxy needed
       // USGS Earthquake API
       '/api/earthquake': {
@@ -1029,6 +1036,13 @@ export default defineConfig({
             console.log('ADS-B Exchange proxy error:', err.message);
           });
         },
+      },
+      // Telegram OSINT - Public channel web preview proxy (bypasses CORS)
+      '/api/telegram-osint': {
+        target: 'https://t.me',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/telegram-osint/, ''),
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WorldMonitor/1.0)' },
       },
     },
   },

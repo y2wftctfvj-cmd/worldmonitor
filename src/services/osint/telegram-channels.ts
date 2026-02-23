@@ -141,7 +141,7 @@ export async function fetchTelegramChannelIntel(): Promise<TelegramChannelIntel>
  * generic bot/fetch user agents.
  */
 async function fetchChannel(name: string): Promise<TelegramPost[]> {
-  const url = `https://t.me/s/${name}`;
+  const url = `/api/telegram-osint/s/${name}`;
 
   // AbortController gives us a clean timeout mechanism
   const controller = new AbortController();
@@ -151,9 +151,7 @@ async function fetchChannel(name: string): Promise<TelegramPost[]> {
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
-        // Browser-like UA to avoid Telegram blocking the request
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        // Accept-Language hint -- User-Agent is handled by the proxy/edge function
         'Accept-Language': 'en-US,en;q=0.9',
       },
     });
@@ -207,8 +205,10 @@ function parseChannelHtml(channel: string, html: string): TelegramPost[] {
 
     // Extract message text from the widget message text div.
     // Strip HTML tags to get plain text content.
+    // Match text up to the footer/info div that always follows the message body.
+    // The old regex ([\s\S]*?<\/div>) stopped at the first nested </div>.
     const textMatch = block.match(
-      /class="tgme_widget_message_text"[^>]*>([\s\S]*?)<\/div>/
+      /class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*tgme_widget_message_(?:footer|info)/
     );
     const rawText = textMatch?.[1] ?? '';
     // Strip HTML tags and decode basic entities for clean text
@@ -218,8 +218,9 @@ function parseChannelHtml(channel: string, html: string): TelegramPost[] {
     if (!text.trim()) continue;
 
     // Extract view count (can be "1.2K", "5.6M", or plain number)
+    // Match view count even when Telegram wraps it in a nested <span>
     const viewsMatch = block.match(
-      /class="tgme_widget_message_views"[^>]*>([^<]+)</
+      /class="tgme_widget_message_views"[^>]*>[\s\S]*?(\d[\d.,KkMm]*)\s*<\/span>/
     );
     const views = viewsMatch?.[1] ? parseViewCount(viewsMatch[1].trim()) : 0;
 
