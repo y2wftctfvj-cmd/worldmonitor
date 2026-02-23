@@ -17,6 +17,11 @@ export default function middleware(request: Request) {
   const url = new URL(request.url);
   const path = url.pathname;
 
+  // Allow Telegram webhook — Telegram sends requests with bot-like UA
+  if (path.startsWith('/api/telegram-webhook')) {
+    return;
+  }
+
   // Allow social preview bots on exact OG routes only
   if (SOCIAL_PREVIEW_UA.test(ua) && SOCIAL_PREVIEW_PATHS.has(path)) {
     return;
