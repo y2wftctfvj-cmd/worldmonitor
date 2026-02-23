@@ -86,7 +86,7 @@
     },
     {
       "path": "/api/cron/monitor-check",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 12 * * *"
     }
   ]
 }

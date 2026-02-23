@@ -13,8 +13,8 @@
 
 // ---- Constants ----
 
-/** HIBP API v3 base URL */
-const HIBP_API = 'https://haveibeenpwned.com/api/v3';
+/** HIBP API v3 base URL — proxied through Vite/Vercel to avoid CORS */
+const HIBP_API = '/api/hibp/api/v3';
 
 /** Cache time-to-live: 1 hour in milliseconds */
 const CACHE_TTL_MS = 60 * 60 * 1000;

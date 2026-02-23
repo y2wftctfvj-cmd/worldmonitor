@@ -1,0 +1,7 @@
+src-tauri/
+node_modules/
+.planning/
+docs/
+e2e/
+scripts/
+*.md

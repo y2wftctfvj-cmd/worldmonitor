@@ -673,6 +673,13 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/reddit/, ''),
         headers: { 'User-Agent': 'worldmonitor:osint-reddit:v1.0 (by worldmonitor)' },
       },
+      // HIBP Breach API — browser CORS blocks direct haveibeenpwned.com fetches
+      '/api/hibp': {
+        target: 'https://haveibeenpwned.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/hibp/, ''),
+        headers: { 'User-Agent': 'worldmonitor:osint-breaches:v1.0 (by worldmonitor)' },
+      },
       // Polymarket handled by polymarketPlugin() — no prod proxy needed
       // USGS Earthquake API
       '/api/earthquake': {

@@ -3394,7 +3394,7 @@ export class App {
         (this.panels['osint-intel'] as OsintIntelPanel)?.setRedditIntel(intel);
         trendStore.record('reddit-posts', intel.posts.length);
       })
-      .catch(() => { /* Reddit intel is optional */ });
+      .catch((err) => { console.warn('[OSINT] Reddit fetch failed:', err.message); });
 
     // Fetch Telegram channel intelligence (non-blocking background fetch)
     fetchTelegramChannelIntel()
@@ -3403,7 +3403,7 @@ export class App {
         (this.panels['osint-intel'] as OsintIntelPanel)?.setTelegramIntel(intel);
         trendStore.record('telegram-posts', intel.posts.length);
       })
-      .catch(() => { /* Telegram intel is optional */ });
+      .catch((err) => { console.warn('[OSINT] Telegram fetch failed:', err.message); });
 
     // Fetch breach stats (non-blocking background fetch)
     getBreachStats()
@@ -3413,7 +3413,7 @@ export class App {
         trendStore.record('breaches', stats.recentCount);
         trendStore.record('breach-accounts', stats.totalPwned);
       })
-      .catch(() => { /* Breach monitor is optional */ });
+      .catch((err) => { console.warn('[OSINT] Breach fetch failed:', err.message); });
 
     // Always update search index regardless of individual task failures
     this.updateSearchIndex();
