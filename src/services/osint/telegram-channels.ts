@@ -17,14 +17,18 @@ import { STOP_WORDS } from '@/utils/analysis-constants';
 // Configuration
 // ---------------------------------------------------------------------------
 
-/** Public Telegram channels to monitor for geopolitical intelligence */
+/**
+ * Public Telegram channels to monitor for geopolitical intelligence.
+ * Only channels with public web previews enabled (t.me/s/) are usable.
+ * Channels that return 302 have disabled previews and must be replaced.
+ */
 const CHANNELS = [
-  'intelslava',
-  'ukraine_now',
-  'ryaborig',
-  'nexaborig',
-  'osaborig',
-  'militarysummary',
+  'intelslava',       // Intel Slava Z — conflict/geopolitical aggregator
+  'militarysummary',  // Military Summary — battlefield analysis
+  'RVvoenkor',        // Russian war correspondents — frontline reporting
+  'breakingmash',     // Mash — Russian breaking news aggregator
+  'legitimniy',       // Legitimniy — political/geopolitical commentary
+  'usaperiodical',    // USA Periodical — US news from Eastern perspective
 ] as const;
 
 /** Cache time-to-live: 10 minutes (avoids excessive Telegram requests) */
