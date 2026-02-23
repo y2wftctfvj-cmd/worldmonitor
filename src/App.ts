@@ -102,6 +102,11 @@ import { AI_RESEARCH_LABS } from '@/config/ai-research-labs';
 import { STARTUP_ECOSYSTEMS } from '@/config/startup-ecosystems';
 import { TECH_HQS, ACCELERATORS } from '@/config/tech-geo';
 import { STOCK_EXCHANGES, FINANCIAL_CENTERS, CENTRAL_BANKS, COMMODITY_HUBS } from '@/config/finance-geo';
+import { fetchRedditIntel, type RedditIntel } from '@/services/osint/reddit';
+import { detectAnomalies as detectFlightAnomalies } from '@/services/osint/flight-anomalies';
+import { updateVesselPositions, detectDarkZones } from '@/services/osint/ais-dark-zones';
+import { evaluateScenarios, type DashboardState } from '@/services/prediction-engine';
+import { checkWatchlist } from '@/services/watchlist';
 import { isDesktopRuntime } from '@/services/runtime';
 import { IntelligenceServiceClient } from '@/generated/client/worldmonitor/intelligence/v1/service_client';
 import { ResearchServiceClient } from '@/generated/client/worldmonitor/research/v1/service_client';
@@ -206,6 +211,7 @@ export class App {
   private activeFocusMode: string;
   private alertCenter: AlertCenter;
   private chatPanel: ChatPanel;
+  private latestRedditIntel: RedditIntel | null = null;
 
   constructor(containerId: string) {
     const el = document.getElementById(containerId);
@@ -3163,6 +3169,14 @@ export class App {
       }
     }
 
+    // Reddit trending topics (if available)
+    if (this.latestRedditIntel && this.latestRedditIntel.trendingTopics.length > 0) {
+      lines.push('\nReddit trending:');
+      for (const topic of this.latestRedditIntel.trendingTopics.slice(0, 5)) {
+        lines.push(`- ${topic}`);
+      }
+    }
+
     // Active focus mode
     lines.push(`\nActive focus mode: ${this.activeFocusMode}`);
 
@@ -3257,6 +3271,65 @@ export class App {
         console.error(`[App] ${tasks[idx]?.name} load failed:`, result.reason);
       }
     });
+
+    // --- Post-load OSINT enrichment (optional, non-blocking) ---
+
+    // Evaluate prediction scenarios using available dashboard state
+    try {
+      const ciiScores: Record<string, number> = {};
+      const ciiCalc = calculateCII();
+      for (const entry of ciiCalc) {
+        ciiScores[entry.code] = entry.score;
+      }
+      const convergences = detectGeoConvergence(this.seenGeoAlerts);
+      const dashState: DashboardState = {
+        ciiScores,
+        convergenceZones: convergences.map(c => ({
+          region: c.cellId,
+          score: c.score,
+          signalTypes: c.types,
+        })),
+        militaryFlightCount: this.intelligenceCache.military?.flights.length ?? 0,
+        militaryVesselCount: this.intelligenceCache.military?.vessels.length ?? 0,
+        oilPriceChange: 0,
+        marketChange: this.latestMarkets.length > 0
+          ? (this.latestMarkets[0]?.change ?? 0)
+          : 0,
+        activeOutages: this.intelligenceCache.outages?.length ?? 0,
+        protestCount: this.intelligenceCache.protests?.events.length ?? 0,
+        headlines: this.allNews.slice(0, 50).map(n => n.title),
+        signalTypes: [],
+      };
+      const predictions = evaluateScenarios(dashState);
+      for (const pred of predictions) {
+        this.alertCenter.push(
+          pred.confidence > 75 ? 'critical' : 'warning',
+          `Prediction: ${pred.scenarioName} (${pred.confidence}%)`,
+          `${pred.metCount}/${pred.totalCount} precursors met. ${pred.description}`,
+          'prediction',
+        );
+      }
+    } catch { /* prediction evaluation is optional */ }
+
+    // Check watchlist against current news headlines
+    try {
+      const newsHeadlines = this.allNews.map(n => n.title);
+      const signalTitles = this.latestClusters.map(c => c.primaryTitle);
+      const watchMatches = checkWatchlist(newsHeadlines, signalTitles);
+      for (const match of watchMatches) {
+        this.alertCenter.push(
+          'warning',
+          `Watchlist: ${match.query}`,
+          match.matchedSignal,
+          'watchlist',
+        );
+      }
+    } catch { /* watchlist is optional */ }
+
+    // Fetch Reddit intelligence (non-blocking background fetch)
+    fetchRedditIntel()
+      .then(intel => { this.latestRedditIntel = intel; })
+      .catch(() => { /* Reddit intel is optional */ });
 
     // Always update search index regardless of individual task failures
     this.updateSearchIndex();
@@ -4020,6 +4093,40 @@ export class App {
             }
           }
         }
+
+        // Detect flight anomalies (circling patterns, emergency squawks, altitude drops)
+        try {
+          const flightAnomalies = detectFlightAnomalies(flightData.flights);
+          for (const anomaly of flightAnomalies) {
+            this.alertCenter.push(
+              anomaly.severity === 'high' ? 'critical' : 'warning',
+              `Flight Anomaly: ${anomaly.callsign}`,
+              anomaly.description,
+              'flight-anomaly',
+            );
+          }
+        } catch { /* flight anomaly detection is optional */ }
+
+        // Track military vessel positions and detect AIS dark zones
+        try {
+          updateVesselPositions(vesselData.vessels.map(v => ({
+            mmsi: v.mmsi,
+            name: v.name || v.mmsi,
+            lat: v.lat,
+            lon: v.lon,
+          })));
+          const darkZoneAlerts = detectDarkZones();
+          for (const dz of darkZoneAlerts) {
+            if (dz.severity !== 'low') {
+              this.alertCenter.push(
+                'warning',
+                `Vessel Dark: ${dz.vesselName}`,
+                `Last seen near ${dz.zone} ${Math.round(dz.darkDuration / 60000)}min ago`,
+                'dark-zone',
+              );
+            }
+          }
+        } catch { /* dark zone detection is optional */ }
       } catch (error) {
         console.error('[Intelligence] Military fetch failed:', error);
         dataFreshness.recordError('opensky', String(error));
@@ -4745,5 +4852,12 @@ export class App {
       this.cyberThreatsCache = null;
       return this.loadCyberThreats();
     }, 10 * 60 * 1000, () => CYBER_LAYER_ENABLED && this.mapLayers.cyberThreats);
+
+    // Refresh Reddit OSINT intel (every 15 minutes)
+    this.scheduleRefresh('reddit', async () => {
+      try {
+        this.latestRedditIntel = await fetchRedditIntel();
+      } catch { /* Reddit intel is optional */ }
+    }, 15 * 60 * 1000);
   }
 }

@@ -192,14 +192,14 @@ function detectCirclingPattern(positions: PositionRecord[]): boolean {
 
   let maxGap = 0;
   for (let i = 1; i < sorted.length; i++) {
-    const gap = sorted[i] - sorted[i - 1];
+    const gap = (sorted[i] ?? 0) - (sorted[i - 1] ?? 0);
     if (gap > maxGap) {
       maxGap = gap;
     }
   }
 
   // Wrap-around gap: from last bearing back to first bearing (full circle)
-  const wrapGap = (2 * Math.PI) - (sorted[sorted.length - 1] - sorted[0]);
+  const wrapGap = (2 * Math.PI) - ((sorted[sorted.length - 1] ?? 0) - (sorted[0] ?? 0));
   if (wrapGap > maxGap) {
     maxGap = wrapGap;
   }
