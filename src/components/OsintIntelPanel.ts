@@ -16,6 +16,8 @@
 import { Panel } from './Panel';
 import { h, replaceChildren } from '@/utils/dom-utils';
 import { sanitizeUrl } from '@/utils/sanitize';
+import { trendStore } from '@/services/trend-store';
+import { renderSparklineSvg, getTrendColor, formatDelta } from '@/utils/sparkline';
 import type { RedditPost, RedditIntel } from '@/services/osint/reddit';
 import type { TelegramPost, TelegramChannelIntel } from '@/services/osint/telegram-channels';
 import type { BreachStats, BreachInfo } from '@/services/osint/breach-monitor';
@@ -160,6 +162,45 @@ export class OsintIntelPanel extends Panel {
   }
 
   // ---------------------------------------------------------------------------
+  // Sparkline trend bar — shows mini chart + delta for a metric key
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build a compact trend bar: [label] [sparkline SVG] [+12.3%]
+   * Shows trend over the last hour compared to the hour before that.
+   */
+  private buildTrendBar(label: string, trendKey: string): HTMLElement | null {
+    const series = trendStore.getSeries(trendKey);
+    if (series.length < 2) return null; // need at least 2 points for a trend
+
+    const values = series.map(p => p.value);
+    const delta = trendStore.getLatestDelta(trendKey, 60 * 60 * 1000); // 1-hour window
+    const deltaText = delta ? formatDelta(delta.changePercent) : '';
+    const deltaColor = delta ? getTrendColor(delta.changePercent) : 'var(--text-dim)';
+
+    const bar = h('div', { className: 'osint-trend-bar' },
+      h('span', { className: 'osint-trend-label' }, label),
+    );
+
+    // Safe innerHTML: renderSparklineSvg builds SVG entirely from numeric
+    // values — no user-supplied strings are interpolated (see sparkline.ts)
+    const sparkWrap = h('span', { className: 'sparkline-wrap' });
+    sparkWrap.innerHTML = renderSparklineSvg(values, {
+      width: 80, height: 20, color: deltaColor, showDot: true, showArea: true,
+    });
+    bar.appendChild(sparkWrap);
+
+    if (deltaText) {
+      bar.appendChild(h('span', {
+        className: 'osint-trend-delta',
+        style: `color: ${deltaColor}`,
+      }, deltaText));
+    }
+
+    return bar;
+  }
+
+  // ---------------------------------------------------------------------------
   // Rendering — dispatches to the correct tab renderer
   // ---------------------------------------------------------------------------
 
@@ -183,8 +224,11 @@ export class OsintIntelPanel extends Panel {
     }
 
     const { posts, trendingTopics } = this.redditIntel;
+    const trendBar = this.buildTrendBar('Post volume', 'reddit-posts');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        // Sparkline trend (shows after first few refreshes)
+        trendBar,
         // Trending topics bar
         trendingTopics.length > 0
           ? h('div', { className: 'osint-trending' },
@@ -225,8 +269,10 @@ export class OsintIntelPanel extends Panel {
     }
 
     const { posts, trendingTopics } = this.telegramIntel;
+    const trendBar = this.buildTrendBar('Post volume', 'telegram-posts');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        trendBar,
         trendingTopics.length > 0
           ? h('div', { className: 'osint-trending' },
               h('span', { className: 'osint-trending-label' }, 'Trending:'),
@@ -268,8 +314,10 @@ export class OsintIntelPanel extends Panel {
     }
 
     const { recentCount, totalPwned, topBreaches } = this.breachStats;
+    const trendBar = this.buildTrendBar('Breach count', 'breaches');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        trendBar,
         // Summary bar
         h('div', { className: 'osint-summary-bar' },
           h('div', { className: 'osint-stat' },
@@ -310,8 +358,10 @@ export class OsintIntelPanel extends Panel {
       return;
     }
 
+    const trendBar = this.buildTrendBar('Anomalies', 'flight-anomalies');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        trendBar,
         ...this.flightAnomalies.map(anomaly => this.buildFlightItem(anomaly)),
       ),
     );
@@ -341,8 +391,10 @@ export class OsintIntelPanel extends Panel {
       return;
     }
 
+    const trendBar = this.buildTrendBar('Dark vessels', 'dark-zones');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        trendBar,
         ...this.darkZoneAlerts.map(alert => this.buildDarkZoneItem(alert)),
       ),
     );
@@ -374,8 +426,10 @@ export class OsintIntelPanel extends Panel {
       return;
     }
 
+    const trendBar = this.buildTrendBar('Threat countries', 'cyber-threats-countries');
     replaceChildren(this.content,
       h('div', { className: 'osint-intel-list' },
+        trendBar,
         ...this.cyberGeoSummary.map(geo => this.buildCyberGeoItem(geo)),
       ),
     );

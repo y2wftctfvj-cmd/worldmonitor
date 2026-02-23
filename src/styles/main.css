@@ -8740,6 +8740,45 @@ a.prediction-link:hover {
   border-left-color: var(--warning);
 }
 
+/* Sparkline trend bar (inline chart + delta badge) */
+.osint-trend-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--overlay-subtle);
+}
+
+.osint-trend-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.osint-trend-bar .sparkline-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.osint-trend-bar .sparkline-wrap svg {
+  display: block;
+  width: 100%;
+  max-width: 120px;
+}
+
+.osint-trend-delta {
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
 /* Empty state within the OSINT panel */
 .osint-empty-state {
   padding: 24px 16px;

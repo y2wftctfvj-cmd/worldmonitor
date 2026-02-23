@@ -109,6 +109,7 @@ import { updateVesselPositions, detectDarkZones, type DarkZoneAlert } from '@/se
 import { fetchTelegramChannelIntel, type TelegramChannelIntel } from '@/services/osint/telegram-channels';
 import { aggregateThreatsByCountry, type ThreatGeoSummary } from '@/services/osint/virustotal-campaigns';
 import { getBreachStats, type BreachStats } from '@/services/osint/breach-monitor';
+import { trendStore } from '@/services/trend-store';
 import { evaluateScenarios, type DashboardState } from '@/services/prediction-engine';
 import { checkWatchlist } from '@/services/watchlist';
 import { isDesktopRuntime } from '@/services/runtime';
@@ -3391,6 +3392,7 @@ export class App {
       .then(intel => {
         this.latestRedditIntel = intel;
         (this.panels['osint-intel'] as OsintIntelPanel)?.setRedditIntel(intel);
+        trendStore.record('reddit-posts', intel.posts.length);
       })
       .catch(() => { /* Reddit intel is optional */ });
 
@@ -3399,6 +3401,7 @@ export class App {
       .then(intel => {
         this.latestTelegramIntel = intel;
         (this.panels['osint-intel'] as OsintIntelPanel)?.setTelegramIntel(intel);
+        trendStore.record('telegram-posts', intel.posts.length);
       })
       .catch(() => { /* Telegram intel is optional */ });
 
@@ -3407,6 +3410,8 @@ export class App {
       .then(stats => {
         this.latestBreachStats = stats;
         (this.panels['osint-intel'] as OsintIntelPanel)?.setBreachStats(stats);
+        trendStore.record('breaches', stats.recentCount);
+        trendStore.record('breach-accounts', stats.totalPwned);
       })
       .catch(() => { /* Breach monitor is optional */ });
 
@@ -4178,6 +4183,7 @@ export class App {
           const flightAnomalies = detectFlightAnomalies(flightData.flights);
           this.latestFlightAnomalies = flightAnomalies;
           (this.panels['osint-intel'] as OsintIntelPanel)?.setFlightAnomalies(flightAnomalies);
+          trendStore.record('flight-anomalies', flightAnomalies.length);
           for (const anomaly of flightAnomalies) {
             this.alertCenter.push(
               anomaly.severity === 'high' ? 'critical' : 'warning',
@@ -4199,6 +4205,7 @@ export class App {
           const darkZoneAlerts = detectDarkZones();
           this.latestDarkZoneAlerts = darkZoneAlerts;
           (this.panels['osint-intel'] as OsintIntelPanel)?.setDarkZoneAlerts(darkZoneAlerts);
+          trendStore.record('dark-zones', darkZoneAlerts.length);
           for (const dz of darkZoneAlerts) {
             if (dz.severity !== 'low') {
               this.alertCenter.push(
@@ -4374,6 +4381,8 @@ export class App {
         const geoSummary = aggregateThreatsByCountry(threatsWithCountry);
         this.latestCyberGeoSummary = geoSummary;
         (this.panels['osint-intel'] as OsintIntelPanel)?.setCyberGeoSummary(geoSummary);
+        trendStore.record('cyber-threats-countries', geoSummary.length);
+        trendStore.record('cyber-threats-total', threatsWithCountry.length);
         for (const geo of geoSummary) {
           if (geo.severity === 'critical' || geo.severity === 'high') {
             this.alertCenter.push(
@@ -4961,6 +4970,7 @@ export class App {
       try {
         this.latestRedditIntel = await fetchRedditIntel();
         (this.panels['osint-intel'] as OsintIntelPanel)?.setRedditIntel(this.latestRedditIntel);
+        trendStore.record('reddit-posts', this.latestRedditIntel.posts.length);
       } catch { /* Reddit intel is optional */ }
     }, 15 * 60 * 1000);
 
@@ -4969,6 +4979,7 @@ export class App {
       try {
         this.latestTelegramIntel = await fetchTelegramChannelIntel();
         (this.panels['osint-intel'] as OsintIntelPanel)?.setTelegramIntel(this.latestTelegramIntel);
+        trendStore.record('telegram-posts', this.latestTelegramIntel.posts.length);
       } catch { /* Telegram intel is optional */ }
     }, 10 * 60 * 1000);
 
@@ -4977,6 +4988,7 @@ export class App {
       try {
         this.latestBreachStats = await getBreachStats();
         (this.panels['osint-intel'] as OsintIntelPanel)?.setBreachStats(this.latestBreachStats);
+        trendStore.record('breaches', this.latestBreachStats.recentCount);
       } catch { /* Breach monitor is optional */ }
     }, 60 * 60 * 1000);
   }
