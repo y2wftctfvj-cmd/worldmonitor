@@ -8542,6 +8542,212 @@ a.prediction-link:hover {
   overflow: hidden;
 }
 
+/* ==========================================================================
+   OSINT Intelligence Panel
+   ========================================================================== */
+
+.osint-intel-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 10px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.osint-intel-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.osint-intel-tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.osint-intel-tab:hover {
+  color: var(--text);
+  background: var(--overlay-subtle);
+}
+
+.osint-intel-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.osint-intel-tab .tab-icon {
+  font-size: 12px;
+}
+
+.osint-intel-tab .tab-label {
+  font-weight: 500;
+}
+
+.osint-intel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.osint-intel-item {
+  display: block;
+  padding: 10px 12px;
+  text-decoration: none;
+  color: inherit;
+  transition: background 0.15s ease;
+  border-left: 2px solid transparent;
+}
+
+.osint-intel-item:hover {
+  background: var(--overlay-light);
+  border-left-color: var(--accent);
+}
+
+.osint-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  gap: 8px;
+}
+
+.osint-item-source {
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.osint-item-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.osint-item-title {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  display: -webkit-box;
+  line-clamp: 3;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.osint-item-detail {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 3px;
+  line-height: 1.3;
+}
+
+/* Trending topics bar */
+.osint-trending {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.osint-trending::-webkit-scrollbar {
+  display: none;
+}
+
+.osint-trending-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  flex-shrink: 0;
+}
+
+.osint-trending-tag {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--overlay-subtle);
+  color: var(--accent);
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+/* Breach summary stats bar */
+.osint-summary-bar {
+  display: flex;
+  gap: 16px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.osint-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.osint-stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1;
+}
+
+.osint-stat-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+/* Severity color coding for flight anomalies, dark zones, cyber geo */
+.osint-severity-high {
+  border-left-color: var(--danger) !important;
+}
+
+.osint-severity-medium {
+  border-left-color: var(--warning) !important;
+}
+
+.osint-severity-low {
+  border-left-color: var(--text-dim) !important;
+}
+
+.osint-severity-critical {
+  border-left-color: var(--danger) !important;
+  background: rgba(var(--danger-rgb, 255, 68, 68), 0.05);
+}
+
+.osint-breach-item {
+  border-left-color: var(--warning);
+}
+
+/* Empty state within the OSINT panel */
+.osint-empty-state {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 /* Hotspot GDELT Context */
 .hotspot-gdelt-context {
   margin-top: 12px;

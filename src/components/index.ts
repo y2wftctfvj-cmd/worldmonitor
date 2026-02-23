@@ -40,3 +40,4 @@ export * from './InvestmentsPanel';
 export * from './LanguageSelector';
 export * from './AlertCenter';
 export * from './ChatPanel';
+export * from './OsintIntelPanel';

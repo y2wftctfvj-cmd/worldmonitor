@@ -27,6 +27,7 @@ import { signalAggregator } from '@/services/signal-aggregator';
 import { updateAndCheck } from '@/services/temporal-baseline';
 import { fetchAllFires, flattenFires, computeRegionStats, toMapFires } from '@/services/wildfires';
 import { SatelliteFiresPanel } from '@/components/SatelliteFiresPanel';
+import { OsintIntelPanel } from '@/components/OsintIntelPanel';
 import { analyzeFlightsForSurge, surgeAlertToSignal, detectForeignMilitaryPresence, foreignPresenceToSignal, type TheaterPostureSummary } from '@/services/military-surge';
 import { fetchCachedTheaterPosture } from '@/services/cached-theater-posture';
 import { ingestProtestsForCII, ingestMilitaryForCII, ingestNewsForCII, ingestOutagesForCII, ingestConflictsForCII, ingestUcdpForCII, ingestHapiForCII, ingestDisplacementForCII, ingestClimateForCII, startLearning, isInLearningMode, calculateCII, getCountryData, TIER1_COUNTRIES } from '@/services/country-instability';
@@ -103,10 +104,11 @@ import { STARTUP_ECOSYSTEMS } from '@/config/startup-ecosystems';
 import { TECH_HQS, ACCELERATORS } from '@/config/tech-geo';
 import { STOCK_EXCHANGES, FINANCIAL_CENTERS, CENTRAL_BANKS, COMMODITY_HUBS } from '@/config/finance-geo';
 import { fetchRedditIntel, type RedditIntel } from '@/services/osint/reddit';
-import { detectAnomalies as detectFlightAnomalies } from '@/services/osint/flight-anomalies';
-import { updateVesselPositions, detectDarkZones } from '@/services/osint/ais-dark-zones';
+import { detectAnomalies as detectFlightAnomalies, type FlightAnomaly } from '@/services/osint/flight-anomalies';
+import { updateVesselPositions, detectDarkZones, type DarkZoneAlert } from '@/services/osint/ais-dark-zones';
 import { fetchTelegramChannelIntel, type TelegramChannelIntel } from '@/services/osint/telegram-channels';
-import { aggregateThreatsByCountry } from '@/services/osint/virustotal-campaigns';
+import { aggregateThreatsByCountry, type ThreatGeoSummary } from '@/services/osint/virustotal-campaigns';
+import { getBreachStats, type BreachStats } from '@/services/osint/breach-monitor';
 import { evaluateScenarios, type DashboardState } from '@/services/prediction-engine';
 import { checkWatchlist } from '@/services/watchlist';
 import { isDesktopRuntime } from '@/services/runtime';
@@ -215,6 +217,10 @@ export class App {
   private chatPanel: ChatPanel;
   private latestRedditIntel: RedditIntel | null = null;
   private latestTelegramIntel: TelegramChannelIntel | null = null;
+  private latestBreachStats: BreachStats | null = null;
+  private latestFlightAnomalies: FlightAnomaly[] = [];
+  private latestDarkZoneAlerts: DarkZoneAlert[] = [];
+  private latestCyberGeoSummary: ThreatGeoSummary[] = [];
 
   constructor(containerId: string) {
     const el = document.getElementById(containerId);
@@ -2408,6 +2414,10 @@ export class App {
     this.panels['etf-flows'] = new ETFFlowsPanel();
     this.panels['stablecoins'] = new StablecoinPanel();
 
+    // OSINT Intelligence Panel — aggregates Reddit, Telegram, breaches, flights, dark zones, cyber geo
+    const osintIntelPanel = new OsintIntelPanel();
+    this.panels['osint-intel'] = osintIntelPanel;
+
     // AI Insights Panel (desktop only - hides itself on mobile)
     const insightsPanel = new InsightsPanel();
     this.panels['insights'] = insightsPanel;
@@ -3188,6 +3198,45 @@ export class App {
       }
     }
 
+    // Breach stats (if available)
+    if (this.latestBreachStats && this.latestBreachStats.recentCount > 0) {
+      const fmtNum = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(0)}K` : String(n);
+      lines.push(`\nRecent data breaches: ${this.latestBreachStats.recentCount} in last 30 days, ${fmtNum(this.latestBreachStats.totalPwned)} accounts exposed`);
+      for (const b of this.latestBreachStats.topBreaches.slice(0, 3)) {
+        lines.push(`- ${b.title}: ${fmtNum(b.pwnCount)} accounts (${b.dataClasses.slice(0, 3).join(', ')})`);
+      }
+    }
+
+    // Flight anomalies (if any active)
+    if (this.latestFlightAnomalies.length > 0) {
+      lines.push(`\nActive flight anomalies: ${this.latestFlightAnomalies.length}`);
+      for (const a of this.latestFlightAnomalies.slice(0, 3)) {
+        lines.push(`- ${a.callsign}: ${a.description} (${a.severity})`);
+      }
+    }
+
+    // AIS dark zone alerts (if any active)
+    if (this.latestDarkZoneAlerts.length > 0) {
+      const nonLow = this.latestDarkZoneAlerts.filter(d => d.severity !== 'low');
+      if (nonLow.length > 0) {
+        lines.push(`\nVessels dark in sensitive zones: ${nonLow.length}`);
+        for (const d of nonLow.slice(0, 3)) {
+          lines.push(`- ${d.vesselName}: dark near ${d.zone} for ${Math.round(d.darkDuration / 60000)}min`);
+        }
+      }
+    }
+
+    // Cyber threat geo hotspots (high/critical only)
+    if (this.latestCyberGeoSummary.length > 0) {
+      const hot = this.latestCyberGeoSummary.filter(g => g.severity === 'critical' || g.severity === 'high');
+      if (hot.length > 0) {
+        lines.push(`\nCyber threat hotspots: ${hot.length} countries`);
+        for (const g of hot.slice(0, 3)) {
+          lines.push(`- ${g.countryName}: ${g.threatCount} threats (${g.severity})`);
+        }
+      }
+    }
+
     // Active focus mode
     lines.push(`\nActive focus mode: ${this.activeFocusMode}`);
 
@@ -3339,13 +3388,27 @@ export class App {
 
     // Fetch Reddit intelligence (non-blocking background fetch)
     fetchRedditIntel()
-      .then(intel => { this.latestRedditIntel = intel; })
+      .then(intel => {
+        this.latestRedditIntel = intel;
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setRedditIntel(intel);
+      })
       .catch(() => { /* Reddit intel is optional */ });
 
     // Fetch Telegram channel intelligence (non-blocking background fetch)
     fetchTelegramChannelIntel()
-      .then(intel => { this.latestTelegramIntel = intel; })
+      .then(intel => {
+        this.latestTelegramIntel = intel;
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setTelegramIntel(intel);
+      })
       .catch(() => { /* Telegram intel is optional */ });
+
+    // Fetch breach stats (non-blocking background fetch)
+    getBreachStats()
+      .then(stats => {
+        this.latestBreachStats = stats;
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setBreachStats(stats);
+      })
+      .catch(() => { /* Breach monitor is optional */ });
 
     // Always update search index regardless of individual task failures
     this.updateSearchIndex();
@@ -4113,6 +4176,8 @@ export class App {
         // Detect flight anomalies (circling patterns, emergency squawks, altitude drops)
         try {
           const flightAnomalies = detectFlightAnomalies(flightData.flights);
+          this.latestFlightAnomalies = flightAnomalies;
+          (this.panels['osint-intel'] as OsintIntelPanel)?.setFlightAnomalies(flightAnomalies);
           for (const anomaly of flightAnomalies) {
             this.alertCenter.push(
               anomaly.severity === 'high' ? 'critical' : 'warning',
@@ -4132,6 +4197,8 @@ export class App {
             lon: v.lon,
           })));
           const darkZoneAlerts = detectDarkZones();
+          this.latestDarkZoneAlerts = darkZoneAlerts;
+          (this.panels['osint-intel'] as OsintIntelPanel)?.setDarkZoneAlerts(darkZoneAlerts);
           for (const dz of darkZoneAlerts) {
             if (dz.severity !== 'low') {
               this.alertCenter.push(
@@ -4305,6 +4372,8 @@ export class App {
         .map(t => ({ country: t.country, severity: t.severity, tags: t.tags }));
       if (threatsWithCountry.length > 0) {
         const geoSummary = aggregateThreatsByCountry(threatsWithCountry);
+        this.latestCyberGeoSummary = geoSummary;
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setCyberGeoSummary(geoSummary);
         for (const geo of geoSummary) {
           if (geo.severity === 'critical' || geo.severity === 'high') {
             this.alertCenter.push(
@@ -4891,6 +4960,7 @@ export class App {
     this.scheduleRefresh('reddit', async () => {
       try {
         this.latestRedditIntel = await fetchRedditIntel();
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setRedditIntel(this.latestRedditIntel);
       } catch { /* Reddit intel is optional */ }
     }, 15 * 60 * 1000);
 
@@ -4898,7 +4968,16 @@ export class App {
     this.scheduleRefresh('telegram', async () => {
       try {
         this.latestTelegramIntel = await fetchTelegramChannelIntel();
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setTelegramIntel(this.latestTelegramIntel);
       } catch { /* Telegram intel is optional */ }
     }, 10 * 60 * 1000);
+
+    // Refresh breach stats (every 60 minutes — HIBP data changes slowly)
+    this.scheduleRefresh('breaches', async () => {
+      try {
+        this.latestBreachStats = await getBreachStats();
+        (this.panels['osint-intel'] as OsintIntelPanel)?.setBreachStats(this.latestBreachStats);
+      } catch { /* Breach monitor is optional */ }
+    }, 60 * 60 * 1000);
   }
 }
