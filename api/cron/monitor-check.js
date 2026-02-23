@@ -269,10 +269,12 @@ async function sendTelegramAlert(botToken, chatId, alert) {
   // Severity emoji: critical = red circle, warning = yellow circle
   const emoji = alert.severity === 'critical' ? '\u{1F534}' : '\u{1F7E1}';
   const text = [
-    `${emoji} *World Monitor Alert*`,
+    `${emoji} *MONITOR ALERT*`,
     '',
     `*${escapeMarkdown(alert.title)}*`,
     escapeMarkdown(alert.body || ''),
+    '',
+    '_Monitoring continues\\._',
   ].join('\n');
 
   const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;

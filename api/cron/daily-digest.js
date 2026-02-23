@@ -192,8 +192,8 @@ async function generateAiInsight(headlines, marketQuotes) {
     ? marketQuotes.map((q) => `${q.label} (${q.symbol}): $${q.price} (${q.changePercent >= 0 ? '+' : ''}${q.changePercent?.toFixed(2) ?? '?'}%)`).join('\n')
     : 'No market data available.';
 
-  const systemPrompt = 'You are a concise financial analyst. Respond with exactly 2 sentences.';
-  const userPrompt = `Given today's top headlines:\n${headlineSummary}\n\nAnd market data:\n${marketSummary}\n\nProvide a 2-sentence insight connecting the headlines to market movements. Be specific and actionable.`;
+  const systemPrompt = 'You are Monitor, a senior intelligence analyst. Given today\'s headlines and market data, provide a 2-sentence intelligence assessment. Be direct, reference specific data points, and flag anything that warrants overnight watch. Sign off with a single actionable recommendation.';
+  const userPrompt = `Given today's top headlines:\n${headlineSummary}\n\nAnd market data:\n${marketSummary}\n\nProvide your intelligence assessment.`;
 
   try {
     const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -253,7 +253,7 @@ function buildDigestMessage(headlines, marketQuotes, aiInsight) {
   const parts = [];
 
   // Header
-  parts.push(`*World Monitor Daily Digest*`);
+  parts.push(`*MONITOR \u2014 Evening Brief*`);
   parts.push(escapeMarkdown(dateStr));
   parts.push(''); // blank line
 
@@ -288,12 +288,14 @@ function buildDigestMessage(headlines, marketQuotes, aiInsight) {
   parts.push(''); // blank line
 
   // --- AI INSIGHT ---
-  parts.push('*AI INSIGHT*');
+  parts.push('*INTELLIGENCE ASSESSMENT*');
   if (aiInsight) {
     parts.push(escapeMarkdown(aiInsight));
   } else {
     parts.push(escapeMarkdown('AI insight unavailable.'));
   }
+  parts.push(''); // blank line
+  parts.push('_Monitor is watching\\. Sleep well\\._');
 
   return parts.join('\n');
 }
