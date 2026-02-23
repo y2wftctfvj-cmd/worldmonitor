@@ -6,7 +6,7 @@ import {
 import type { CableHealthRecord, CableHealthResponse, CableHealthStatus } from '@/types';
 import { createCircuitBreaker } from '@/utils';
 
-const client = new InfrastructureServiceClient('', { fetch: fetch.bind(globalThis) });
+const client = new InfrastructureServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
 const breaker = createCircuitBreaker<GetCableHealthResponse>({ name: 'Cable Health' });
 const emptyFallback: GetCableHealthResponse = { generatedAt: 0, cables: {} };
 

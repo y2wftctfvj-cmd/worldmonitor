@@ -465,6 +465,19 @@ export class RuntimeConfigPanel extends Panel {
             }
           }
           this.updateFeatureCardStatus(key);
+
+          // Update inline status text to reflect staged state
+          const statusEl = input.closest('.runtime-secret-row')?.querySelector('.runtime-secret-status');
+          if (statusEl) {
+            statusEl.textContent = result.valid ? t('modals.runtimeConfig.status.staged') : t('modals.runtimeConfig.status.invalid');
+            statusEl.className = `runtime-secret-status ${result.valid ? 'staged' : 'warn'}`;
+          }
+
+          // When Ollama URL is staged, auto-fetch available models
+          if (key === 'OLLAMA_API_URL' && result.valid) {
+            const modelSelect = this.content.querySelector<HTMLSelectElement>('select[data-model-select]');
+            if (modelSelect) void this.fetchOllamaModels(modelSelect);
+          }
         } else {
           void setSecretValue(key, raw);
           input.value = '';

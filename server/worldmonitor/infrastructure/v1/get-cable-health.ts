@@ -9,6 +9,7 @@ import type {
 
 import { getCachedJson, setCachedJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS } from './_shared';
+import { CHROME_UA } from '../../../_shared/constants';
 
 // ========================================================================
 // Constants
@@ -121,7 +122,7 @@ async function fetchNgaWarnings(): Promise<NgaWarning[]> {
   try {
     const res = await fetch(
       'https://msi.nga.mil/api/publications/broadcast-warn?output=json&status=A',
-      { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) },
+      { headers: { 'User-Agent': CHROME_UA }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) },
     );
     if (!res.ok) return [];
     const data = await res.json();

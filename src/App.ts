@@ -190,6 +190,8 @@ export class App {
   private seenGeoAlerts: Set<string> = new Set();
   private snapshotIntervalId: ReturnType<typeof setInterval> | null = null;
   private refreshTimeoutIds: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private refreshRunners = new Map<string, { run: () => Promise<void>; intervalMs: number }>();
+  private hiddenSince = 0;
   private isDestroyed = false;
   private boundKeydownHandler: ((e: KeyboardEvent) => void) | null = null;
   private boundFullscreenHandler: (() => void) | null = null;
@@ -1327,7 +1329,7 @@ export class App {
   }
 
   private shouldShowIntelligenceNotifications(): boolean {
-    return !this.isMobile && !!this.findingsBadge?.isEnabled();
+    return !this.isMobile && !!this.findingsBadge?.isEnabled() && !!this.findingsBadge?.isPopupEnabled();
   }
 
   private setupSearchModal(): void {
@@ -2093,6 +2095,7 @@ export class App {
       clearTimeout(timeoutId);
     }
     this.refreshTimeoutIds.clear();
+    this.refreshRunners.clear();
 
     // Remove global event listeners
     if (this.boundKeydownHandler) {
@@ -2698,6 +2701,26 @@ export class App {
       document.getElementById('settingsModal')?.classList.add('active');
     });
 
+    // Sync panel state when settings are changed in the separate settings window
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_KEYS.panels && e.newValue) {
+        try {
+          this.panelSettings = JSON.parse(e.newValue) as Record<string, PanelConfig>;
+          this.applyPanelSettings();
+          this.renderPanelToggles();
+        } catch (_) {}
+      }
+      if (e.key === 'worldmonitor-intel-findings' && this.findingsBadge) {
+        this.findingsBadge.setEnabled(e.newValue !== 'hidden');
+      }
+      if (e.key === STORAGE_KEYS.liveChannels && e.newValue) {
+        const panel = this.panels['live-news'];
+        if (panel && typeof (panel as unknown as { refreshChannelsFromStorage?: () => void }).refreshChannelsFromStorage === 'function') {
+          (panel as unknown as { refreshChannelsFromStorage: () => void }).refreshChannelsFromStorage();
+        }
+      }
+    });
+
     document.getElementById('modalClose')?.addEventListener('click', () => {
       document.getElementById('settingsModal')?.classList.remove('active');
     });
@@ -2771,13 +2794,16 @@ export class App {
     // Map pin toggle
     this.setupMapPin();
 
-    // Pause animations when tab is hidden, unload ML models to free memory
+    // Pause animations when tab is hidden, unload ML models to free memory.
+    // On return, flush any data refreshes that went stale while hidden.
     this.boundVisibilityHandler = () => {
       document.body.classList.toggle('animations-paused', document.hidden);
       if (document.hidden) {
+        this.hiddenSince = this.hiddenSince || Date.now();
         mlWorker.unloadOptionalModels();
       } else {
         this.resetIdleTimer();
+        this.flushStaleRefreshes();
       }
     };
     document.addEventListener('visibilitychange', this.boundVisibilityHandler);
@@ -2894,11 +2920,11 @@ export class App {
 
   private toggleFullscreen(): void {
     if (document.fullscreenElement) {
-      void document.exitFullscreen().catch(() => {});
+      try { void document.exitFullscreen()?.catch(() => {}); } catch {}
     } else {
       const el = document.documentElement as HTMLElement & { webkitRequestFullscreen?: () => void };
       if (el.requestFullscreen) {
-        void el.requestFullscreen().catch(() => {});
+        try { void el.requestFullscreen()?.catch(() => {}); } catch {}
       } else if (el.webkitRequestFullscreen) {
         try { el.webkitRequestFullscreen(); } catch {}
       }
@@ -4927,7 +4953,25 @@ export class App {
         scheduleNext(computeDelay(intervalMs, false));
       }
     };
+    this.refreshRunners.set(name, { run, intervalMs });
     scheduleNext(computeDelay(intervalMs, document.visibilityState === 'hidden'));
+  }
+
+  /** Cancel pending timeouts for stale services and re-trigger them immediately. */
+  private flushStaleRefreshes(): void {
+    if (!this.hiddenSince) return;
+    const hiddenMs = Date.now() - this.hiddenSince;
+    this.hiddenSince = 0;
+
+    let stagger = 0;
+    for (const [name, { run, intervalMs }] of this.refreshRunners) {
+      if (hiddenMs < intervalMs) continue;
+      const pending = this.refreshTimeoutIds.get(name);
+      if (pending) clearTimeout(pending);
+      const delay = stagger;
+      stagger += 150;
+      this.refreshTimeoutIds.set(name, setTimeout(() => void run(), delay));
+    }
   }
 
   private setupRefreshIntervals(): void {

@@ -14,6 +14,7 @@ import type {
   UcdpViolenceType,
 } from '../../../../src/generated/server/worldmonitor/conflict/v1/service_server';
 import { getCachedJson, setCachedJson } from '../../../_shared/redis';
+import { CHROME_UA } from '../../../_shared/constants';
 
 const UCDP_PAGE_SIZE = 1000;
 const MAX_PAGES = 12;
@@ -60,7 +61,7 @@ function buildVersionCandidates(): string[] {
 
 // Negative cache: prevent hammering UCDP when it's down
 let lastFailureTimestamp = 0;
-const NEGATIVE_CACHE_MS = 5 * 60 * 1000; // 5 minutes backoff after failure
+const NEGATIVE_CACHE_MS = 60 * 1000; // 60 seconds backoff after failure
 
 // Discovered version cache: avoid re-probing every request
 let discoveredVersion: string | null = null;
@@ -71,8 +72,8 @@ async function fetchGedPage(version: string, page: number): Promise<any> {
   const response = await fetch(
     `https://ucdpapi.pcr.uu.se/api/gedevents/${version}?pagesize=${UCDP_PAGE_SIZE}&page=${page}`,
     {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(6000),
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15000),
     },
   );
   if (!response.ok) {
@@ -194,9 +195,12 @@ async function fetchUcdpGedEvents(req: ListUcdpEventsRequest): Promise<UcdpViole
     lastFailureTimestamp = 0;
 
     // Cache with TTL based on completeness (ported from main #198)
+    // Only cache non-empty results to avoid serving stale empty data for hours
     const ttl = isPartial ? CACHE_TTL_PARTIAL : CACHE_TTL_FULL;
-    await setCachedJson(CACHE_KEY, mapped, ttl).catch(() => {});
-    fallbackCache = { data: mapped, timestamp: Date.now(), ttlMs: ttl * 1000 };
+    if (mapped.length > 0) {
+      await setCachedJson(CACHE_KEY, mapped, ttl).catch(() => {});
+      fallbackCache = { data: mapped, timestamp: Date.now(), ttlMs: ttl * 1000 };
+    }
 
     return mapped;
   } catch {

@@ -311,7 +311,7 @@ export class Panel {
           h('div', { className: 'panel-radar-sweep' }),
           h('div', { className: 'panel-radar-dot' }),
         ),
-        h('div', { className: 'panel-loading-text' }, message),
+        h('div', { className: 'panel-loading-text retrying' }, message),
       ),
     );
   }

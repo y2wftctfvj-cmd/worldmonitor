@@ -1160,7 +1160,19 @@
       "retry": "Retry",
       "notLive": "{{name}} is not currently live",
       "cannotEmbed": "{{name}} cannot be embedded in this app (YouTube {{code}})",
-      "openOnYouTube": "Open on YouTube"
+      "openOnYouTube": "Open on YouTube",
+      "manage": "إدارة القنوات",
+      "addChannel": "إضافة قناة",
+      "remove": "إزالة",
+      "youtubeHandle": "معرّف YouTube (مثال: @Channel)",
+      "displayName": "اسم العرض (اختياري)",
+      "openPanelSettings": "إعدادات عرض اللوحة",
+      "channelSettings": "إعدادات القناة",
+      "save": "حفظ",
+      "cancel": "إلغاء",
+      "confirmDelete": "حذف هذه القناة؟",
+      "confirmTitle": "تأكيد",
+      "restoreDefaults": "استعادة القنوات الافتراضية"
     }
   },
   "popups": {
@@ -1750,7 +1762,7 @@
     "noDataAvailable": "لا تتوفر بيانات",
     "updated": "تم التحديث للتو",
     "ago": "منذ {{time}}",
-    "retrying": "جارٍ إعادة المحاولة…",
+    "retrying": "جاري إعادة المحاولة...",
     "failedToLoad": "فشل تحميل البيانات",
     "noDataShort": "لا بيانات",
     "upstreamUnavailable": "واجهة API المصدر غير متاحة — ستتم إعادة المحاولة تلقائياً",

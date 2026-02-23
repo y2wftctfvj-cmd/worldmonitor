@@ -15,6 +15,12 @@ import type {
   AcledConflictEvent,
 } from '../../../../src/generated/server/worldmonitor/conflict/v1/service_server';
 
+import { CHROME_UA } from '../../../_shared/constants';
+import { getCachedJson, setCachedJson } from '../../../_shared/redis';
+
+const REDIS_CACHE_KEY = 'conflict:acled:v1';
+const REDIS_CACHE_TTL = 900; // 15 min — ACLED rate-limited
+
 const ACLED_API_URL = 'https://acleddata.com/api/acled/read';
 
 async function fetchAcledConflicts(req: ListAcledEventsRequest): Promise<AcledConflictEvent[]> {
@@ -44,6 +50,7 @@ async function fetchAcledConflicts(req: ListAcledEventsRequest): Promise<AcledCo
       headers: {
         Accept: 'application/json',
         Authorization: `Bearer ${token}`,
+        'User-Agent': CHROME_UA,
       },
       signal: AbortSignal.timeout(15000),
     });
@@ -90,8 +97,16 @@ export async function listAcledEvents(
   req: ListAcledEventsRequest,
 ): Promise<ListAcledEventsResponse> {
   try {
+    const cacheKey = `${REDIS_CACHE_KEY}:${req.country || 'all'}:${req.timeRange?.start || 0}:${req.timeRange?.end || 0}`;
+    const cached = (await getCachedJson(cacheKey)) as ListAcledEventsResponse | null;
+    if (cached?.events?.length) return cached;
+
     const events = await fetchAcledConflicts(req);
-    return { events, pagination: undefined };
+    const result: ListAcledEventsResponse = { events, pagination: undefined };
+    if (events.length > 0) {
+      setCachedJson(cacheKey, result, REDIS_CACHE_TTL).catch(() => {});
+    }
+    return result;
   } catch {
     return { events: [], pagination: undefined };
   }

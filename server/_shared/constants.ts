@@ -7,11 +7,15 @@ export const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
  */
 let yahooLastRequest = 0;
 const YAHOO_MIN_GAP_MS = 600;
+let yahooQueue: Promise<void> = Promise.resolve();
 
-export async function yahooGate(): Promise<void> {
-  const elapsed = Date.now() - yahooLastRequest;
-  if (elapsed < YAHOO_MIN_GAP_MS) {
-    await new Promise<void>(r => setTimeout(r, YAHOO_MIN_GAP_MS - elapsed));
-  }
-  yahooLastRequest = Date.now();
+export function yahooGate(): Promise<void> {
+  yahooQueue = yahooQueue.then(async () => {
+    const elapsed = Date.now() - yahooLastRequest;
+    if (elapsed < YAHOO_MIN_GAP_MS) {
+      await new Promise<void>(r => setTimeout(r, YAHOO_MIN_GAP_MS - elapsed));
+    }
+    yahooLastRequest = Date.now();
+  });
+  return yahooQueue;
 }

@@ -153,7 +153,7 @@ export async function initAnalytics(): Promise<void> {
         api_host: POSTHOG_HOST,
         persistence: 'localStorage',
         autocapture: false,
-        capture_pageview: true,
+        capture_pageview: false, // Manual capture below — auto-capture silently fails with bootstrap + SPA
         capture_pageleave: true,
         disable_session_recording: true,
         bootstrap: { distinctID: getOrCreateInstallationId() },
@@ -191,6 +191,11 @@ export async function initAnalytics(): Promise<void> {
 
       posthog.register(superProps);
       posthogInstance = posthog as unknown as PostHogInstance;
+
+      // Fire $pageview manually after full init — auto capture_pageview: true
+      // fires during init() before super props are registered, and silently
+      // fails with bootstrap + SPA setups (posthog-js #386).
+      posthog.capture('$pageview');
 
       // Flush any events queued while offline (desktop)
       flushOfflineQueue();

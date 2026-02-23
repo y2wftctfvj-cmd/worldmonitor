@@ -12,6 +12,10 @@ const SOCIAL_PREVIEW_UA =
 
 const SOCIAL_PREVIEW_PATHS = new Set(['/api/story', '/api/og-story']);
 
+// Slack uses Slack-ImgProxy to fetch OG images — distinct from Slackbot
+const SOCIAL_IMAGE_UA =
+  /Slack-ImgProxy|Slackbot|twitterbot|facebookexternalhit|linkedinbot|telegrambot|whatsapp|discordbot|redditbot/i;
+
 export default function middleware(request: Request) {
   const ua = request.headers.get('user-agent') ?? '';
   const url = new URL(request.url);
@@ -20,6 +24,13 @@ export default function middleware(request: Request) {
   // Allow Telegram webhook — Telegram sends requests with bot-like UA
   if (path.startsWith('/api/telegram-webhook')) {
     return;
+  }
+
+  // Allow social preview/image bots on OG image assets (bypasses Vercel Attack Challenge)
+  if (path.startsWith('/favico/') || path.endsWith('.png')) {
+    if (SOCIAL_IMAGE_UA.test(ua)) {
+      return;
+    }
   }
 
   // Allow social preview bots on exact OG routes only
@@ -45,5 +56,5 @@ export default function middleware(request: Request) {
 }
 
 export const config = {
-  matcher: '/api/:path*',
+  matcher: ['/api/:path*', '/favico/:path*'],
 };

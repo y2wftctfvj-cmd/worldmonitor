@@ -1160,7 +1160,19 @@
       "retry": "Retry",
       "notLive": "{{name}} is not currently live",
       "cannotEmbed": "{{name}} cannot be embedded in this app (YouTube {{code}})",
-      "openOnYouTube": "Open on YouTube"
+      "openOnYouTube": "Open on YouTube",
+      "manage": "Gérer les chaînes",
+      "addChannel": "Ajouter une chaîne",
+      "remove": "Supprimer",
+      "youtubeHandle": "Handle YouTube (ex. @Channel)",
+      "displayName": "Nom d'affichage (optionnel)",
+      "openPanelSettings": "Paramètres d'affichage du panneau",
+      "channelSettings": "Paramètres de la chaîne",
+      "save": "Enregistrer",
+      "cancel": "Annuler",
+      "confirmDelete": "Supprimer cette chaîne ?",
+      "confirmTitle": "Confirmer",
+      "restoreDefaults": "Restaurer les chaînes par défaut"
     }
   },
   "popups": {
@@ -1749,7 +1761,7 @@
     "noData": "Aucune donnée disponible",
     "updated": "Mis à jour à l'instant",
     "ago": "il y a {{time}}",
-    "retrying": "Nouvelle tentative…",
+    "retrying": "Nouvelle tentative...",
     "failedToLoad": "Échec du chargement des données",
     "noDataShort": "Aucune donnée",
     "upstreamUnavailable": "API source indisponible — nouvelle tentative automatique",

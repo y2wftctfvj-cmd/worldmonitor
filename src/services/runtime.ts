@@ -150,6 +150,10 @@ function isLocalOnlyApiTarget(target: string): boolean {
   return target.startsWith('/api/local-');
 }
 
+function isKeyFreeApiTarget(target: string): boolean {
+  return target.startsWith('/api/register-interest');
+}
+
 async function fetchLocalWithStartupRetry(
   nativeFetch: typeof window.fetch,
   localUrl: string,
@@ -220,7 +224,7 @@ export function installRuntimeFetchPatch(): void {
     if (debug) console.log(`[fetch] intercept → ${target}`);
     let allowCloudFallback = !isLocalOnlyApiTarget(target);
 
-    if (allowCloudFallback) {
+    if (allowCloudFallback && !isKeyFreeApiTarget(target)) {
       try {
         const { getSecretState, secretsReady } = await import('@/services/runtime-config');
         await Promise.race([secretsReady, new Promise<void>(r => setTimeout(r, 2000))]);
