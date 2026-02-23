@@ -39,6 +39,7 @@ export { generateSummary, translateText } from './summarization';
 export * from './cached-theater-posture';
 export * from './watchlist';
 export * from './prediction-engine';
+export * from './signal-explanations';
 // NOTE: pattern-memory is NOT re-exported here because its saveSnapshot
 // conflicts with storage.ts saveSnapshot. Import directly instead:
 //   import { ... } from '@/services/pattern-memory';
