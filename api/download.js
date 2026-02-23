@@ -71,7 +71,8 @@ export default async function handler(req) {
         'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[download] GitHub API error:', err?.message || err);
     return Response.redirect(RELEASES_PAGE, 302);
   }
 }

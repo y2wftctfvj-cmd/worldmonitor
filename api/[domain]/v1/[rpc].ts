@@ -73,6 +73,41 @@ const allRoutes = [
 
 const router = createRouter(allRoutes);
 
+/**
+ * Cache TTL in seconds based on how often each data category actually changes.
+ * Uses s-maxage (CDN edge cache) + stale-while-revalidate for best UX.
+ * Returns 0 for real-time endpoints that should never be cached.
+ */
+function getCacheMaxAge(request: Request): number {
+  const url = new URL(request.url);
+  const path = url.pathname; // e.g., /api/military/v1/list-bases
+
+  // Static reference data — changes rarely (daily or less)
+  if (path.includes('/military/v1/list-bases')) return 86400;        // 24h — base locations don't move
+  if (path.includes('/military/v1/get-theater-posture')) return 3600; // 1h — posture summary
+  if (path.includes('/infrastructure/v1/get-cable-health')) return 180; // 3min — already cached in Redis
+  if (path.includes('/infrastructure/v1/list-service-statuses')) return 120; // 2min
+  if (path.includes('/cyber/v1/list-cyber-threats')) return 300;     // 5min — threat feeds update ~hourly
+  if (path.includes('/displacement/v1/')) return 3600;               // 1h — UNHCR data updates daily
+  if (path.includes('/climate/v1/')) return 1800;                    // 30min — weather data
+  if (path.includes('/conflict/v1/')) return 600;                    // 10min — conflict events
+  if (path.includes('/unrest/v1/')) return 600;                      // 10min — protest data
+  if (path.includes('/prediction/v1/')) return 600;                  // 10min — prediction markets
+  if (path.includes('/research/v1/')) return 3600;                   // 1h — research papers
+  if (path.includes('/intelligence/v1/')) return 300;                // 5min — AI briefs
+  if (path.includes('/wildfire/v1/')) return 300;                    // 5min — FIRMS fire data
+  if (path.includes('/seismology/v1/')) return 120;                  // 2min — earthquakes
+  if (path.includes('/economic/v1/')) return 1800;                   // 30min — FRED/EIA data
+
+  // Real-time endpoints — no caching
+  if (path.includes('/aviation/v1/')) return 0;   // live aircraft positions
+  if (path.includes('/maritime/v1/')) return 0;   // live vessel positions
+  if (path.includes('/market/v1/')) return 0;     // live stock/crypto prices
+  if (path.includes('/news/v1/')) return 0;       // live news feeds
+
+  return 0; // Unknown endpoint — don't cache
+}
+
 export default async function handler(request: Request): Promise<Response> {
   // Origin check first — skip CORS headers for disallowed origins (M-2 fix)
   if (isDisallowedOrigin(request)) {
@@ -86,7 +121,7 @@ export default async function handler(request: Request): Promise<Response> {
   try {
     corsHeaders = getCorsHeaders(request);
   } catch {
-    corsHeaders = { 'Access-Control-Allow-Origin': '*' };
+    corsHeaders = { 'Access-Control-Allow-Origin': 'https://worldmonitor.app', 'Vary': 'Origin' };
   }
 
   // OPTIONS preflight
@@ -124,10 +159,18 @@ export default async function handler(request: Request): Promise<Response> {
     });
   }
 
-  // Merge CORS headers into response
+  // Merge CORS + Cache-Control headers into response
   const mergedHeaders = new Headers(response.headers);
   for (const [key, value] of Object.entries(corsHeaders)) {
     mergedHeaders.set(key, value);
+  }
+
+  // Add Cache-Control based on endpoint data freshness (reduces Vercel function calls)
+  if (response.status === 200 && !mergedHeaders.has('Cache-Control')) {
+    const cacheMaxAge = getCacheMaxAge(request);
+    if (cacheMaxAge > 0) {
+      mergedHeaders.set('Cache-Control', `public, s-maxage=${cacheMaxAge}, stale-while-revalidate=${cacheMaxAge * 2}`);
+    }
   }
 
   return new Response(response.body, {

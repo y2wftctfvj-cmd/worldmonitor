@@ -68,6 +68,7 @@ const BASELINE_WINDOW_MS = 7 * DAY_MS;
 const BASELINE_REFRESH_MS = HOUR_MS;
 const SPIKE_COOLDOWN_MS = 30 * 60 * 1000;
 const MAX_TRACKED_TERMS = 10000;
+const MAX_SEEN_HEADLINES = 50000; // Safety cap for seenHeadlines Map
 const MAX_AUTO_SUMMARIES_PER_HOUR = 5;
 const MIN_TOKEN_LENGTH = 3;
 const MIN_SPIKE_SOURCE_COUNT = 2;
@@ -280,6 +281,16 @@ function headlineKey(headline: TrendingHeadlineInput): string {
 function pruneOldState(now: number): void {
   for (const [key, seenAt] of seenHeadlines) {
     if (now - seenAt > BASELINE_WINDOW_MS) {
+      seenHeadlines.delete(key);
+    }
+  }
+
+  // Safety cap: if seenHeadlines grows too large, evict oldest entries
+  if (seenHeadlines.size > MAX_SEEN_HEADLINES) {
+    const entries = Array.from(seenHeadlines.entries())
+      .sort((a, b) => a[1] - b[1]);
+    const toRemove = entries.slice(0, entries.length - MAX_SEEN_HEADLINES);
+    for (const [key] of toRemove) {
       seenHeadlines.delete(key);
     }
   }

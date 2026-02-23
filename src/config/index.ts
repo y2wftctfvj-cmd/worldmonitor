@@ -43,6 +43,15 @@ export {
   LAYER_TO_SOURCE,
 } from './panels';
 
+// Focus modes — preset dashboard views (Overview, Crisis, Markets, etc.)
+export {
+  FOCUS_MODES,
+  DEFAULT_FOCUS_MODE,
+  FOCUS_MODE_STORAGE_KEY,
+  getPanelsForMode,
+  type FocusMode,
+} from './focus-modes';
+
 // ============================================
 // VARIANT-SPECIFIC EXPORTS
 // Only import what's needed for each variant

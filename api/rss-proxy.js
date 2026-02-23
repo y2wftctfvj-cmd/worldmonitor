@@ -264,7 +264,8 @@ export default async function handler(req) {
               ...corsHeaders,
             },
           });
-        } catch {
+        } catch (err) {
+          console.error('[rss-proxy] Redirect follow failed:', err?.message || err);
           return new Response(JSON.stringify({ error: 'Invalid redirect' }), {
             status: 502,
             headers: { 'Content-Type': 'application/json', ...corsHeaders },

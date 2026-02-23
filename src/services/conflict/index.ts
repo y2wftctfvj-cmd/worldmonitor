@@ -16,6 +16,7 @@ const client = new ConflictServiceClient('', { fetch: (...args) => globalThis.fe
 const acledBreaker = createCircuitBreaker<ListAcledEventsResponse>({ name: 'ACLED Conflicts' });
 const ucdpBreaker = createCircuitBreaker<ListUcdpEventsResponse>({ name: 'UCDP Events' });
 const hapiBreaker = createCircuitBreaker<GetHumanitarianSummaryResponse>({ name: 'HDX HAPI' });
+const CONFLICT_EVENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 // ---- Exported Types (match legacy shapes exactly) ----
 
@@ -79,6 +80,19 @@ function mapProtoEventType(eventType: string): ConflictEventType {
   return 'battle';
 }
 
+function mapUcdpViolenceType(eventType: string): ConflictEventType {
+  switch (eventType) {
+    case 'UCDP_VIOLENCE_TYPE_STATE_BASED':
+      return 'battle';
+    case 'UCDP_VIOLENCE_TYPE_NON_STATE':
+      return 'remote_violence';
+    case 'UCDP_VIOLENCE_TYPE_ONE_SIDED':
+      return 'violence_against_civilians';
+    default:
+      return 'battle';
+  }
+}
+
 function toConflictEvent(proto: ProtoAcledEvent): ConflictEvent {
   return {
     id: proto.id,
@@ -93,6 +107,23 @@ function toConflictEvent(proto: ProtoAcledEvent): ConflictEvent {
     fatalities: proto.fatalities,
     actors: proto.actors,
     source: proto.source,
+  };
+}
+
+function toConflictEventFromUcdp(proto: ProtoUcdpEvent): ConflictEvent {
+  return {
+    id: proto.id.startsWith('ucdp-') ? proto.id : `ucdp-${proto.id}`,
+    eventType: mapUcdpViolenceType(proto.violenceType),
+    subEventType: proto.violenceType,
+    country: proto.country,
+    region: undefined,
+    location: '',
+    lat: proto.location?.latitude ?? 0,
+    lon: proto.location?.longitude ?? 0,
+    time: new Date(proto.dateStart || proto.dateEnd || Date.now()),
+    fatalities: proto.deathsBest,
+    actors: [proto.sideA, proto.sideB].filter(Boolean),
+    source: proto.sourceOriginal || 'UCDP',
   };
 }
 
@@ -233,13 +264,7 @@ const emptyHapiFallback: GetHumanitarianSummaryResponse = { summary: undefined }
 
 // ---- Exported Functions ----
 
-export async function fetchConflictEvents(): Promise<ConflictData> {
-  const resp = await acledBreaker.execute(async () => {
-    return client.listAcledEvents({ country: '' });
-  }, emptyAcledFallback);
-
-  const events = resp.events.map(toConflictEvent);
-
+function buildConflictData(events: ConflictEvent[]): ConflictData {
   const byCountry = new Map<string, ConflictEvent[]>();
   let totalFatalities = 0;
 
@@ -256,6 +281,30 @@ export async function fetchConflictEvents(): Promise<ConflictData> {
     totalFatalities,
     count: events.length,
   };
+}
+
+export async function fetchConflictEvents(): Promise<ConflictData> {
+  // UCDP is the primary no-key conflict source for desktop users.
+  const ucdpResp = await ucdpBreaker.execute(async () => {
+    return client.listUcdpEvents({ country: '' });
+  }, emptyUcdpFallback);
+
+  if (ucdpResp.events.length === 0) {
+    ucdpBreaker.clearCache();
+  } else {
+    const cutoffMs = Date.now() - CONFLICT_EVENT_WINDOW_MS;
+    const recentEvents = ucdpResp.events.filter((event) => event.dateStart >= cutoffMs);
+    if (recentEvents.length > 0) {
+      return buildConflictData(recentEvents.map(toConflictEventFromUcdp));
+    }
+  }
+
+  // Fallback to ACLED when UCDP is unavailable or stale.
+  const acledResp = await acledBreaker.execute(async () => {
+    return client.listAcledEvents({ country: '' });
+  }, emptyAcledFallback);
+
+  return buildConflictData(acledResp.events.map(toConflictEvent));
 }
 
 export async function fetchUcdpClassifications(): Promise<Map<string, UcdpConflictStatus>> {

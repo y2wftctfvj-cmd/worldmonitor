@@ -30,7 +30,8 @@ export async function getCachedJson(key: string): Promise<unknown | null> {
     if (!resp.ok) return null;
     const data = (await resp.json()) as { result?: string };
     return data.result ? JSON.parse(data.result) : null;
-  } catch {
+  } catch (err) {
+    console.warn('[redis] GET failed for key:', key, err instanceof Error ? err.message : '');
     return null;
   }
 }
@@ -46,5 +47,7 @@ export async function setCachedJson(key: string, value: unknown, ttlSeconds: num
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(3_000),
     });
-  } catch { /* best-effort */ }
+  } catch (err) {
+    console.warn('[redis] SET failed for key:', key, err instanceof Error ? err.message : '');
+  }
 }

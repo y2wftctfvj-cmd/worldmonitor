@@ -563,6 +563,356 @@ canvas,
   gap: 12px;
 }
 
+/* ── Focus Mode Bar ─────────────────────────────────────────────── */
+.focus-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.focus-pill {
+  padding: 3px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.focus-pill:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.focus-pill.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* -- Alert Center -------------------------------------------------------- */
+.alert-bell-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.alert-bell-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-dim);
+}
+
+.alert-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.alert-drawer {
+  position: fixed;
+  z-index: 10000;
+  width: 360px;
+  max-height: 480px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.alert-drawer.open {
+  display: flex;
+}
+
+.alert-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.alert-drawer-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.alert-drawer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.alert-mark-read-btn,
+.alert-clear-btn {
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.alert-mark-read-btn:hover,
+.alert-clear-btn:hover {
+  border-color: var(--text-dim);
+  color: var(--text);
+}
+
+.alert-drawer-list {
+  overflow-y: auto;
+  max-height: 420px;
+  padding: 4px;
+}
+
+.alert-empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.alert-item {
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin-bottom: 2px;
+  transition: background 0.15s;
+}
+
+.alert-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.alert-item.unread {
+  background: rgba(59, 130, 246, 0.06);
+  border-left: 2px solid var(--accent);
+}
+
+.alert-item-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.alert-severity-icon {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.alert-item-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-item-time {
+  font-size: 10px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.alert-item-body {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.toast-notification.toast-critical {
+  border-left: 3px solid #ef4444;
+}
+
+.toast-notification.toast-warning {
+  border-left: 3px solid #eab308;
+}
+
+/* -- Chat Panel (slide-out AI assistant) --------------------------------- */
+.chat-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.chat-toggle-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-dim);
+}
+
+.chat-panel {
+  position: fixed;
+  top: 0;
+  right: -400px;
+  width: 380px;
+  height: 100vh;
+  z-index: 10001;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  transition: right 0.25s ease;
+}
+
+.chat-panel.open {
+  right: 0;
+}
+
+.chat-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.chat-close-btn:hover {
+  color: var(--text);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-message {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 85%;
+  word-wrap: break-word;
+}
+
+.chat-message.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+  border-bottom-right-radius: 2px;
+}
+
+.chat-message.assistant {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 2px;
+}
+
+.chat-message.loading {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.chat-input-area {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.chat-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.chat-input:focus {
+  border-color: var(--accent);
+}
+
+.chat-input::placeholder {
+  color: var(--text-dim);
+}
+
+.chat-send-btn {
+  padding: 8px 14px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.chat-send-btn:hover {
+  opacity: 0.85;
+}
+
 .theme-toggle-btn {
   display: flex;
   align-items: center;
@@ -7778,6 +8128,16 @@ a.prediction-link:hover {
 
 /* Narrow viewport only — keep 768 in sync with MOBILE_BREAKPOINT_PX in src/utils/index.ts */
 @media (max-width: 768px) {
+  /* Focus mode: horizontal scroll, smaller pills on mobile */
+  .focus-mode-bar {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 55vw;
+    scrollbar-width: none;
+  }
+  .focus-mode-bar::-webkit-scrollbar { display: none; }
+  .focus-pill { font-size: 10px; padding: 3px 7px; }
+
   /* Expand touch targets for all map markers using ::before pseudo-element */
   /* This creates an invisible touch area around small markers */
 

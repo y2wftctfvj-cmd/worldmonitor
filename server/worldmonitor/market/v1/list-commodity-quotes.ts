@@ -11,12 +11,20 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/market/v1/service_server';
 import { fetchYahooQuote } from './_shared';
 
+function normalizeCommoditySymbols(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((s): s is string => typeof s === 'string')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
 export async function listCommodityQuotes(
   _ctx: ServerContext,
   req: ListCommodityQuotesRequest,
 ): Promise<ListCommodityQuotesResponse> {
   try {
-    const symbols = req.symbols;
+    const symbols = normalizeCommoditySymbols((req as { symbols?: unknown } | undefined)?.symbols);
     if (!symbols.length) return { quotes: [] };
 
     const results = await Promise.all(

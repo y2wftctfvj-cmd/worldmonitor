@@ -36,7 +36,8 @@ export default async function handler() {
         'Access-Control-Allow-Origin': '*',
       },
     });
-  } catch {
+  } catch (err) {
+    console.error('[version] GitHub API error:', err?.message || err);
     return new Response(JSON.stringify({ error: 'fetch_failed' }), {
       status: 502,
       headers: { 'Content-Type': 'application/json' },

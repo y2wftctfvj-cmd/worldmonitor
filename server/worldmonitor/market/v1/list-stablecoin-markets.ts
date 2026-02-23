@@ -21,6 +21,14 @@ let stablecoinCache: ListStablecoinMarketsResponse | null = null;
 let stablecoinCacheTimestamp = 0;
 const STABLECOIN_CACHE_TTL = 120_000; // 2 minutes
 
+function normalizeCoinIds(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter((c): c is string => typeof c === 'string')
+    .map((c) => c.trim().toLowerCase())
+    .filter((c) => /^[a-z0-9-]+$/.test(c));
+}
+
 // ========================================================================
 // Types
 // ========================================================================
@@ -50,8 +58,9 @@ export async function listStablecoinMarkets(
     return stablecoinCache;
   }
 
-  const coins = req.coins.length > 0
-    ? req.coins.filter(c => /^[a-z0-9-]+$/.test(c)).join(',')
+  const requestedCoins = normalizeCoinIds((req as { coins?: unknown } | undefined)?.coins);
+  const coins = requestedCoins.length > 0
+    ? requestedCoins.join(',')
     : DEFAULT_STABLECOIN_IDS;
 
   try {

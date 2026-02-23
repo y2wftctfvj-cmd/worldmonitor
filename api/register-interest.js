@@ -6,19 +6,41 @@ import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LENGTH = 320;
 
-const rateLimitMap = new Map();
+// Rate limiting via Upstash Redis (survives serverless scaling, unlike in-memory Map)
 const RATE_LIMIT = 5;
-const RATE_WINDOW_MS = 60 * 60 * 1000;
+const RATE_WINDOW_SECONDS = 3600; // 1 hour
 
-function isRateLimited(ip) {
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip);
-  if (!entry || now - entry.windowStart > RATE_WINDOW_MS) {
-    rateLimitMap.set(ip, { windowStart: now, count: 1 });
+async function isRateLimited(ip) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  // If Redis isn't configured, allow the request (graceful degradation)
+  if (!url || !token) return false;
+
+  const key = `rl:register:${ip}`;
+  try {
+    // INCR the key and set TTL atomically via Upstash REST pipeline
+    // Pipeline: INCR key, then EXPIRE key (only if it's a new key)
+    const resp = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([
+        ['INCR', key],
+        ['EXPIRE', key, RATE_WINDOW_SECONDS, 'NX'], // NX = only set if no TTL exists
+      ]),
+      signal: AbortSignal.timeout(2_000),
+    });
+
+    if (!resp.ok) return false; // Redis issue — allow the request
+
+    const results = await resp.json();
+    // results[0].result = current count after INCR
+    const count = results?.[0]?.result ?? 0;
+    return count > RATE_LIMIT;
+  } catch {
+    // Redis unavailable — allow the request rather than blocking everyone
     return false;
   }
-  entry.count += 1;
-  return entry.count > RATE_LIMIT;
 }
 
 export default async function handler(req) {
@@ -43,10 +65,14 @@ export default async function handler(req) {
   }
 
   const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-  if (isRateLimited(ip)) {
+  if (await isRateLimited(ip)) {
     return new Response(JSON.stringify({ error: 'Too many requests' }), {
       status: 429,
-      headers: { 'Content-Type': 'application/json', ...cors },
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(RATE_WINDOW_SECONDS),
+        ...cors,
+      },
     });
   }
 

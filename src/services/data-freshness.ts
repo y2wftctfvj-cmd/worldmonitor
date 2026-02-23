@@ -25,7 +25,7 @@ export type DataSourceId =
   | 'oil'        // EIA oil analytics
   | 'spending'        // USASpending.gov
   | 'firms'          // NASA FIRMS satellite fires
-  | 'acled_conflict' // ACLED battles/explosions/violence
+  | 'acled_conflict' // Armed conflicts (UCDP primary, ACLED fallback)
   | 'ucdp'           // UCDP conflict classification
   | 'hapi'           // HDX HAPI aggregated conflict data
   | 'ucdp_events'    // UCDP georeferenced conflict events
@@ -86,7 +86,7 @@ const SOURCE_METADATA: Record<DataSourceId, { name: string; requiredForRisk: boo
   oil: { name: 'Oil Analytics (EIA)', requiredForRisk: false, panelId: 'economic' },
   spending: { name: 'Gov Spending', requiredForRisk: false, panelId: 'economic' },
   firms: { name: 'FIRMS Satellite Fires', requiredForRisk: false, panelId: 'map' },
-  acled_conflict: { name: 'Armed Conflicts (ACLED)', requiredForRisk: false, panelId: 'protests' },
+  acled_conflict: { name: 'Armed Conflicts (UCDP Primary)', requiredForRisk: false, panelId: 'protests' },
   ucdp: { name: 'Conflict Classification (UCDP)', requiredForRisk: false, panelId: 'protests' },
   hapi: { name: 'Conflict Aggregates (HDX)', requiredForRisk: false, panelId: 'protests' },
   ucdp_events: { name: 'UCDP Conflict Events', requiredForRisk: false, panelId: 'ucdp-events' },
@@ -340,7 +340,7 @@ const INTELLIGENCE_GAP_MESSAGES: Record<DataSourceId, string> = {
   oil: 'Oil market analytics unavailable—EIA data not updating',
   spending: 'Government spending data unavailable',
   firms: 'Satellite fire detection unavailable—NASA FIRMS data not updating',
-  acled_conflict: 'Armed conflict events may be missed—ACLED conflict data unavailable',
+  acled_conflict: 'Armed conflict events may be missed—UCDP conflict data unavailable (ACLED fallback may also be unavailable)',
   ucdp: 'Conflict classification unavailable—UCDP data not loading',
   hapi: 'Aggregated conflict data unavailable—HDX HAPI not responding',
   ucdp_events: 'UCDP event-level conflict data unavailable',

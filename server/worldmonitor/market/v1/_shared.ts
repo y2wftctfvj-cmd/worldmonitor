@@ -154,3 +154,58 @@ export async function fetchCoinGeckoMarkets(
   }
   return data;
 }
+
+// ========================================================================
+// Stooq fallback fetcher (no key)
+// ========================================================================
+
+function toStooqSymbol(symbol: string): string | null {
+  const s = symbol.trim().toUpperCase();
+  if (!s) return null;
+
+  const indexMap: Record<string, string> = {
+    '^GSPC': '^spx',
+    '^DJI': '^dji',
+    '^IXIC': '^ndq',
+    '^VIX': '^vix',
+  };
+  if (indexMap[s]) return indexMap[s];
+
+  // Basic US equity fallback (AAPL -> aapl.us)
+  if (/^[A-Z][A-Z0-9.-]{0,9}$/.test(s)) return `${s.toLowerCase()}.us`;
+
+  return null;
+}
+
+export async function fetchStooqQuote(
+  symbol: string,
+): Promise<{ price: number; change: number; sparkline: number[] } | null> {
+  try {
+    const stooqSymbol = toStooqSymbol(symbol);
+    if (!stooqSymbol) return null;
+
+    const url = `https://stooq.com/q/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+
+    const text = (await resp.text()).trim();
+    if (!text || /N\/D/i.test(text)) return null;
+
+    // Format: SYMBOL,YYYYMMDD,HHMMSS,OPEN,HIGH,LOW,CLOSE,VOLUME,
+    const parts = text.split(',');
+    if (parts.length < 7) return null;
+
+    const open = Number(parts[3]);
+    const close = Number(parts[6]);
+    if (!Number.isFinite(close) || close <= 0) return null;
+
+    // Approximate day change using open when previous close is unavailable.
+    const change = Number.isFinite(open) && open > 0 ? ((close - open) / open) * 100 : 0;
+    return { price: close, change, sparkline: [] };
+  } catch {
+    return null;
+  }
+}

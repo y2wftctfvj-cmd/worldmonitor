@@ -12,6 +12,10 @@ import {
   STORAGE_KEYS,
   SITE_VARIANT,
   LAYER_TO_SOURCE,
+  FOCUS_MODES,
+  DEFAULT_FOCUS_MODE,
+  FOCUS_MODE_STORAGE_KEY,
+  getPanelsForMode,
 } from '@/config';
 import { BETA_MODE } from '@/config/beta';
 import { fetchCategoryFeeds, getFeedFailures, fetchMultipleStocks, fetchCrypto, fetchPredictions, fetchEarthquakes, fetchWeatherAlerts, fetchFredData, fetchInternetOutages, isOutagesConfigured, fetchAisSignals, initAisStream, getAisStatus, disconnectAisStream, isAisConfigured, fetchCableActivity, fetchCableHealth, fetchProtestEvents, getProtestStatus, fetchFlightDelays, fetchMilitaryFlights, fetchMilitaryVessels, initMilitaryVesselStream, isMilitaryVesselTrackingConfigured, fetchUSNIFleetReport, initDB, updateBaseline, calculateDeviation, addToSignalHistory, saveSnapshot, cleanOldSnapshots, analysisWorker, fetchPizzIntStatus, fetchGdeltTensions, fetchNaturalEvents, fetchRecentAwards, fetchOilAnalytics, fetchCyberThreats, drainTrendingSignals } from '@/services';
@@ -81,6 +85,8 @@ import {
   PopulationExposurePanel,
   InvestmentsPanel,
   LanguageSelector,
+  AlertCenter,
+  ChatPanel,
 } from '@/components';
 import type { SearchResult } from '@/components/SearchModal';
 import { collectStoryData } from '@/services/story-data';
@@ -197,6 +203,9 @@ export class App {
   private readonly UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
   private updateCheckIntervalId: ReturnType<typeof setInterval> | null = null;
   private clockIntervalId: ReturnType<typeof setInterval> | null = null;
+  private activeFocusMode: string;
+  private alertCenter: AlertCenter;
+  private chatPanel: ChatPanel;
 
   constructor(containerId: string) {
     const el = document.getElementById(containerId);
@@ -213,6 +222,11 @@ export class App {
     const storedVariant = localStorage.getItem('worldmonitor-variant');
     const currentVariant = SITE_VARIANT;
     console.log(`[App] Variant check: stored="${storedVariant}", current="${currentVariant}"`);
+    // Load saved focus mode (or default to Overview for a cleaner first experience)
+    this.activeFocusMode = localStorage.getItem(FOCUS_MODE_STORAGE_KEY) ?? DEFAULT_FOCUS_MODE;
+    this.alertCenter = new AlertCenter();
+    this.chatPanel = new ChatPanel();
+
     if (storedVariant !== currentVariant) {
       // Variant changed - use defaults for new variant, clear old settings
       console.log('[App] Variant changed - resetting to defaults');
@@ -1884,6 +1898,9 @@ export class App {
             </select>
           </div>
         </div>
+        <div class="focus-mode-bar" id="focusModeBar">
+          ${FOCUS_MODES.map((m) => `<button class="focus-pill${m.id === this.activeFocusMode ? ' active' : ''}" data-mode="${m.id}" title="${m.label}">${m.icon} ${m.label}</button>`).join('')}
+        </div>
         <div class="header-right">
           <button class="search-btn" id="searchBtn"><kbd>⌘K</kbd> ${t('header.search')}</button>
           ${this.isDesktopApp ? '' : `<button class="copy-link-btn" id="copyLinkBtn">${t('header.copyLink')}</button>`}
@@ -1945,6 +1962,16 @@ export class App {
 
     this.createPanels();
     this.renderPanelToggles();
+
+    // Mount alert center bell icon and chat panel into header-right
+    const headerRight = document.querySelector('.header-right') as HTMLElement;
+    if (headerRight) {
+      this.alertCenter.mount(headerRight);
+      this.chatPanel.mount(headerRight);
+    }
+
+    // Give the chat panel a function to gather current dashboard context
+    this.chatPanel.setContextGetter(() => this.getChatContext());
   }
 
   /**
@@ -2637,6 +2664,15 @@ export class App {
       }
     });
 
+    // Focus mode pill buttons — switch dashboard view
+    document.getElementById('focusModeBar')?.addEventListener('click', (e) => {
+      const pill = (e.target as HTMLElement).closest('.focus-pill') as HTMLElement | null;
+      if (!pill) return;
+      const modeId = pill.dataset.mode;
+      if (!modeId || modeId === this.activeFocusMode) return;
+      this.setFocusMode(modeId);
+    });
+
     // Settings modal
     document.getElementById('settingsBtn')?.addEventListener('click', () => {
       document.getElementById('settingsModal')?.classList.add('active');
@@ -3079,17 +3115,81 @@ export class App {
   }
 
   private applyPanelSettings(): void {
+    // Get the focus mode filter (null = show everything)
+    const allowedPanels = getPanelsForMode(this.activeFocusMode);
+
     Object.entries(this.panelSettings).forEach(([key, config]) => {
+      // A panel is visible when BOTH conditions are true:
+      //   1. The user hasn't manually disabled it in settings
+      //   2. It's included in the active focus mode (or mode is "all")
+      const enabledByUser = config.enabled;
+      const enabledByMode = allowedPanels === null || allowedPanels.includes(key);
+      const visible = enabledByUser && enabledByMode;
+
       if (key === 'map') {
         const mapSection = document.getElementById('mapSection');
         if (mapSection) {
-          mapSection.classList.toggle('hidden', !config.enabled);
+          mapSection.classList.toggle('hidden', !visible);
         }
         return;
       }
       const panel = this.panels[key];
-      panel?.toggle(config.enabled);
+      panel?.toggle(visible);
     });
+  }
+
+  /**
+   * Build a text summary of current dashboard data for the AI chat context.
+   * Includes top headlines, market data, and active signals.
+   */
+  private getChatContext(): string {
+    const lines: string[] = [];
+
+    // Top headlines (last 10)
+    const recentNews = this.allNews.slice(0, 10);
+    if (recentNews.length > 0) {
+      lines.push('Recent headlines:');
+      for (const item of recentNews) {
+        lines.push(`- ${item.title} (${item.source})`);
+      }
+    }
+
+    // Market data
+    if (this.latestMarkets.length > 0) {
+      lines.push('\nMarket data:');
+      for (const m of this.latestMarkets.slice(0, 5)) {
+        const changeStr = m.change != null ? `${m.change >= 0 ? '+' : ''}${m.change.toFixed(2)}%` : 'n/a';
+        lines.push(`- ${m.symbol}: ${m.price ?? 'n/a'} (${changeStr})`);
+      }
+    }
+
+    // Active focus mode
+    lines.push(`\nActive focus mode: ${this.activeFocusMode}`);
+
+    // Unread alert count
+    const unread = this.alertCenter.unreadCount;
+    if (unread > 0) {
+      lines.push(`Unread alerts: ${unread}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Switch focus mode — updates pill UI, persists choice, and re-filters panels.
+   */
+  private setFocusMode(modeId: string): void {
+    this.activeFocusMode = modeId;
+    localStorage.setItem(FOCUS_MODE_STORAGE_KEY, modeId);
+
+    // Update pill button active states
+    document.querySelectorAll('.focus-pill').forEach((pill) => {
+      const el = pill as HTMLElement;
+      el.classList.toggle('active', el.dataset.mode === modeId);
+    });
+
+    // Re-apply panel visibility with the new mode filter
+    this.applyPanelSettings();
   }
 
   private updateHeaderThemeIcon(): void {
@@ -3638,6 +3738,19 @@ export class App {
       ingestEarthquakes(earthquakeResult.value);
       this.statusPanel?.updateApi('USGS', { status: 'ok' });
       dataFreshness.recordUpdate('usgs', earthquakeResult.value.length);
+
+      // Alert for significant earthquakes (M5.0+)
+      for (const eq of earthquakeResult.value) {
+        if (eq.magnitude >= 5.0) {
+          const severity = eq.magnitude >= 7 ? 'critical' : eq.magnitude >= 6 ? 'warning' : 'info';
+          this.alertCenter.push(
+            severity as 'critical' | 'warning' | 'info',
+            `M${eq.magnitude.toFixed(1)} Earthquake`,
+            `${eq.place || 'Unknown location'} — depth ${eq.depthKm?.toFixed(0) ?? '?'}km`,
+            'earthquake'
+          );
+        }
+      }
     } else {
       this.intelligenceCache.earthquakes = [];
       this.map?.setEarthquakes([]);
@@ -3891,12 +4004,20 @@ export class App {
             const surgeSignals = surgeAlerts.map(surgeAlertToSignal);
             addToSignalHistory(surgeSignals);
             if (this.shouldShowIntelligenceNotifications()) this.signalModal?.show(surgeSignals);
+            // Push to alert center
+            for (const sa of surgeAlerts) {
+              this.alertCenter.push('warning', `Military Surge: ${sa.theater?.name ?? 'Unknown'}`, `${sa.type} surge — ${sa.currentCount} aircraft (${sa.surgeMultiple?.toFixed(1) ?? '?'}x baseline)`, 'military');
+            }
           }
           const foreignAlerts = detectForeignMilitaryPresence(flightData.flights);
           if (foreignAlerts.length > 0) {
             const foreignSignals = foreignAlerts.map(foreignPresenceToSignal);
             addToSignalHistory(foreignSignals);
             if (this.shouldShowIntelligenceNotifications()) this.signalModal?.show(foreignSignals);
+            // Push to alert center
+            for (const fa of foreignAlerts) {
+              this.alertCenter.push('warning', `Foreign Military: ${fa.operatorCountry ?? 'Unknown'}`, `${fa.aircraftCount} aircraft in ${fa.region}`, 'military');
+            }
           }
         }
       } catch (error) {
