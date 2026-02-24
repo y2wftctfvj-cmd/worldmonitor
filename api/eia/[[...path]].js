@@ -21,7 +21,7 @@ export default async function handler(req) {
   }
 
   const url = new URL(req.url);
-  const path = url.pathname.replace(/^\\/api\\/eia/, '');
+  const path = url.pathname.replace(/^\/api\/eia/, '');
 
   const apiKey = process.env.EIA_API_KEY;
 
