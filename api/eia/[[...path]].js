@@ -100,11 +100,12 @@ export default async function handler(req) {
         },
       });
     } catch (error) {
-      console.error('[EIA] Fetch error:', error);
+      const isTimeout = error?.name === 'AbortError';
+      console.error('[EIA] Fetch error:', isTimeout ? 'timeout' : error?.message);
       return Response.json({
-        error: 'Failed to fetch EIA data',
+        error: isTimeout ? 'EIA request timed out' : 'Failed to fetch EIA data',
       }, {
-        status: 500,
+        status: isTimeout ? 504 : 502,
         headers: cors,
       });
     }

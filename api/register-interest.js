@@ -64,7 +64,10 @@ export default async function handler(req) {
     });
   }
 
-  const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  // Use x-real-ip (set by Vercel) first, then last x-forwarded-for entry (most trusted)
+  const ip = req.headers.get('x-real-ip')?.trim()
+    || req.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
+    || 'anonymous';
   if (await isRateLimited(ip)) {
     return new Response(JSON.stringify({ error: 'Too many requests' }), {
       status: 429,

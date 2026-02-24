@@ -87,7 +87,10 @@ export default async function handler(request) {
   }
 
   // --- Rate limit: 30 requests/minute per IP via Upstash Redis ---
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
+  // Use x-real-ip (set by Vercel) first, then last x-forwarded-for entry (most trusted)
+  const ip = request.headers.get('x-real-ip')?.trim()
+    || request.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
+    || 'anonymous';
   if (await isRateLimited(ip)) {
     return new Response(JSON.stringify({ error: 'Rate limited' }), {
       status: 429,

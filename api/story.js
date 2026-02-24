@@ -17,7 +17,10 @@ const BOT_UA = /twitterbot|facebookexternalhit|linkedinbot|slackbot|telegrambot|
 
 export default function handler(req, res) {
   const url = new URL(req.url, `https://${req.headers.host}`);
-  const countryCode = (url.searchParams.get('c') || '').toUpperCase();
+  // Validate country code against known list to prevent reflected input abuse
+  const rawCountry = (url.searchParams.get('c') || '').toUpperCase();
+  const VALID_COUNTRIES = new Set(Object.keys(COUNTRY_NAMES));
+  const countryCode = VALID_COUNTRIES.has(rawCountry) ? rawCountry : '';
   // Validate type param against allowlist to prevent XSS via reflected input
   const VALID_TYPES = new Set(['ciianalysis', 'military', 'market', 'prediction', 'unrest', 'cyber']);
   const rawType = url.searchParams.get('t') || 'ciianalysis';
