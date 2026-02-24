@@ -128,16 +128,18 @@ export default async function handler(request) {
 }
 
 /**
- * Fetch lightweight server-side context: GDELT headlines + market quotes.
- * Both are public APIs, no keys needed. Failures are non-fatal.
+ * Fetch lightweight server-side context: headlines + markets + Reddit OSINT.
+ * All public APIs, no keys needed. Failures are non-fatal.
  */
 async function fetchContext() {
   const sections = [];
 
-  // Fetch GDELT headlines and market quotes in parallel
-  const [headlines, quotes] = await Promise.allSettled([
-    fetchGdeltHeadlines(),
+  // Fetch all four data sources in parallel
+  const [headlines, quotes, reddit, telegram] = await Promise.allSettled([
+    fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
+    fetchRedditOsint(),
+    fetchTelegramOsint(),
   ]);
 
   if (headlines.status === 'fulfilled' && headlines.value) {
@@ -148,6 +150,14 @@ async function fetchContext() {
     sections.push(`MARKETS:\n${quotes.value}`);
   }
 
+  if (reddit.status === 'fulfilled' && reddit.value) {
+    sections.push(`REDDIT OSINT:\n${reddit.value}`);
+  }
+
+  if (telegram.status === 'fulfilled' && telegram.value) {
+    sections.push(`TELEGRAM OSINT:\n${telegram.value}`);
+  }
+
   if (sections.length === 0) {
     return 'No live data available right now.';
   }
@@ -156,24 +166,32 @@ async function fetchContext() {
 }
 
 /**
- * Fetch 10 recent headlines from GDELT DOC API.
- * Free, no key, returns global news sorted by relevance.
+ * Fetch 10 recent headlines from Google News RSS.
+ * Free, no key, always available. Uses the "World" topic feed.
  */
-async function fetchGdeltHeadlines() {
-  const gdeltUrl =
-    'https://api.gdeltproject.org/api/v2/doc/doc?query=sourcelang:english&mode=artlist&maxrecords=10&format=json&sort=datedesc';
+async function fetchGoogleNewsHeadlines() {
+  const rssUrl =
+    'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en';
 
-  const resp = await fetch(gdeltUrl, { signal: AbortSignal.timeout(5000) });
+  const resp = await fetch(rssUrl, { signal: AbortSignal.timeout(5000) });
   if (!resp.ok) return null;
 
-  const data = await resp.json();
-  const articles = data?.articles;
-  if (!Array.isArray(articles) || articles.length === 0) return null;
+  const xml = await resp.text();
 
-  // Format: "- Title (source, date)"
-  return articles
-    .map((a) => `- ${a.title} (${a.domain}, ${a.seendate?.slice(0, 10) || 'recent'})`)
-    .join('\n');
+  // Parse RSS items with simple regex (Edge runtime has no DOMParser)
+  const items = [];
+  const itemPattern = /<item>[\s\S]*?<\/item>/g;
+  const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
+  let itemMatch;
+  while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 10) {
+    const titleMatch = itemMatch[0].match(titlePattern);
+    const title = titleMatch?.[1] || titleMatch?.[2];
+    if (title) items.push(title);
+  }
+
+  if (items.length === 0) return null;
+
+  return items.map((t) => `- ${t}`).join('\n');
 }
 
 /**
@@ -193,21 +211,21 @@ async function fetchMarketQuotes() {
   if (!resp.ok) return null;
 
   const data = await resp.json();
-  const results = data?.spark?.result;
-  if (!Array.isArray(results)) return null;
 
-  // Format each quote as "- Name: price (change%)"
+  // Yahoo returns a flat object: { "^GSPC": { close: [...], chartPreviousClose: N }, ... }
   const lines = [];
-  for (const item of results) {
-    const symbol = item.symbol;
-    const name = names[symbol] || symbol;
-    const meta = item.response?.[0]?.meta;
-    if (!meta) continue;
+  for (const symbol of symbols) {
+    const quote = data?.[symbol];
+    if (!quote) continue;
 
-    const price = meta.regularMarketPrice;
-    const prevClose = meta.previousClose || meta.chartPreviousClose;
+    const name = names[symbol] || symbol;
+    const closeArr = quote.close;
+    const price = Array.isArray(closeArr) && closeArr.length > 0
+      ? closeArr[closeArr.length - 1]
+      : null;
     if (price == null) continue;
 
+    const prevClose = quote.chartPreviousClose || quote.previousClose;
     let changeStr = '';
     if (prevClose && prevClose !== 0) {
       const changePct = ((price - prevClose) / prevClose) * 100;
@@ -218,6 +236,123 @@ async function fetchMarketQuotes() {
   }
 
   return lines.length > 0 ? lines.join('\n') : null;
+}
+
+/**
+ * Fetch latest messages from public Telegram OSINT channels.
+ * Scrapes t.me/s/{channel} (public web preview) and extracts message text.
+ * Same channels as the dashboard OSINT panel.
+ */
+async function fetchTelegramOsint() {
+  const channels = ['intelslava', 'militarysummary', 'RVvoenkor', 'breakingmash', 'legitimniy'];
+
+  // Fetch all channels in parallel
+  const results = await Promise.allSettled(
+    channels.map(async (channel) => {
+      const url = `https://t.me/s/${channel}`;
+      const resp = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!resp.ok) return [];
+
+      const html = await resp.text();
+
+      // Parse message text from Telegram's widget HTML
+      const posts = [];
+      const blocks = html.split('tgme_widget_message_wrap');
+      for (const block of blocks) {
+        // Extract message text from the widget div
+        const textMatch = block.match(
+          /class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*tgme_widget_message_(?:footer|info)/
+        );
+        if (!textMatch) continue;
+
+        // Strip HTML tags to get plain text
+        const text = textMatch[1]
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (text.length > 10) {
+          // Truncate long messages to keep context compact
+          const truncated = text.length > 200 ? text.slice(0, 200) + '...' : text;
+          posts.push({ channel, text: truncated });
+        }
+      }
+
+      // Return only the 3 most recent messages per channel
+      return posts.slice(-3);
+    })
+  );
+
+  const allPosts = results
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value);
+
+  if (allPosts.length === 0) return null;
+
+  // Take the last 10 messages across all channels (most recent)
+  return allPosts
+    .slice(-10)
+    .map((p) => `- [${p.channel}] ${p.text}`)
+    .join('\n');
+}
+
+/**
+ * Fetch top posts from geopolitical subreddits via Reddit's public JSON API.
+ * Same sources as the dashboard OSINT panel: worldnews, geopolitics, osint, CredibleDefense.
+ */
+async function fetchRedditOsint() {
+  const subreddits = ['worldnews', 'geopolitics', 'osint', 'CredibleDefense'];
+  const postsPerSub = 5;
+
+  // Fetch all subreddits in parallel
+  const results = await Promise.allSettled(
+    subreddits.map(async (sub) => {
+      const url = `https://www.reddit.com/r/${sub}/hot.json?limit=${postsPerSub}&raw_json=1`;
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'WorldMonitor/1.0' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!resp.ok) return [];
+
+      const data = await resp.json();
+      const children = data?.data?.children;
+      if (!Array.isArray(children)) return [];
+
+      return children
+        .filter((c) => c?.data?.title && !c.data.stickied)
+        .map((c) => ({
+          sub,
+          title: c.data.title,
+          score: c.data.score || 0,
+          comments: c.data.num_comments || 0,
+        }));
+    })
+  );
+
+  // Merge all posts, sort by score, take top 10
+  const allPosts = results
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+
+  if (allPosts.length === 0) return null;
+
+  return allPosts
+    .map((p) => `- [r/${p.sub}, ${p.score}pts] ${p.title}`)
+    .join('\n');
 }
 
 /**
