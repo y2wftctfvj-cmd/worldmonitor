@@ -99,8 +99,8 @@ export default async function handler(request) {
   const truncatedText = userText.length > 2000 ? userText.slice(0, 2000) : userText;
 
   try {
-    // --- Fetch lightweight context in parallel ---
-    const context = await fetchContext();
+    // --- Fetch lightweight context in parallel (generic + topic-specific) ---
+    const context = await fetchContext(truncatedText);
 
     // --- Build LLM messages ---
     const messages = [
@@ -139,16 +139,21 @@ export default async function handler(request) {
  * Fetch lightweight server-side context: headlines + markets + Reddit OSINT.
  * All public APIs, no keys needed. Failures are non-fatal.
  */
-async function fetchContext() {
+async function fetchContext(userQuery = '') {
   const sections = [];
 
-  // Fetch all four data sources in parallel
-  const [headlines, quotes, reddit, telegram] = await Promise.allSettled([
+  // Fetch all data sources in parallel — generic + topic-specific search
+  const [headlines, quotes, reddit, telegram, topicNews] = await Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
     fetchRedditOsint(),
     fetchTelegramOsint(),
+    fetchTopicNews(userQuery),
   ]);
+
+  if (topicNews.status === 'fulfilled' && topicNews.value) {
+    sections.push(`TOPIC-SPECIFIC NEWS:\n${topicNews.value}`);
+  }
 
   if (headlines.status === 'fulfilled' && headlines.value) {
     sections.push(`HEADLINES:\n${headlines.value}`);
@@ -202,6 +207,62 @@ async function fetchGoogleNewsHeadlines() {
   if (items.length === 0) return null;
 
   return items.map((t) => `- ${t}`).join('\n');
+}
+
+/**
+ * Extract keywords from user query and search Google News for topic-specific results.
+ * Returns null if no meaningful keywords found or search fails.
+ */
+async function fetchTopicNews(query) {
+  if (!query || query.length < 3) return null;
+
+  // Extract meaningful keywords: strip common question words, keep nouns/proper nouns
+  const stopWords = new Set([
+    'what', 'whats', 'how', 'why', 'when', 'where', 'who', 'is', 'are', 'was', 'were',
+    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'about', 'from',
+    'do', 'does', 'did', 'can', 'could', 'would', 'should', 'will', 'has', 'have', 'had',
+    'tell', 'me', 'us', 'your', 'my', 'this', 'that', 'it', 'its', 'and', 'or', 'but',
+    'current', 'latest', 'today', 'now', 'going', 'happening', 'update', 'status',
+    'threat', 'level', 'situation', 'analysis', 'brief', 'report',
+  ]);
+
+  const keywords = query
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !stopWords.has(w));
+
+  if (keywords.length === 0) return null;
+
+  // Use top 3 keywords for search
+  const searchTerms = keywords.slice(0, 3).join('+');
+  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(searchTerms)}&hl=en-US&gl=US&ceid=US:en`;
+
+  try {
+    const resp = await fetch(rssUrl, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return null;
+
+    const xml = await resp.text();
+
+    const items = [];
+    const itemPattern = /<item>[\s\S]*?<\/item>/g;
+    const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
+    const datePattern = /<pubDate>(.*?)<\/pubDate>/;
+    let itemMatch;
+    while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 5) {
+      const titleMatch = itemMatch[0].match(titlePattern);
+      const dateMatch = itemMatch[0].match(datePattern);
+      const title = titleMatch?.[1] || titleMatch?.[2];
+      const pubDate = dateMatch?.[1] || '';
+      if (title) items.push(`- ${title}${pubDate ? ` (${pubDate})` : ''}`);
+    }
+
+    if (items.length === 0) return null;
+
+    return `Search: "${keywords.join(' ')}"\n${items.join('\n')}`;
+  } catch {
+    return null;
+  }
 }
 
 /**
