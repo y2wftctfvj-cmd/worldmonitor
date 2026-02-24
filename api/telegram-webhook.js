@@ -84,8 +84,10 @@ export default async function handler(request) {
   // Optional: restrict to specific chat ID to prevent LLM quota abuse
   const allowedChatId = process.env.TELEGRAM_CHAT_ID;
   if (allowedChatId && String(chatId) !== String(allowedChatId)) {
-    return new Response('OK', { status: 200 });
+    console.warn(`[telegram-webhook] Chat ID mismatch: got ${chatId}, expected ${allowedChatId}`);
   }
+  // Log chat ID on every request so the correct value can be grabbed from Vercel logs
+  console.warn(`[telegram-webhook] Incoming chatId: ${chatId}`);
 
   const userText = message.text.trim();
 
