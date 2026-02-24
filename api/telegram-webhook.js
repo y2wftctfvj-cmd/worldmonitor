@@ -315,7 +315,14 @@ async function fetchMarketQuotes() {
  * Same channels as the dashboard OSINT panel.
  */
 async function fetchTelegramOsint() {
-  const channels = ['intelslava', 'militarysummary', 'RVvoenkor', 'breakingmash', 'legitimniy'];
+  const channels = [
+    // Conflict/geopolitical aggregators (public preview verified)
+    'intelslava', 'militarysummary', 'breakingmash', 'legitimniy',
+    // Middle East / Iran (public preview verified)
+    'iranintl_en', 'CIG_telegram',
+    // Global OSINT & intel aggregators (public preview verified)
+    'IntelRepublic', 'combatftg',
+  ];
 
   // Fetch all channels in parallel
   const results = await Promise.allSettled(
@@ -372,9 +379,9 @@ async function fetchTelegramOsint() {
 
   if (allPosts.length === 0) return null;
 
-  // Take the last 10 messages across all channels (most recent)
+  // Take the last 15 messages across all channels (most recent)
   return allPosts
-    .slice(-10)
+    .slice(-15)
     .map((p) => `- [${p.channel}] ${p.text}`)
     .join('\n');
 }
@@ -384,8 +391,11 @@ async function fetchTelegramOsint() {
  * Same sources as the dashboard OSINT panel: worldnews, geopolitics, osint, CredibleDefense.
  */
 async function fetchRedditOsint() {
-  const subreddits = ['worldnews', 'geopolitics', 'osint', 'CredibleDefense'];
-  const postsPerSub = 5;
+  const subreddits = [
+    'worldnews', 'geopolitics', 'osint', 'CredibleDefense',
+    'internationalsecurity', 'middleeastwar', 'iranpolitics',
+  ];
+  const postsPerSub = 3;
 
   // Fetch all subreddits in parallel
   const results = await Promise.allSettled(
