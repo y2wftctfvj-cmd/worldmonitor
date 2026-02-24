@@ -240,8 +240,15 @@ export class App {
     const storedVariant = localStorage.getItem('worldmonitor-variant');
     const currentVariant = SITE_VARIANT;
     console.log(`[App] Variant check: stored="${storedVariant}", current="${currentVariant}"`);
-    // Load saved focus mode (or default to Overview for a cleaner first experience)
-    this.activeFocusMode = localStorage.getItem(FOCUS_MODE_STORAGE_KEY) ?? DEFAULT_FOCUS_MODE;
+    // URL param ?focus=crisis overrides stored mode (enables bookmarkable focus links)
+    const urlFocusMode = new URL(window.location.href).searchParams.get('focus');
+    const validFocusIds = FOCUS_MODES.map((m) => m.id);
+    if (urlFocusMode && validFocusIds.includes(urlFocusMode)) {
+      this.activeFocusMode = urlFocusMode;
+      localStorage.setItem(FOCUS_MODE_STORAGE_KEY, urlFocusMode);
+    } else {
+      this.activeFocusMode = localStorage.getItem(FOCUS_MODE_STORAGE_KEY) ?? DEFAULT_FOCUS_MODE;
+    }
     this.alertCenter = new AlertCenter();
     this.chatPanel = new ChatPanel();
 
