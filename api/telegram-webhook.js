@@ -170,7 +170,9 @@ async function fetchContext() {
     return 'No live data available right now.';
   }
 
-  return sections.join('\n\n');
+  // Prepend timestamp so the LLM knows data freshness
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  return `DATA FETCHED AT: ${now}\n\n${sections.join('\n\n')}`;
 }
 
 /**
