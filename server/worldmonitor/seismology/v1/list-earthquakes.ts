@@ -38,7 +38,7 @@ export const listEarthquakes: SeismologyServiceHandler['listEarthquakes'] = asyn
   });
 
   if (!response.ok) {
-    throw new Error(`USGS API error: ${response.status}`);
+    return { earthquakes: [], pagination: undefined };
   }
 
   const geojson: any = await response.json();

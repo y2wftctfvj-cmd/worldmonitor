@@ -34,6 +34,22 @@ export async function summarizeArticle(
     .map(h => typeof h === 'string' ? h.slice(0, MAX_HEADLINE_LEN) : '');
   const sanitizedGeoContext = typeof geoContext === 'string' ? geoContext.slice(0, MAX_GEO_CONTEXT_LEN) : '';
 
+  // Request validation — check before credentials so missing keys don't mask bad input
+  if (!headlines || !Array.isArray(headlines) || headlines.length === 0) {
+    return {
+      summary: '',
+      model: '',
+      provider: provider,
+      cached: false,
+      tokens: 0,
+      fallback: false,
+      skipped: false,
+      reason: '',
+      error: 'Headlines array required',
+      errorType: 'ValidationError',
+    };
+  }
+
   // Provider credential check
   const skipReasons: Record<string, string> = {
     ollama: 'OLLAMA_API_URL not configured',
@@ -58,22 +74,6 @@ export async function summarizeArticle(
   }
 
   const { apiUrl, model, headers: providerHeaders, extraBody } = credentials;
-
-  // Request validation
-  if (!headlines || !Array.isArray(headlines) || headlines.length === 0) {
-    return {
-      summary: '',
-      model: '',
-      provider: provider,
-      cached: false,
-      tokens: 0,
-      fallback: false,
-      skipped: false,
-      reason: '',
-      error: 'Headlines array required',
-      errorType: 'ValidationError',
-    };
-  }
 
   try {
     // Check cache first (shared across all providers)

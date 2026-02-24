@@ -21,7 +21,7 @@ export default async function handler(req) {
   }
 
   const url = new URL(req.url);
-  const path = url.pathname.replace('/api/eia', '');
+  const path = url.pathname.replace(/^\\/api\\/eia/, '');
 
   const apiKey = process.env.EIA_API_KEY;
 
@@ -60,7 +60,7 @@ export default async function handler(req) {
         try {
           const response = await fetch(
             `https://api.eia.gov/v2/seriesid/${seriesId}?api_key=${apiKey}&num=2`,
-            { headers: { 'Accept': 'application/json' } }
+            { headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(8_000) }
           );
 
           if (!response.ok) return null;

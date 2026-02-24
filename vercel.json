@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/telegram-osint/:path*",
-      "destination": "/api/telegram-osint"
+      "destination": "/api/telegram-osint/:path*"
     },
     {
       "source": "/ingest/static/:path*",

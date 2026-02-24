@@ -773,7 +773,7 @@ export default defineConfig({
       },
       // RSS Feeds - CNN
       '/rss/cnn': {
-        target: 'http://rss.cnn.com',
+        target: 'https://rss.cnn.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/rss\/cnn/, ''),
       },

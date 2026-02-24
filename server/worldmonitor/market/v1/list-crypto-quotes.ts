@@ -26,36 +26,36 @@ export async function listCryptoQuotes(
   const cached = (await getCachedJson(cacheKey)) as ListCryptoQuotesResponse | null;
   if (cached?.quotes?.length) return cached;
 
-  const items = await fetchCoinGeckoMarkets(ids);
+  try {
+    const items = await fetchCoinGeckoMarkets(ids);
 
-  if (items.length === 0) {
-    throw new Error('CoinGecko returned no data');
+    if (items.length === 0) return { quotes: [] };
+
+    const byId = new Map(items.map((c) => [c.id, c]));
+    const quotes: CryptoQuote[] = [];
+
+    for (const id of ids) {
+      const coin = byId.get(id);
+      if (!coin) continue;
+      const meta = CRYPTO_META[id];
+      const prices = coin.sparkline_in_7d?.price;
+      const sparkline = prices && prices.length > 24 ? prices.slice(-48) : (prices || []);
+
+      quotes.push({
+        name: meta?.name || id,
+        symbol: meta?.symbol || id.toUpperCase(),
+        price: coin.current_price ?? 0,
+        change: coin.price_change_percentage_24h ?? 0,
+        sparkline,
+      });
+    }
+
+    if (quotes.every(q => q.price === 0)) return { quotes: [] };
+
+    const result: ListCryptoQuotesResponse = { quotes };
+    setCachedJson(cacheKey, result, REDIS_CACHE_TTL).catch(() => {});
+    return result;
+  } catch {
+    return { quotes: [] };
   }
-
-  const byId = new Map(items.map((c) => [c.id, c]));
-  const quotes: CryptoQuote[] = [];
-
-  for (const id of ids) {
-    const coin = byId.get(id);
-    if (!coin) continue;
-    const meta = CRYPTO_META[id];
-    const prices = coin.sparkline_in_7d?.price;
-    const sparkline = prices && prices.length > 24 ? prices.slice(-48) : (prices || []);
-
-    quotes.push({
-      name: meta?.name || id,
-      symbol: meta?.symbol || id.toUpperCase(),
-      price: coin.current_price ?? 0,
-      change: coin.price_change_percentage_24h ?? 0,
-      sparkline,
-    });
-  }
-
-  if (quotes.every(q => q.price === 0)) {
-    throw new Error('CoinGecko returned all-zero prices');
-  }
-
-  const result: ListCryptoQuotesResponse = { quotes };
-  setCachedJson(cacheKey, result, REDIS_CACHE_TTL).catch(() => {});
-  return result;
 }

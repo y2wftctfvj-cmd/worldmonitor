@@ -18,8 +18,13 @@ const BOT_UA = /twitterbot|facebookexternalhit|linkedinbot|slackbot|telegrambot|
 export default function handler(req, res) {
   const url = new URL(req.url, `https://${req.headers.host}`);
   const countryCode = (url.searchParams.get('c') || '').toUpperCase();
-  const type = url.searchParams.get('t') || 'ciianalysis';
-  const ts = url.searchParams.get('ts') || '';
+  // Validate type param against allowlist to prevent XSS via reflected input
+  const VALID_TYPES = new Set(['ciianalysis', 'military', 'market', 'prediction', 'unrest', 'cyber']);
+  const rawType = url.searchParams.get('t') || 'ciianalysis';
+  const type = VALID_TYPES.has(rawType) ? rawType : 'ciianalysis';
+  // Validate ts param: must be numeric timestamp (up to 13 digits)
+  const rawTs = url.searchParams.get('ts') || '';
+  const ts = /^\d{1,13}$/.test(rawTs) ? rawTs : '';
   const score = url.searchParams.get('s') || '';
   const level = url.searchParams.get('l') || '';
 

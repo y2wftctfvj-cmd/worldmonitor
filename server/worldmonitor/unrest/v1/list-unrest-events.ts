@@ -159,7 +159,7 @@ async function fetchGdeltEvents(): Promise<UnrestEvent[]> {
       const country = name.split(',').pop()?.trim() || name;
 
       events.push({
-        id: `gdelt-${lat.toFixed(2)}-${lon.toFixed(2)}-${Date.now()}`,
+        id: `gdelt-${lat.toFixed(2)}-${lon.toFixed(2)}-${name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 20)}`,
         title: `${name} (${count} reports)`,
         summary: '',
         eventType: classifyGdeltEventType(name),

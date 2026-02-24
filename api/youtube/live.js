@@ -33,12 +33,13 @@ export default async function handler(request) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       },
       redirect: 'follow',
+      signal: AbortSignal.timeout(10_000),
     });
 
     if (!response.ok) {
       return new Response(JSON.stringify({ videoId: null }), {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...cors },
       });
     }
 
@@ -68,7 +69,7 @@ export default async function handler(request) {
     console.error('YouTube live check error:', error);
     return new Response(JSON.stringify({ videoId: null, error: error.message }), {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...cors },
     });
   }
 }

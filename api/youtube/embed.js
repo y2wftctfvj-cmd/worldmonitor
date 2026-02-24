@@ -89,7 +89,7 @@ export default async function handler(request) {
         events:{
           onReady:function(){
             window.parent.postMessage({type:'yt-ready'},'*');
-            if(${autoplay}===1){player.playVideo()}
+            if(${autoplay}==1){player.playVideo()}
           },
           onError:function(e){window.parent.postMessage({type:'yt-error',code:e.data},'*')},
           onStateChange:function(e){

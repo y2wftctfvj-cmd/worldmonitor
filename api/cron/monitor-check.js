@@ -24,9 +24,7 @@ export const config = { runtime: 'edge' };
 // Thresholds — tweak these to control alert sensitivity
 // ---------------------------------------------------------------------------
 const THRESHOLDS = {
-  ciiDelta: 8,            // Crisis Impact Index delta threshold
   marketMove: 3,          // SPY daily % change to trigger alert
-  convergenceScore: 65,   // Convergence score threshold
 };
 
 // Max age (in milliseconds) for a GDELT article to be considered "breaking"

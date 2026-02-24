@@ -4,12 +4,11 @@ import type {
   RecordBaselineSnapshotResponse,
 } from '../../../../src/generated/server/worldmonitor/infrastructure/v1/service_server';
 
-import { setCachedJson } from '../../../_shared/redis';
+import { setCachedJson, getCachedJsonBatch } from '../../../_shared/redis';
 import {
   VALID_BASELINE_TYPES,
   BASELINE_TTL,
   makeBaselineKey,
-  mgetJson,
   type BaselineEntry,
 } from './_shared';
 
@@ -34,7 +33,8 @@ export async function recordBaselineSnapshot(
     const month = now.getUTCMonth() + 1;
 
     const keys = batch.map(u => makeBaselineKey(u.type, u.region || 'global', weekday, month));
-    const existing = await mgetJson(keys) as (BaselineEntry | null)[];
+    const existingMap = await getCachedJsonBatch(keys);
+    const existing = keys.map(k => (existingMap.get(k) as BaselineEntry | null) ?? null);
 
     const writes: Promise<void>[] = [];
 

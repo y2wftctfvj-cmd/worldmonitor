@@ -10,6 +10,7 @@ export default async function handler() {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'WorldMonitor-Version-Check',
       },
+      signal: AbortSignal.timeout(8_000),
     });
 
     if (!res.ok) {

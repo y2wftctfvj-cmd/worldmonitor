@@ -26,8 +26,8 @@ export default function middleware(request: Request) {
     return;
   }
 
-  // Allow social preview/image bots on OG image assets (bypasses Vercel Attack Challenge)
-  if (path.startsWith('/favico/') || path.endsWith('.png')) {
+  // Allow social preview/image bots on favico assets (bypasses Vercel Attack Challenge)
+  if (path.startsWith('/favico/')) {
     if (SOCIAL_IMAGE_UA.test(ua)) {
       return;
     }

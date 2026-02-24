@@ -38,30 +38,3 @@ export function getBaselineSeverity(zScore: number): string {
   if (zScore >= Z_THRESHOLD_LOW) return 'medium';
   return 'normal';
 }
-
-// ========================================================================
-// Upstash Redis MGET helper (edge-compatible)
-// getCachedJson / setCachedJson are imported from ../../../_shared/redis.ts
-// ========================================================================
-
-export async function mgetJson(keys: string[]): Promise<(unknown | null)[]> {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return keys.map(() => null);
-  try {
-    const resp = await fetch(`${url}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['MGET', ...keys]),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!resp.ok) return keys.map(() => null);
-    const data = (await resp.json()) as { result?: (string | null)[] };
-    return (data.result || []).map(v => v ? JSON.parse(v) : null);
-  } catch {
-    return keys.map(() => null);
-  }
-}

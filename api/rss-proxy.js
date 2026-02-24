@@ -201,7 +201,6 @@ const ALLOWED_DOMAINS = [
   // Additional
   'news.ycombinator.com',
   // Finance variant
-  'seekingalpha.com',
   'www.coindesk.com',
   'cointelegraph.com',
 ];
@@ -212,6 +211,13 @@ export default async function handler(req) {
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (isDisallowedOrigin(req)) {
+    return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    });
   }
 
   const requestUrl = new URL(req.url);
