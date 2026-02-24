@@ -63,6 +63,7 @@ export default async function handler(request) {
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'public, max-age=300, s-maxage=300, stale-while-revalidate=60',
+        ...cors,
       },
     });
   } catch (error) {
