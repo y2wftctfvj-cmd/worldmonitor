@@ -102,6 +102,7 @@ const APP_HOSTS = new Set([
   'worldmonitor.app',
   'www.worldmonitor.app',
   'tech.worldmonitor.app',
+  'worldmonitor-two-kappa.vercel.app',
   'localhost',
   '127.0.0.1',
 ]);
@@ -110,7 +111,7 @@ function isAppOriginUrl(urlStr: string): boolean {
   try {
     const u = new URL(urlStr);
     const host = u.hostname;
-    return APP_HOSTS.has(host) || host.endsWith('.worldmonitor.app');
+    return APP_HOSTS.has(host) || host.endsWith('.worldmonitor.app') || host.endsWith('.vercel.app');
   } catch {
     return false;
   }
