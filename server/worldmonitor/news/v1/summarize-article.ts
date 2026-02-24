@@ -81,7 +81,7 @@ export async function summarizeArticle(
     const cached = await getCachedJson(cacheKey);
     if (cached && typeof cached === 'object' && (cached as any).summary) {
       const c = cached as { summary: string; model?: string };
-      console.log(`[SummarizeArticle:${provider}] Cache hit:`, cacheKey);
+      console.warn(`[SummarizeArticle:${provider}] Cache hit:`, cacheKey);
       return {
         summary: c.summary,
         model: c.model || model,
