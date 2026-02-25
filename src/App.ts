@@ -62,7 +62,6 @@ import {
   StatusPanel,
   EconomicPanel,
   SearchModal,
-  MobileWarningModal,
   PizzIntIndicator,
   GdeltIntelPanel,
   LiveNewsPanel,
@@ -89,6 +88,7 @@ import {
   AlertCenter,
   ChatPanel,
 } from '@/components';
+import { MobileLayout } from '@/components/MobileLayout';
 import type { SearchResult } from '@/components/SearchModal';
 import { collectStoryData } from '@/services/story-data';
 import { renderStoryToCanvas } from '@/services/story-renderer';
@@ -175,7 +175,7 @@ export class App {
   private exportPanel: ExportPanel | null = null;
   private languageSelector: LanguageSelector | null = null;
   private searchModal: SearchModal | null = null;
-  private mobileWarningModal: MobileWarningModal | null = null;
+  private mobileLayout: MobileLayout | null = null;
   private pizzintIndicator: PizzIntIndicator | null = null;
   private latestPredictions: PredictionMarket[] = [];
   private latestMarkets: MarketData[] = [];
@@ -715,10 +715,9 @@ export class App {
   }
 
   private setupMobileWarning(): void {
-    if (MobileWarningModal.shouldShow()) {
-      this.mobileWarningModal = new MobileWarningModal();
-      this.mobileWarningModal.show();
-    }
+    if (!this.isMobile) return;
+    this.mobileLayout = new MobileLayout(this.container);
+    this.mobileLayout.mount();
   }
 
   private setupStatusPanel(): void {

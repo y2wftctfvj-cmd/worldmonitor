@@ -1,6 +1,8 @@
 @import './lang-switcher.css';
 @import './rtl-overrides.css';
 @import './panels.css';
+@import './glass.css';
+@import './mobile.css';
 
 /* ============================================================
    Theme Colors — overridden by [data-theme="light"] below
@@ -58,8 +60,8 @@
   --overlay-medium: rgba(255, 255, 255, 0.1);
   --overlay-heavy: rgba(255, 255, 255, 0.2);
   --shadow-color: rgba(0, 0, 0, 0.5);
-  --shadow-panel: 0 1px 3px rgba(0, 0, 0, 0.25), 0 1px 2px rgba(0, 0, 0, 0.15);
-  --shadow-panel-hover: 0 4px 12px rgba(0, 0, 0, 0.35), 0 2px 4px rgba(0, 0, 0, 0.2);
+  --shadow-panel: 0 0 0 1px rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.15);
+  --shadow-panel-hover: 0 0 0 1px rgba(255,255,255,0.05), 0 2px 4px rgba(0,0,0,0.35), 0 8px 24px rgba(0,0,0,0.25);
   --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
   --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
@@ -97,10 +99,6 @@
   --accent-primary: #6366f1;
   --accent-primary-hover: #818cf8;
   --accent-primary-subtle: rgba(99, 102, 241, 0.12);
-
-  /* Font stack */
-  --font-mono: 'SF Mono', 'Monaco', 'Cascadia Code', 'Fira Code', 'DejaVu Sans Mono', 'Liberation Mono', monospace;
-  --font-body: var(--font-mono);
 }
 
 [dir="rtl"] {

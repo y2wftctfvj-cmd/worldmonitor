@@ -1,0 +1,149 @@
+/* ============================================================
+   Mobile PWA Styles — bottom tab bar + card list
+   ============================================================ */
+
+/* --- Bottom tab bar (56px, safe-area-aware) --- */
+.mobile-tab-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: calc(56px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-around;
+  align-items: center;
+  z-index: 2000;
+}
+
+.mobile-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: color 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-tab.active {
+  color: var(--accent-primary);
+}
+
+.mobile-tab-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.mobile-tab-label {
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+/* --- Card list layout --- */
+.mobile-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 8px calc(64px + env(safe-area-inset-bottom, 0px));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  min-height: 50vh;
+}
+
+.mobile-card {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* --- Pull-to-refresh indicator --- */
+.mobile-refresh-indicator {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 8px;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+/* --- Compact mobile header (36px) --- */
+@media (max-width: 768px) {
+  .header {
+    height: 36px;
+    min-height: 36px;
+    padding: 0 8px;
+  }
+
+  /* Hide non-essential header controls on mobile */
+  .header .focus-mode-bar,
+  .header .region-selector,
+  .header .copy-link-btn,
+  .header .fullscreen-btn,
+  .header .sources-btn,
+  .header .credit-link,
+  .header .github-link,
+  .header .search-btn {
+    display: none;
+  }
+
+  .header .variant-label {
+    display: none;
+  }
+
+  .header .variant-divider {
+    display: none;
+  }
+
+  .header .version {
+    display: none;
+  }
+
+  .header .beta-badge {
+    display: none;
+  }
+
+  /* Compact map section when on map tab */
+  .map-section {
+    height: calc(100vh - 36px - 56px - env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Hide desktop panels grid on mobile — #id selector needed to beat
+     main.css line ~8792 which sets .panels-grid { display: flex !important }
+     in its own mobile media query. ID specificity wins over class. */
+  #panelsGrid {
+    display: none !important;
+  }
+
+  /* Main content fills available space */
+  .main-content {
+    height: calc(100vh - 36px);
+    overflow: hidden;
+  }
+
+  /* Card list needs to scroll within main-content */
+  .mobile-card-list {
+    height: calc(100vh - 36px);
+    overflow-y: auto;
+  }
+
+  /* Push community widget above the tab bar */
+  .community-widget {
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* --- Light mode tab bar --- */
+[data-theme="light"] .mobile-tab-bar {
+  background: var(--surface);
+  border-top-color: var(--border);
+}
