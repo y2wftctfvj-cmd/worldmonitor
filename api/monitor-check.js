@@ -82,12 +82,10 @@ export default async function handler(request) {
 
   try {
     // -----------------------------------------------------------------------
-    // 1. COLLECT — fetch all data sources in parallel
+    // 1. COLLECT — fetch all data sources in parallel (15s max for entire phase)
     // -----------------------------------------------------------------------
-    const [
-      headlines, markets, telegram, reddit, predictions,
-      earthquakes, outages, military, govFeeds,
-    ] = await Promise.allSettled([
+    const COLLECT_TIMEOUT_MS = 15000;
+    const collectPromise = Promise.allSettled([
       fetchGoogleNewsHeadlines(),
       fetchMarketQuotes(),
       fetchAllTelegramChannels(),
@@ -98,6 +96,21 @@ export default async function handler(request) {
       fetchMilitaryNews(),
       fetchGovFeeds(),
     ]);
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve(null), COLLECT_TIMEOUT_MS)
+    );
+    const collectResult = await Promise.race([collectPromise, timeoutPromise]);
+
+    // If collection timed out, use whatever we have (allSettled would have partial results)
+    const defaultRejected = { status: 'rejected', reason: 'collection timeout' };
+    const [
+      headlines, markets, telegram, reddit, predictions,
+      earthquakes, outages, military, govFeeds,
+    ] = collectResult || Array(9).fill(defaultRejected);
+
+    if (!collectResult) {
+      console.warn('[monitor-check] Collection phase timed out after 15s, using partial data');
+    }
 
     // -----------------------------------------------------------------------
     // 2. BUILD SNAPSHOT — assemble all data into one context string
@@ -479,7 +492,11 @@ async function updateDevelopingItems(findings, redisUrl, redisToken) {
   const thirtyMinAgo = now - 30 * 60 * 1000;
   const active = updated.filter(d => d.lastSeen > thirtyMinAgo);
 
-  await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(active), 3600);
+  try {
+    await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(active), 3600);
+  } catch (err) {
+    console.error('[monitor-check] Failed to save developing items:', err.message);
+  }
 }
 
 async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
@@ -530,6 +547,9 @@ async function storeSnapshot(redisUrl, redisToken, snapshot) {
 
   try {
     // Truncate snapshot if too large for Redis (max ~1MB for free tier)
+    if (snapshot.length > 500000) {
+      console.warn(`[monitor-check] Snapshot truncated: ${snapshot.length} → 500000 chars (${Math.round((snapshot.length - 500000) / 1000)}KB lost)`);
+    }
     const truncated = snapshot.length > 500000 ? snapshot.slice(0, 500000) : snapshot;
     await redisSet(redisUrl, redisToken, 'monitor:snapshot', truncated, SNAPSHOT_TTL_SECONDS);
   } catch (err) {
@@ -553,25 +573,34 @@ async function loadAllWatchlists(redisUrl, redisToken) {
 
     const data = await resp.json();
     const keys = data.result?.[1] || [];
+    if (keys.length === 0) return [];
 
+    // Batch GET all keys in a single pipeline call (instead of N+1 sequential)
+    const pipeline = keys.map(key => ['GET', key]);
+    const batchResp = await fetch(`${redisUrl}/pipeline`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${redisToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(pipeline),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!batchResp.ok) return [];
+
+    const batchData = await batchResp.json();
     const watchlists = [];
-    for (const key of keys) {
+    for (let i = 0; i < keys.length; i++) {
+      const result = batchData[i]?.result;
+      if (!result) continue;
       try {
-        const itemResp = await fetch(`${redisUrl}/get/${encodeURIComponent(key)}`, {
-          headers: { Authorization: `Bearer ${redisToken}` },
-          signal: AbortSignal.timeout(2000),
-        });
-        if (!itemResp.ok) continue;
-        const itemData = await itemResp.json();
-        if (!itemData.result) continue;
-
-        const items = JSON.parse(itemData.result);
+        const items = JSON.parse(result);
         if (Array.isArray(items) && items.length > 0) {
-          const chatId = key.replace('watchlist:', '');
+          const chatId = keys[i].replace('watchlist:', '');
           watchlists.push({ chatId, terms: items.map(w => w.term) });
         }
       } catch {
-        // Skip this watchlist
+        // Skip malformed watchlist
       }
     }
     return watchlists;

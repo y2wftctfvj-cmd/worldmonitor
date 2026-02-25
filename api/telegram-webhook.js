@@ -465,7 +465,13 @@ async function callLLMWithTools(messages, openRouterKey, groqKey) {
         }
 
         console.log(`[telegram-webhook] Tool call: ${toolName}(${JSON.stringify(toolArgs)})`);
-        const toolResult = await runTool(toolName, toolArgs);
+        let toolResult;
+        try {
+          toolResult = await runTool(toolName, toolArgs);
+        } catch (toolErr) {
+          console.error(`[telegram-webhook] Tool ${toolName} failed:`, toolErr.message || toolErr);
+          toolResult = `Tool "${toolName}" failed: ${toolErr.message || 'unknown error'}. Try a different approach.`;
+        }
 
         // Add the tool result
         currentMessages.push({
@@ -718,7 +724,12 @@ async function addToWatchlist(chatId, rawTerm, redisUrl, redisToken) {
   }
 
   const updated = [...watchlist, { term, addedAt: Date.now() }];
-  await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  try {
+    await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  } catch (err) {
+    console.error('[telegram-webhook] Watchlist save failed:', err.message);
+    return `Failed to save "${term}" to watchlist. Try again in a moment.`;
+  }
   return `Added "${term}" to watchlist. I'll alert you when it appears in any intel source.`;
 }
 
@@ -736,7 +747,12 @@ async function removeFromWatchlist(chatId, term, redisUrl, redisToken) {
     return `"${term}" was not on your watchlist.`;
   }
 
-  await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  try {
+    await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  } catch (err) {
+    console.error('[telegram-webhook] Watchlist save failed:', err.message);
+    return `Failed to remove "${term}". Try again in a moment.`;
+  }
   return `Removed "${term}" from watchlist.`;
 }
 
@@ -744,20 +760,19 @@ async function removeFromWatchlist(chatId, term, redisUrl, redisToken) {
  * Save watchlist to Redis (no TTL — persists indefinitely).
  */
 async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
-  try {
-    const key = `watchlist:${chatId}`;
-    const value = JSON.stringify(watchlist);
-    await fetch(`${redisUrl}/pipeline`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${redisToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify([['SET', key, value]]),
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch (err) {
-    console.error('[telegram-webhook] Failed to save watchlist:', err.message);
+  const key = `watchlist:${chatId}`;
+  const value = JSON.stringify(watchlist);
+  const resp = await fetch(`${redisUrl}/pipeline`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${redisToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([['SET', key, value]]),
+    signal: AbortSignal.timeout(2000),
+  });
+  if (!resp.ok) {
+    throw new Error(`Redis SET failed: ${resp.status}`);
   }
 }
 
@@ -769,8 +784,7 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return [];
 
   try {
-    // Use SCAN to find all watchlist keys
-    // Upstash REST: /scan/0/match/watchlist:*/count/100
+    // SCAN for all watchlist keys
     const resp = await fetch(`${redisUrl}/scan/0/match/watchlist:*/count/100`, {
       headers: { Authorization: `Bearer ${redisToken}` },
       signal: AbortSignal.timeout(3000),
@@ -779,16 +793,34 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
 
     const data = await resp.json();
     const keys = data.result?.[1] || [];
+    if (keys.length === 0) return [];
 
+    // Batch GET all keys in a single pipeline call (instead of N+1 sequential)
+    const pipeline = keys.map(key => ['GET', key]);
+    const batchResp = await fetch(`${redisUrl}/pipeline`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${redisToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(pipeline),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!batchResp.ok) return [];
+
+    const batchData = await batchResp.json();
     const watchlists = [];
-    for (const key of keys) {
-      const chatId = key.replace('watchlist:', '');
-      const items = await loadWatchlist(chatId, redisUrl, redisToken);
-      if (items.length > 0) {
-        watchlists.push({
-          chatId,
-          terms: items.map(w => w.term),
-        });
+    for (let i = 0; i < keys.length; i++) {
+      const result = batchData[i]?.result;
+      if (!result) continue;
+      try {
+        const items = JSON.parse(result);
+        if (Array.isArray(items) && items.length > 0) {
+          const chatId = keys[i].replace('watchlist:', '');
+          watchlists.push({ chatId, terms: items.map(w => w.term) });
+        }
+      } catch {
+        // Skip malformed watchlist
       }
     }
     return watchlists;

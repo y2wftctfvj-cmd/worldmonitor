@@ -243,27 +243,30 @@ async function toolSearchTelegram(query) {
 }
 
 async function toolSearchReddit(query) {
-  // Use Reddit search API across all tracked subreddits
-  const subredditsToSearch = SUBREDDITS;
+  // Use Reddit search API across tracked subreddits — batch 4 at a time to avoid rate limits
   const allResults = [];
+  const BATCH_SIZE = 4;
 
-  const searches = await Promise.allSettled(
-    subredditsToSearch.map(async (sub) => {
-      const url = `https://www.reddit.com/r/${sub}/search.json?q=${encodeURIComponent(query)}&restrict_sr=on&sort=relevance&t=day&limit=3&raw_json=1`;
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': 'WorldMonitor/2.7' },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!resp.ok) return [];
-      const data = await resp.json();
-      return (data?.data?.children || [])
-        .filter(c => c?.data?.title)
-        .map(c => ({ sub, title: c.data.title, score: c.data.score || 0 }));
-    })
-  );
+  for (let i = 0; i < SUBREDDITS.length; i += BATCH_SIZE) {
+    const batch = SUBREDDITS.slice(i, i + BATCH_SIZE);
+    const searches = await Promise.allSettled(
+      batch.map(async (sub) => {
+        const url = `https://www.reddit.com/r/${sub}/search.json?q=${encodeURIComponent(query)}&restrict_sr=on&sort=relevance&t=day&limit=3&raw_json=1`;
+        const resp = await fetch(url, {
+          headers: { 'User-Agent': 'WorldMonitor/2.7' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return [];
+        const data = await resp.json();
+        return (data?.data?.children || [])
+          .filter(c => c?.data?.title)
+          .map(c => ({ sub, title: c.data.title, score: c.data.score || 0 }));
+      })
+    );
 
-  for (const result of searches) {
-    if (result.status === 'fulfilled') allResults.push(...result.value);
+    for (const result of searches) {
+      if (result.status === 'fulfilled') allResults.push(...result.value);
+    }
   }
 
   if (allResults.length === 0) return `No Reddit results for "${query}" in the last 24 hours.`;
@@ -569,34 +572,42 @@ export async function fetchAllTelegramChannels() {
  */
 export async function fetchAllRedditPosts() {
   const postsPerSub = 3;
-  const results = await Promise.allSettled(
-    SUBREDDITS.map(async (sub) => {
-      const url = `https://www.reddit.com/r/${sub}/hot.json?limit=${postsPerSub}&raw_json=1`;
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': 'WorldMonitor/2.7' },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!resp.ok) return [];
+  const BATCH_SIZE = 4;
+  const allPosts = [];
 
-      const data = await resp.json();
-      const children = data?.data?.children;
-      if (!Array.isArray(children)) return [];
+  // Batch 4 subreddits at a time to avoid Reddit rate limits
+  for (let i = 0; i < SUBREDDITS.length; i += BATCH_SIZE) {
+    const batch = SUBREDDITS.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(async (sub) => {
+        const url = `https://www.reddit.com/r/${sub}/hot.json?limit=${postsPerSub}&raw_json=1`;
+        const resp = await fetch(url, {
+          headers: { 'User-Agent': 'WorldMonitor/2.7' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return [];
 
-      return children
-        .filter((c) => c?.data?.title && !c.data.stickied)
-        .map((c) => ({
-          sub,
-          title: c.data.title,
-          score: c.data.score || 0,
-          comments: c.data.num_comments || 0,
-        }));
-    })
-  );
+        const data = await resp.json();
+        const children = data?.data?.children;
+        if (!Array.isArray(children)) return [];
 
-  return results
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value)
-    .sort((a, b) => b.score - a.score);
+        return children
+          .filter((c) => c?.data?.title && !c.data.stickied)
+          .map((c) => ({
+            sub,
+            title: c.data.title,
+            score: c.data.score || 0,
+            comments: c.data.num_comments || 0,
+          }));
+      })
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled') allPosts.push(...r.value);
+    }
+  }
+
+  return allPosts.sort((a, b) => b.score - a.score);
 }
 
 /**

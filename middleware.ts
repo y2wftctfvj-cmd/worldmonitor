@@ -31,6 +31,11 @@ export default function middleware(request: Request) {
     return;
   }
 
+  // Allow PostHog analytics proxy — PostHog ingestion uses non-browser UAs
+  if (path === '/ingest' || path.startsWith('/ingest/')) {
+    return;
+  }
+
   // Allow social preview/image bots on favico assets (bypasses Vercel Attack Challenge)
   if (path.startsWith('/favico/')) {
     if (SOCIAL_IMAGE_UA.test(ua)) {

@@ -55,8 +55,8 @@ export async function fetchGeopoliticalMarkets() {
           title: market.question || event.title || 'Unknown',
           probability: Math.round(probability * 100),
           volume: isNaN(volume) ? 0 : volume,
-          // Polymarket doesn't directly expose 24h change in the API,
-          // so we track it ourselves via Redis in the analysis cycle
+          // TODO: Polymarket doesn't expose 24h change — need to store
+          // prices in Redis each cycle and compute deltas ourselves
           slug: market.slug || event.slug || '',
         });
       }
