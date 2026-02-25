@@ -159,22 +159,27 @@ export default async function handler(request) {
       const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
       for (const finding of analysis.findings) {
-        if (finding.severity === 'routine') continue;
+        // Only routine and urgent pass through — notable is logged, not pushed
+        if (finding.severity === 'routine' || finding.severity === 'notable') continue;
 
         // Cross-source verification: Telegram-only claims get downgraded
         const sources = finding.sources || [];
         const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
         const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
         if (isTelegramOnly && finding.severity !== 'developing') {
-          console.log(`[monitor-check] Downgrading "${finding.title}" — Telegram-only source`);
           finding.severity = 'developing';
-          finding.title = `UNVERIFIED: ${finding.title}`;
+          // Avoid double prefix if AI already added UNVERIFIED
+          if (!finding.title.startsWith('UNVERIFIED')) {
+            finding.title = `UNVERIFIED: ${finding.title}`;
+          }
         }
 
         // Skip developing items from alerting (they go to tracking instead)
         if (finding.severity === 'developing') { skippedDeveloping++; continue; }
 
-        // Similarity-based dedup: skip if >50% word overlap with any recent alert
+        // At this point only "urgent" findings remain
+
+        // Similarity-based dedup: skip if >40% word overlap with any recent alert
         const isDuplicate = recentTitles.some(
           recent => jaccardSimilarity(finding.title, recent) > 0.4
         );
@@ -312,15 +317,14 @@ OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
   "situation_summary": "1 paragraph overall assessment"
 }
 
-SEVERITY RULES:
-- "routine": Normal news cycle. Do NOT alert.
-- "notable": Genuinely unusual — not just normal news. Alert with analysis.
-- "urgent": Multiple sources converging OR rapid change from previous cycle. Alert immediately.
-- "developing": A situation is building but has not triggered yet. Track it.
-- Cross-domain convergence (e.g., military news + market move + prediction shift) should ALWAYS be flagged as notable or urgent.
-- Only flag "notable" if genuinely unusual (not routine news cycles).
-- Check watchlist terms against ALL sources.
-- Maximum 5 findings per cycle to avoid alert fatigue.
+SEVERITY RULES (BE STRICT — the user gets a phone notification for each alert):
+- "routine": The DEFAULT for everything. Ongoing situations, diplomatic rhetoric, political statements, policy debates, existing conflicts with no new development — ALL routine. If you saw similar headlines yesterday, it is routine.
+- "notable": Reserve for genuinely NEW developments that changed in the last 5 minutes. Examples: a new military strike, a sudden market crash (>3% in an hour), a new natural disaster, a surprise political event (resignation, coup, emergency declaration). NOT: "tensions are escalating" (that is just commentary), "contradictory signals" (that is analysis, not an event), "rhetoric intensifies" (words are not events).
+- "urgent": A concrete, confirmed event that is happening RIGHT NOW and affects multiple domains. Examples: active military engagement confirmed by 2+ sources, market circuit breaker triggered, major leader killed/captured (confirmed). Must have hard evidence, not just rhetoric or speculation.
+- "developing": Something might be emerging but is too early to call. Use this instead of notable when uncertain.
+- Cross-domain convergence (e.g., military strike + oil spike + prediction market jump) can elevate to urgent.
+- Check watchlist terms against ALL sources. Watchlist match = "notable" ONLY if there is a new concrete event, not just another article about the same ongoing situation.
+- Maximum 3 findings per cycle. Most cycles should have 0 notable/urgent findings — that is normal and correct. Do NOT manufacture alerts from routine news.
 
 SOURCE VERIFICATION (CRITICAL):
 - Telegram channels often post unverified, exaggerated, or completely false claims.
