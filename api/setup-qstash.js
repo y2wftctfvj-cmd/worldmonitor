@@ -45,7 +45,7 @@ async function setupQStashSchedule() {
       headers['Upstash-Forward-Authorization'] = `Bearer ${CRON_SECRET}`;
     }
 
-    const resp = await fetch(`https://qstash.upstash.io/v2/schedules/${encodeURIComponent(DESTINATION)}`, {
+    const resp = await fetch(`https://qstash.upstash.io/v2/schedules/${DESTINATION}`, {
       method: 'POST',
       headers,
     });
