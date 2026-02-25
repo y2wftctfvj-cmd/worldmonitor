@@ -31,7 +31,7 @@ import {
 // ---------------------------------------------------------------------------
 const TEMPERATURE = 0.3;
 const MAX_TOKENS = 2000;
-const LLM_TIMEOUT_MS = 30000; // Qwen can be slower with big context
+const LLM_TIMEOUT_MS = 18000; // Must fit within Vercel's 30s edge limit after context fetch
 const MAX_TOOL_CALLS_PER_TURN = 3;
 const TELEGRAM_MAX_LENGTH = 4096;
 
@@ -262,14 +262,26 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
 // ---------------------------------------------------------------------------
 
 async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, groqKey) {
-  // Fetch ALL data sources in parallel
-  const [headlines, markets, telegram, reddit, predictions] = await Promise.allSettled([
+  // Fetch ALL data sources in parallel — 10s max, leaves ~18s for LLM
+  const BRIEF_FETCH_TIMEOUT_MS = 10000;
+  const fetchPromise = Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
     fetchAllTelegramChannels(),
     fetchAllRedditPosts(),
     fetchGeopoliticalMarkets(),
   ]);
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve(null), BRIEF_FETCH_TIMEOUT_MS)
+  );
+  const result = await Promise.race([fetchPromise, timeoutPromise]);
+
+  const defaultRejected = { status: 'rejected', reason: 'brief fetch timeout' };
+  const [headlines, markets, telegram, reddit, predictions] = result || Array(5).fill(defaultRejected);
+
+  if (!result) {
+    console.warn('[telegram-webhook] Brief fetch timed out after 10s, using partial data');
+  }
 
   const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
 
@@ -386,13 +398,26 @@ async function generateStatus() {
 async function fetchContext(userQuery = '') {
   const sections = [];
 
-  const [headlines, quotes, reddit, telegram, topicNews] = await Promise.allSettled([
+  // 8s max for context fetching — leaves ~20s for LLM within Vercel's 30s edge limit
+  const CONTEXT_TIMEOUT_MS = 8000;
+  const fetchPromise = Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
     fetchAllRedditPosts(),
     fetchAllTelegramChannels(),
     fetchTopicNews(userQuery),
   ]);
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve(null), CONTEXT_TIMEOUT_MS)
+  );
+  const result = await Promise.race([fetchPromise, timeoutPromise]);
+
+  const defaultRejected = { status: 'rejected', reason: 'context timeout' };
+  const [headlines, quotes, reddit, telegram, topicNews] = result || Array(5).fill(defaultRejected);
+
+  if (!result) {
+    console.warn('[telegram-webhook] Context fetch timed out after 8s, using partial data');
+  }
 
   if (topicNews.status === 'fulfilled' && topicNews.value) {
     sections.push(`TOPIC-SPECIFIC NEWS:\n${topicNews.value}`);
