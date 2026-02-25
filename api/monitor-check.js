@@ -152,14 +152,14 @@ export default async function handler(request) {
     // 7. ALERT — send notable/urgent findings to Telegram
     // -----------------------------------------------------------------------
     let alertsSent = 0;
-    const debugInfo = { recentTitlesLoaded: 0, savedTitles: [], skippedDeveloping: 0, skippedDuplicate: 0, skippedRoutine: 0 };
+    let skippedDeveloping = 0;
+    let skippedDuplicate = 0;
     if (analysis && analysis.findings) {
       // Load recent alert titles for similarity-based dedup
       const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
-      debugInfo.recentTitlesLoaded = recentTitles.length;
 
       for (const finding of analysis.findings) {
-        if (finding.severity === 'routine') { debugInfo.skippedRoutine++; continue; }
+        if (finding.severity === 'routine') continue;
 
         // Cross-source verification: Telegram-only claims get downgraded
         const sources = finding.sources || [];
@@ -172,20 +172,19 @@ export default async function handler(request) {
         }
 
         // Skip developing items from alerting (they go to tracking instead)
-        if (finding.severity === 'developing') { debugInfo.skippedDeveloping++; continue; }
+        if (finding.severity === 'developing') { skippedDeveloping++; continue; }
 
         // Similarity-based dedup: skip if >50% word overlap with any recent alert
         const isDuplicate = recentTitles.some(
           recent => jaccardSimilarity(finding.title, recent) > 0.4
         );
         if (isDuplicate) {
-          debugInfo.skippedDuplicate++;
+          skippedDuplicate++;
           continue;
         }
 
         await sendIntelAlert(botToken, chatId, finding);
         await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
-        debugInfo.savedTitles.push(finding.title.substring(0, 60));
         alertsSent++;
       }
 
@@ -205,8 +204,9 @@ export default async function handler(request) {
       ok: true,
       alertsSent,
       findings: analysis?.findings?.length || 0,
+      skippedDeveloping,
+      skippedDuplicate,
       summary: analysis?.situation_summary?.substring(0, 200) || '',
-      debug: debugInfo,
     });
   } catch (err) {
     console.error('[monitor-check] Cycle failed:', err.message || err);
