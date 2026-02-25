@@ -1,8 +1,9 @@
 /**
  * Chat API Endpoint — AI-powered Q&A about dashboard data.
  *
- * Accepts user messages with dashboard context, returns AI analysis
- * via Groq (primary) with OpenRouter fallback. Both use Llama 3.1 8B.
+ * v2.7.0: Upgraded to Qwen 3.5 Plus (primary) with DeepSeek V3.2 and
+ * Groq Llama fallbacks. Max tokens increased to 2000. Monitor persona
+ * upgraded with cross-domain analysis and probability-based reasoning.
  *
  * Request: POST /api/chat
  *   Body: {
@@ -30,11 +31,17 @@ const MAX_HISTORY_MESSAGE_LENGTH = 5000;
 
 // --- LLM settings ---
 const TEMPERATURE = 0.3;
-const MAX_TOKENS = 500;
-const REQUEST_TIMEOUT_MS = 15000;
+const MAX_TOKENS = 2000;
+const REQUEST_TIMEOUT_MS = 30000;
 
-// --- Monitor persona: defines how the AI behaves ---
+// --- Monitor persona: v2.7 upgraded ---
 const SYSTEM_PROMPT = `You are Monitor, a senior intelligence analyst for World Monitor.
+
+IDENTITY:
+- Direct, concise, data-driven. No filler.
+- You think in probabilities and leading indicators.
+- You proactively flag cross-domain connections nobody asked about.
+- You challenge assumptions when evidence contradicts them.
 
 RULES:
 - Every claim MUST reference dashboard data provided in context. No speculation without evidence.
@@ -43,11 +50,12 @@ RULES:
 - Flag cross-domain connections proactively (e.g., military + shipping + oil = escalation signal).
 - When uncertain, give probability ranges, not certainties.
 - Be concise. 2-4 sentences for simple questions, up to a paragraph for analysis.
+- Always end analysis with: "Watch for:" + 2-3 specific next indicators.
 - Never start with "I'd be happy to help" or similar filler.
 - If asked about something not in the dashboard context, say "I don't have data on that right now."`;
 
 export default async function handler(request) {
-  // --- CORS preflight: browsers send OPTIONS before POST ---
+  // CORS preflight
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -55,7 +63,6 @@ export default async function handler(request) {
     });
   }
 
-  // --- Only accept POST requests ---
   if (request.method !== 'POST') {
     return new Response(JSON.stringify({ error: 'Method not allowed' }), {
       status: 405,
@@ -63,7 +70,6 @@ export default async function handler(request) {
     });
   }
 
-  // --- Block requests from unknown origins ---
   if (isDisallowedOrigin(request)) {
     return new Response(JSON.stringify({ error: 'Forbidden' }), {
       status: 403,
@@ -71,14 +77,12 @@ export default async function handler(request) {
     });
   }
 
-  // --- Check that at least one LLM provider is configured ---
-  const groqKey = process.env.GROQ_API_KEY;
+  // Check LLM providers
   const openRouterKey = process.env.OPENROUTER_API_KEY;
-  if (!groqKey && !openRouterKey) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!openRouterKey && !groqKey) {
     return new Response(
-      JSON.stringify({
-        error: 'No AI providers configured. Set GROQ_API_KEY or OPENROUTER_API_KEY in Vercel env vars.',
-      }),
+      JSON.stringify({ error: 'No AI providers configured. Set OPENROUTER_API_KEY or GROQ_API_KEY in Vercel env vars.' }),
       {
         status: 503,
         headers: { ...getCorsHeaders(request, 'POST, OPTIONS'), 'Content-Type': 'application/json' },
@@ -86,8 +90,7 @@ export default async function handler(request) {
     );
   }
 
-  // --- Rate limit: 30 requests/minute per IP via Upstash Redis ---
-  // Use x-real-ip (set by Vercel) first, then last x-forwarded-for entry (most trusted)
+  // Rate limit
   const ip = request.headers.get('x-real-ip')?.trim()
     || request.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
     || 'anonymous';
@@ -102,7 +105,7 @@ export default async function handler(request) {
     });
   }
 
-  // --- Parse the request body ---
+  // Parse request
   let payload;
   try {
     payload = await request.json();
@@ -115,7 +118,7 @@ export default async function handler(request) {
 
   const { message, context, history } = payload;
 
-  // --- Validate: message is required and within size limits ---
+  // Validate message
   if (!message || typeof message !== 'string') {
     return new Response(JSON.stringify({ error: 'Missing or invalid message' }), {
       status: 400,
@@ -133,7 +136,7 @@ export default async function handler(request) {
     );
   }
 
-  // --- Validate context size (dashboard data can be large but not unbounded) ---
+  // Validate context
   if (context && (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH)) {
     return new Response(
       JSON.stringify({ error: `Context too long (max ${MAX_CONTEXT_LENGTH} characters)` }),
@@ -144,11 +147,25 @@ export default async function handler(request) {
     );
   }
 
-  // --- Build the messages array for the LLM ---
+  // Build messages
   const messages = buildMessages(message, context, history);
 
-  // --- Try Groq first, fall back to OpenRouter ---
+  // Build provider list: Qwen 3.5 Plus → DeepSeek V3.2 → Groq Llama
   const providers = [];
+  if (openRouterKey) {
+    providers.push({
+      name: 'Qwen',
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'qwen/qwen3.5-plus-02-15',
+      apiKey: openRouterKey,
+    });
+    providers.push({
+      name: 'DeepSeek',
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'deepseek/deepseek-v3.2',
+      apiKey: openRouterKey,
+    });
+  }
   if (groqKey) {
     providers.push({
       name: 'Groq',
@@ -157,20 +174,11 @@ export default async function handler(request) {
       apiKey: groqKey,
     });
   }
-  if (openRouterKey) {
-    providers.push({
-      name: 'OpenRouter',
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      model: 'meta-llama/llama-3.1-8b-instruct:free',
-      apiKey: openRouterKey,
-    });
-  }
 
-  // --- Attempt each provider in order until one succeeds ---
+  // Try each provider
   for (const provider of providers) {
     try {
       const reply = await callProvider(provider, messages);
-      // Success — return the AI response
       return new Response(
         JSON.stringify({ reply, provider: provider.name }),
         {
@@ -179,12 +187,11 @@ export default async function handler(request) {
         }
       );
     } catch (err) {
-      // Log and try the next provider
       console.error(`[chat] ${provider.name} failed:`, err.message || err);
     }
   }
 
-  // --- All providers failed ---
+  // All failed
   return new Response(
     JSON.stringify({ error: 'All AI providers failed. Try again in a moment.' }),
     {
@@ -196,20 +203,12 @@ export default async function handler(request) {
 
 /**
  * Build the messages array sent to the LLM.
- *
- * Structure:
- *   1. System prompt (Monitor persona)
- *   2. Dashboard context as a second system message (if provided)
- *   3. Last 10 conversation history entries (user/assistant roles only)
- *   4. The current user message
  */
 function buildMessages(message, context, history) {
   const messages = [];
 
-  // Always start with the Monitor persona
   messages.push({ role: 'system', content: SYSTEM_PROMPT });
 
-  // Inject dashboard context so the LLM can reference real data
   if (context && typeof context === 'string') {
     messages.push({
       role: 'system',
@@ -217,7 +216,7 @@ function buildMessages(message, context, history) {
     });
   }
 
-  // Include recent conversation history for continuity (max 10 turns, each capped)
+  // Recent conversation history (max 10 turns)
   if (Array.isArray(history)) {
     const validRoles = new Set(['user', 'assistant']);
     const recentHistory = history
@@ -225,7 +224,6 @@ function buildMessages(message, context, history) {
       .slice(-MAX_HISTORY_ENTRIES);
 
     for (const msg of recentHistory) {
-      // Truncate individual history messages to prevent payload abuse
       const content = msg.content.length > MAX_HISTORY_MESSAGE_LENGTH
         ? msg.content.slice(0, MAX_HISTORY_MESSAGE_LENGTH)
         : msg.content;
@@ -233,17 +231,13 @@ function buildMessages(message, context, history) {
     }
   }
 
-  // The current question from the user
   messages.push({ role: 'user', content: message });
 
   return messages;
 }
 
 /**
- * Call a single LLM provider (Groq or OpenRouter).
- *
- * Returns the assistant's reply text, or throws on failure.
- * Uses a 15-second timeout to avoid hanging requests.
+ * Call a single LLM provider.
  */
 async function callProvider(provider, messages) {
   const response = await fetch(provider.url, {
@@ -267,8 +261,6 @@ async function callProvider(provider, messages) {
   }
 
   const data = await response.json();
-
-  // Extract the reply text from the standard OpenAI-compatible response format
   const reply = data?.choices?.[0]?.message?.content;
   if (!reply) {
     throw new Error(`${provider.name} returned no content in response`);
@@ -278,20 +270,12 @@ async function callProvider(provider, messages) {
 }
 
 /**
- * Rate limit via Upstash Redis pipeline (same pattern as telegram-alert.js).
- *
- * Uses INCR + EXPIRE with NX flag:
- *   - INCR atomically increments the counter for this IP
- *   - EXPIRE NX sets a 60-second TTL only if one isn't already set
- *   - If the count exceeds 30, the request is rate-limited
- *
- * Gracefully degrades: if Redis is down or not configured, allow the request.
+ * Rate limit via Upstash Redis.
  */
 async function isRateLimited(ip) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-  // If Redis isn't configured, skip rate limiting (graceful degradation)
   if (!url || !token) return false;
 
   const key = `rl:chat:${ip}`;
@@ -312,7 +296,6 @@ async function isRateLimited(ip) {
     const count = results?.[0]?.result ?? 0;
     return count > RATE_LIMIT;
   } catch {
-    // Redis error — allow the request rather than block legitimate users
     return false;
   }
 }

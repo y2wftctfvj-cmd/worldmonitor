@@ -1,12 +1,13 @@
 /**
  * Telegram Webhook — lets users chat with Monitor via Telegram.
  *
- * Telegram sends a POST with an Update object whenever someone messages the bot.
- * We validate the request, fetch lightweight context (GDELT headlines + market quotes),
- * run it through Groq/OpenRouter with the Monitor persona, and reply via Bot API.
+ * v2.7.0: Upgraded to Qwen 3.5 Plus (1M context, tool-calling),
+ * conversation memory (Redis, 30 turns, 48h TTL), watchlist commands,
+ * and the full Monitor intelligence analyst persona.
  *
  * Auth: secret token passed as ?token= query param (must match CRON_SECRET).
- * Stateless: no conversation history across messages.
+ *
+ * Commands: /watch, /unwatch, /watches, /brief, /status, /clear
  *
  * Setup (one-time):
  *   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=https://worldmonitor.app/api/telegram-webhook?token=${CRON_SECRET}"
@@ -14,35 +15,69 @@
 
 export const config = { runtime: 'edge' };
 
-// --- LLM settings (same as chat.js) ---
-const TEMPERATURE = 0.3;
-const MAX_TOKENS = 500;
-const LLM_TIMEOUT_MS = 15000;
+import {
+  TOOL_DEFINITIONS,
+  runTool,
+  fetchGoogleNewsHeadlines,
+  fetchMarketQuotes,
+  fetchAllTelegramChannels,
+  fetchAllRedditPosts,
+  fetchTopicNews,
+  fetchGeopoliticalMarkets,
+} from './tools/monitor-tools.js';
 
-// --- Telegram message length cap ---
+// ---------------------------------------------------------------------------
+// LLM settings
+// ---------------------------------------------------------------------------
+const TEMPERATURE = 0.3;
+const MAX_TOKENS = 2000;
+const LLM_TIMEOUT_MS = 30000; // Qwen can be slower with big context
+const MAX_TOOL_CALLS_PER_TURN = 3;
 const TELEGRAM_MAX_LENGTH = 4096;
 
-// --- Monitor persona (same as chat.js) ---
-const SYSTEM_PROMPT = `You are Monitor, a senior intelligence analyst for World Monitor.
+// ---------------------------------------------------------------------------
+// Conversation memory settings
+// ---------------------------------------------------------------------------
+const MAX_HISTORY_MESSAGES = 30;
+const HISTORY_TTL_SECONDS = 48 * 60 * 60; // 48 hours
+const MAX_WATCHLIST_ITEMS = 20;
 
-RULES:
-- You can ONLY cite information from the CURRENT INTELLIGENCE DATA provided below. Do NOT use your training data, memory, or general knowledge to make claims about current events.
-- If the user asks about a topic not covered in the provided context, say: "No data on that in the current feed. Try asking about [list 2-3 topics you DO have data on]."
-- NEVER fabricate, invent, or recall news articles, sources, or events from your training data. If it's not in the context below, you don't know it.
-- Lead with the answer, then supporting evidence from the context.
-- Flag cross-domain connections proactively (e.g., military + shipping + oil = escalation signal).
-- When uncertain, give probability ranges, not certainties.
-- Be concise. 2-4 sentences for simple questions, up to a paragraph for analysis.
-- Never start with "I'd be happy to help" or similar filler.
-- Format for Telegram: use *bold* for emphasis, keep paragraphs short.`;
+// ---------------------------------------------------------------------------
+// Monitor persona — v2.7 upgraded
+// ---------------------------------------------------------------------------
+const SYSTEM_PROMPT = `You are Monitor, a senior intelligence analyst.
 
+IDENTITY:
+- Direct, concise, data-driven. No filler.
+- You think in probabilities and leading indicators.
+- You proactively flag cross-domain connections nobody asked about.
+- You challenge assumptions when evidence contradicts them.
+
+CAPABILITIES:
+- You have tools to search news, markets, Telegram, Reddit, prediction markets, earthquake data, and flight anomalies. Use them when asked about topics not in your current context.
+- You remember conversations for 48 hours.
+- You maintain watchlists that trigger proactive alerts.
+- When analyzing a situation, always consider: What are the precursors? What would escalation look like? What are the leading indicators to watch?
+
+ANALYSIS FRAMEWORK:
+- Cite your source for every claim (which feed/tool provided it)
+- Flag data age: if >2h old, say so
+- When 2+ unrelated signals converge on the same region/topic, highlight it as a convergence signal and explain why it matters
+- Give probability ranges, not certainties
+- Always end analysis with: "Watch for:" + 2-3 specific next indicators
+
+FORMAT: Telegram. Use *bold* for key points. Short paragraphs.
+Never start with "I'd be happy to help" or similar filler.`;
+
+// ---------------------------------------------------------------------------
+// Main handler
+// ---------------------------------------------------------------------------
 export default async function handler(request) {
-  // Only accept POST (Telegram always POSTs)
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
 
-  // --- Validate secret token to prevent unauthorized access ---
+  // Validate secret token
   const url = new URL(request.url);
   const token = url.searchParams.get('token');
   const cronSecret = process.env.CRON_SECRET;
@@ -50,21 +85,25 @@ export default async function handler(request) {
     return new Response('Unauthorized', { status: 401 });
   }
 
-  // --- Verify Telegram + LLM providers are configured ---
+  // Verify Telegram + LLM providers are configured
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) {
     console.error('[telegram-webhook] TELEGRAM_BOT_TOKEN not set');
     return new Response('Bot not configured', { status: 503 });
   }
 
-  const groqKey = process.env.GROQ_API_KEY;
   const openRouterKey = process.env.OPENROUTER_API_KEY;
-  if (!groqKey && !openRouterKey) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!openRouterKey && !groqKey) {
     console.error('[telegram-webhook] No LLM provider configured');
     return new Response('AI not configured', { status: 503 });
   }
 
-  // --- Parse the Telegram Update ---
+  // Redis config for conversation memory + watchlist
+  const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  // Parse the Telegram Update
   let update;
   try {
     update = await request.json();
@@ -72,16 +111,15 @@ export default async function handler(request) {
     return new Response('Invalid JSON', { status: 400 });
   }
 
-  // Only handle text messages (ignore photos, stickers, edits, callbacks, etc.)
+  // Only handle text messages
   const message = update?.message;
   if (!message?.text || !message?.chat?.id) {
-    // Return 200 so Telegram doesn't retry non-text updates
     return new Response('OK', { status: 200 });
   }
 
   const chatId = message.chat.id;
 
-  // Restrict to specific chat ID to prevent LLM quota abuse
+  // Restrict to specific chat ID
   const allowedChatId = process.env.TELEGRAM_CHAT_ID?.trim();
   if (allowedChatId && String(chatId) !== allowedChatId) {
     console.warn(`[telegram-webhook] Blocked chatId ${chatId} (allowed: ${allowedChatId})`);
@@ -89,28 +127,43 @@ export default async function handler(request) {
   }
 
   const userText = message.text.trim();
-
-  // Ignore empty messages
   if (!userText) {
     return new Response('OK', { status: 200 });
   }
 
-  // Cap user message at 2000 chars to prevent abuse
+  // Cap user message at 2000 chars
   const truncatedText = userText.length > 2000 ? userText.slice(0, 2000) : userText;
 
   try {
-    // --- Fetch lightweight context in parallel (generic + topic-specific) ---
+    // --- Check for slash commands (handled before LLM call) ---
+    const commandResult = await handleCommand(truncatedText, chatId, botToken, redisUrl, redisToken, openRouterKey, groqKey);
+    if (commandResult) {
+      return new Response('OK', { status: 200 });
+    }
+
+    // --- Load conversation history from Redis ---
+    const history = await loadHistory(chatId, redisUrl, redisToken);
+
+    // --- Load watchlist for context ---
+    const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+
+    // --- Fetch lightweight context in parallel ---
     const context = await fetchContext(truncatedText);
 
     // --- Build LLM messages ---
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'system', content: `CURRENT INTELLIGENCE DATA:\n${context}` },
+      { role: 'system', content: buildContextMessage(context, watchlist) },
+      ...history,
       { role: 'user', content: truncatedText },
     ];
 
-    // --- Call Groq (primary) → OpenRouter (fallback) ---
-    const reply = await callLLM(messages, groqKey, openRouterKey);
+    // --- Call LLM with tool-calling support ---
+    const reply = await callLLMWithTools(messages, openRouterKey, groqKey);
+
+    // --- Save user message + assistant reply to Redis ---
+    await appendHistory(chatId, 'user', truncatedText, redisUrl, redisToken);
+    await appendHistory(chatId, 'assistant', reply, redisUrl, redisToken);
 
     // --- Send reply back to Telegram ---
     await sendTelegramMessage(botToken, chatId, reply);
@@ -119,7 +172,6 @@ export default async function handler(request) {
   } catch (err) {
     console.error('[telegram-webhook] Error:', err.message || err);
 
-    // Try to send an error message to the user so they know something went wrong
     try {
       await sendTelegramMessage(
         botToken,
@@ -127,7 +179,6 @@ export default async function handler(request) {
         'Monitor is temporarily offline. Try again in a moment.'
       );
     } catch {
-      // If even the error message fails, just log it
       console.error('[telegram-webhook] Failed to send error message to user');
     }
 
@@ -135,346 +186,366 @@ export default async function handler(request) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Command handling — /watch, /unwatch, /watches, /brief, /status, /clear
+// ---------------------------------------------------------------------------
+
 /**
- * Fetch lightweight server-side context: headlines + markets + Reddit OSINT.
- * All public APIs, no keys needed. Failures are non-fatal.
+ * Handle slash commands. Returns true if a command was processed.
+ */
+async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openRouterKey, groqKey) {
+  const lower = text.toLowerCase().trim();
+
+  // /watch <term>
+  if (lower.startsWith('/watch ') && !lower.startsWith('/watches')) {
+    const term = text.slice(7).trim();
+    if (!term) {
+      await sendTelegramMessage(botToken, chatId, 'Usage: /watch <topic>\nExample: /watch Taiwan');
+      return true;
+    }
+    const result = await addToWatchlist(chatId, term, redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, result);
+    return true;
+  }
+
+  // /unwatch <term>
+  if (lower.startsWith('/unwatch ')) {
+    const term = text.slice(9).trim();
+    if (!term) {
+      await sendTelegramMessage(botToken, chatId, 'Usage: /unwatch <topic>');
+      return true;
+    }
+    const result = await removeFromWatchlist(chatId, term, redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, result);
+    return true;
+  }
+
+  // /watches — list active watches
+  if (lower === '/watches') {
+    const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+    if (watchlist.length === 0) {
+      await sendTelegramMessage(botToken, chatId, 'No active watches. Use /watch <topic> to add one.');
+    } else {
+      const list = watchlist.map((w, i) => `${i + 1}. ${w.term} (since ${new Date(w.addedAt).toLocaleDateString()})`).join('\n');
+      await sendTelegramMessage(botToken, chatId, `*Active Watchlist* (${watchlist.length}/${MAX_WATCHLIST_ITEMS}):\n${list}`);
+    }
+    return true;
+  }
+
+  // /brief — full intelligence briefing
+  if (lower === '/brief') {
+    await sendTelegramMessage(botToken, chatId, 'Compiling intelligence briefing...');
+    const briefing = await generateBriefing(chatId, redisUrl, redisToken, openRouterKey, groqKey);
+    await sendTelegramMessage(botToken, chatId, briefing);
+    return true;
+  }
+
+  // /status — quick signal summary
+  if (lower === '/status') {
+    const status = await generateStatus();
+    await sendTelegramMessage(botToken, chatId, status);
+    return true;
+  }
+
+  // /clear — clear conversation history
+  if (lower === '/clear') {
+    await clearHistory(chatId, redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, 'Conversation history cleared.');
+    return true;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// /brief — Full intelligence briefing on demand
+// ---------------------------------------------------------------------------
+
+async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, groqKey) {
+  // Fetch ALL data sources in parallel
+  const [headlines, markets, telegram, reddit, predictions] = await Promise.allSettled([
+    fetchGoogleNewsHeadlines(),
+    fetchMarketQuotes(),
+    fetchAllTelegramChannels(),
+    fetchAllRedditPosts(),
+    fetchGeopoliticalMarkets(),
+  ]);
+
+  const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+
+  // Build context string
+  const sections = [];
+  if (headlines.status === 'fulfilled' && headlines.value) sections.push(`HEADLINES:\n${headlines.value}`);
+  if (markets.status === 'fulfilled' && markets.value) sections.push(`MARKETS:\n${markets.value}`);
+
+  if (telegram.status === 'fulfilled' && telegram.value?.length > 0) {
+    const telegramStr = telegram.value.slice(-15).map(p => `- [${p.channel}] ${p.text}`).join('\n');
+    sections.push(`TELEGRAM OSINT:\n${telegramStr}`);
+  }
+
+  if (reddit.status === 'fulfilled' && reddit.value?.length > 0) {
+    const redditStr = reddit.value.slice(0, 10).map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`).join('\n');
+    sections.push(`REDDIT OSINT:\n${redditStr}`);
+  }
+
+  if (predictions.status === 'fulfilled' && predictions.value?.length > 0) {
+    const predStr = predictions.value.slice(0, 10).map(m => `- ${m.title}: ${m.probability}% (vol: $${Math.round(m.volume).toLocaleString()})`).join('\n');
+    sections.push(`PREDICTION MARKETS (Polymarket):\n${predStr}`);
+  }
+
+  const watchlistStr = watchlist.length > 0
+    ? watchlist.map(w => `- "${w.term}" (since ${new Date(w.addedAt).toLocaleDateString()})`).join('\n')
+    : 'No active watches.';
+
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  const context = `DATA FETCHED AT: ${now}\n\n${sections.join('\n\n')}\n\nUSER WATCHLIST:\n${watchlistStr}`;
+
+  const briefingPrompt = `You are Monitor delivering a full intelligence briefing.
+
+Structure your response exactly like this:
+*INTELLIGENCE BRIEF*
+
+*MARKETS*
+Key prices + daily changes + what's moving and why
+
+*GEOPOLITICAL*
+Top 3 developing situations with source citations
+
+*SIGNALS*
+What's unusual across Telegram/Reddit right now
+
+*PREDICTIONS*
+Top prediction market movers (Polymarket)
+
+*WATCHLIST*
+Status of each watched item
+
+*OUTLOOK*
+What to watch in the next 24 hours
+
+Be specific. Cite sources. Give probabilities where relevant.
+Format for Telegram: use *bold* for section headers. Keep paragraphs short.`;
+
+  const messages = [
+    { role: 'system', content: briefingPrompt },
+    { role: 'system', content: `CURRENT INTELLIGENCE DATA:\n${context}` },
+    { role: 'user', content: 'Deliver the full intelligence briefing.' },
+  ];
+
+  try {
+    const reply = await callLLM(messages, openRouterKey, groqKey);
+    return reply;
+  } catch {
+    return 'Failed to generate briefing. Try again in a moment.';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /status — Quick signal summary
+// ---------------------------------------------------------------------------
+
+async function generateStatus() {
+  const [markets, headlines] = await Promise.allSettled([
+    fetchMarketQuotes(),
+    fetchGoogleNewsHeadlines(),
+  ]);
+
+  const parts = ['*MONITOR STATUS*\n'];
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  parts.push(`${now}\n`);
+
+  if (markets.status === 'fulfilled' && markets.value) {
+    parts.push('*Markets:*');
+    parts.push(markets.value);
+    parts.push('');
+  }
+
+  if (headlines.status === 'fulfilled' && headlines.value) {
+    const topHeadlines = headlines.value.split('\n').slice(0, 3).join('\n');
+    parts.push('*Top Headlines:*');
+    parts.push(topHeadlines);
+  }
+
+  parts.push('\n_Use /brief for full analysis._');
+  return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Context building
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch lightweight context for a conversational reply.
+ * Not as comprehensive as /brief — just enough for a quick answer.
  */
 async function fetchContext(userQuery = '') {
   const sections = [];
 
-  // Fetch all data sources in parallel — generic + topic-specific search
   const [headlines, quotes, reddit, telegram, topicNews] = await Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
-    fetchRedditOsint(),
-    fetchTelegramOsint(),
+    fetchAllRedditPosts(),
+    fetchAllTelegramChannels(),
     fetchTopicNews(userQuery),
   ]);
 
   if (topicNews.status === 'fulfilled' && topicNews.value) {
     sections.push(`TOPIC-SPECIFIC NEWS:\n${topicNews.value}`);
   }
-
   if (headlines.status === 'fulfilled' && headlines.value) {
     sections.push(`HEADLINES:\n${headlines.value}`);
   }
-
   if (quotes.status === 'fulfilled' && quotes.value) {
     sections.push(`MARKETS:\n${quotes.value}`);
   }
-
-  if (reddit.status === 'fulfilled' && reddit.value) {
-    sections.push(`REDDIT OSINT:\n${reddit.value}`);
+  if (reddit.status === 'fulfilled' && reddit.value?.length > 0) {
+    const redditStr = reddit.value.slice(0, 10).map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`).join('\n');
+    sections.push(`REDDIT OSINT:\n${redditStr}`);
+  }
+  if (telegram.status === 'fulfilled' && telegram.value?.length > 0) {
+    const telegramStr = telegram.value.slice(-15).map(p => `- [${p.channel}] ${p.text}`).join('\n');
+    sections.push(`TELEGRAM OSINT:\n${telegramStr}`);
   }
 
-  if (telegram.status === 'fulfilled' && telegram.value) {
-    sections.push(`TELEGRAM OSINT:\n${telegram.value}`);
-  }
+  if (sections.length === 0) return 'No live data available right now.';
 
-  if (sections.length === 0) {
-    return 'No live data available right now.';
-  }
-
-  // Prepend timestamp so the LLM knows data freshness
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   return `DATA FETCHED AT: ${now}\n\n${sections.join('\n\n')}`;
 }
 
 /**
- * Fetch 10 recent headlines from Google News RSS.
- * Free, no key, always available. Uses the "World" topic feed.
+ * Build the context system message including watchlist.
  */
-async function fetchGoogleNewsHeadlines() {
-  const rssUrl =
-    'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en';
-
-  const resp = await fetch(rssUrl, { signal: AbortSignal.timeout(5000) });
-  if (!resp.ok) return null;
-
-  const xml = await resp.text();
-
-  // Parse RSS items with simple regex (Edge runtime has no DOMParser)
-  const items = [];
-  const itemPattern = /<item>[\s\S]*?<\/item>/g;
-  const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
-  let itemMatch;
-  while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 10) {
-    const titleMatch = itemMatch[0].match(titlePattern);
-    const title = titleMatch?.[1] || titleMatch?.[2];
-    if (title) items.push(title);
+function buildContextMessage(context, watchlist) {
+  let msg = `CURRENT INTELLIGENCE DATA:\n${context}`;
+  if (watchlist.length > 0) {
+    msg += `\n\nUSER WATCHLIST:\n${watchlist.map(w => `- "${w.term}"`).join('\n')}`;
   }
-
-  if (items.length === 0) return null;
-
-  return items.map((t) => `- ${t}`).join('\n');
+  return msg;
 }
 
-/**
- * Extract keywords from user query and search Google News for topic-specific results.
- * Returns null if no meaningful keywords found or search fails.
- */
-async function fetchTopicNews(query) {
-  if (!query || query.length < 3) return null;
-
-  // Extract meaningful keywords: strip common question words, keep nouns/proper nouns
-  const stopWords = new Set([
-    'what', 'whats', 'how', 'why', 'when', 'where', 'who', 'is', 'are', 'was', 'were',
-    'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'about', 'from',
-    'do', 'does', 'did', 'can', 'could', 'would', 'should', 'will', 'has', 'have', 'had',
-    'tell', 'me', 'us', 'your', 'my', 'this', 'that', 'it', 'its', 'and', 'or', 'but',
-    'current', 'latest', 'today', 'now', 'going', 'happening', 'update', 'status',
-    'threat', 'level', 'situation', 'analysis', 'brief', 'report',
-  ]);
-
-  const keywords = query
-    .toLowerCase()
-    .replace(/[^\w\s]/g, '')
-    .split(/\s+/)
-    .filter((w) => w.length > 2 && !stopWords.has(w));
-
-  if (keywords.length === 0) return null;
-
-  // Use top 3 keywords for search
-  const searchTerms = keywords.slice(0, 3).join('+');
-  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(searchTerms)}&hl=en-US&gl=US&ceid=US:en`;
-
-  try {
-    const resp = await fetch(rssUrl, { signal: AbortSignal.timeout(5000) });
-    if (!resp.ok) return null;
-
-    const xml = await resp.text();
-
-    const items = [];
-    const itemPattern = /<item>[\s\S]*?<\/item>/g;
-    const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
-    const datePattern = /<pubDate>(.*?)<\/pubDate>/;
-    let itemMatch;
-    while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 5) {
-      const titleMatch = itemMatch[0].match(titlePattern);
-      const dateMatch = itemMatch[0].match(datePattern);
-      const title = titleMatch?.[1] || titleMatch?.[2];
-      const pubDate = dateMatch?.[1] || '';
-      if (title) items.push(`- ${title}${pubDate ? ` (${pubDate})` : ''}`);
-    }
-
-    if (items.length === 0) return null;
-
-    return `Search: "${keywords.join(' ')}"\n${items.join('\n')}`;
-  } catch {
-    return null;
-  }
-}
+// ---------------------------------------------------------------------------
+// LLM calling with tool support
+// ---------------------------------------------------------------------------
 
 /**
- * Fetch key market quotes from Yahoo Finance v8 API (public, no key).
- * Covers: S&P 500, oil, gold, 10Y treasury, VIX.
+ * Call the LLM with tool-calling support.
+ * Handles up to MAX_TOOL_CALLS_PER_TURN tool call rounds.
  */
-async function fetchMarketQuotes() {
-  const symbols = ['^GSPC', 'CL=F', 'GC=F', '^TNX', '^VIX'];
-  const names = { '^GSPC': 'S&P 500', 'CL=F': 'Oil (WTI)', 'GC=F': 'Gold', '^TNX': '10Y Yield', '^VIX': 'VIX' };
+async function callLLMWithTools(messages, openRouterKey, groqKey) {
+  let currentMessages = [...messages];
+  let toolCallsUsed = 0;
 
-  const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${symbols.join(',')}&range=1d&interval=1d`;
+  while (toolCallsUsed < MAX_TOOL_CALLS_PER_TURN) {
+    const response = await callLLMRaw(currentMessages, openRouterKey, groqKey, true);
+    const choice = response?.choices?.[0];
 
-  const resp = await fetch(yahooUrl, {
-    headers: { 'User-Agent': 'WorldMonitor/1.0' },
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!resp.ok) return null;
+    if (!choice) throw new Error('LLM returned no choices');
 
-  const data = await resp.json();
+    const assistantMessage = choice.message;
 
-  // Yahoo returns a flat object: { "^GSPC": { close: [...], chartPreviousClose: N }, ... }
-  const lines = [];
-  for (const symbol of symbols) {
-    const quote = data?.[symbol];
-    if (!quote) continue;
+    // If there are tool calls, process them
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      // Add the assistant's message (with tool_calls) to the conversation
+      currentMessages.push(assistantMessage);
 
-    const name = names[symbol] || symbol;
-    const closeArr = quote.close;
-    const price = Array.isArray(closeArr) && closeArr.length > 0
-      ? closeArr[closeArr.length - 1]
-      : null;
-    if (price == null) continue;
-
-    const prevClose = quote.chartPreviousClose || quote.previousClose;
-    let changeStr = '';
-    if (prevClose && prevClose !== 0) {
-      const changePct = ((price - prevClose) / prevClose) * 100;
-      changeStr = ` (${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%)`;
-    }
-
-    lines.push(`- ${name}: ${price.toFixed(2)}${changeStr}`);
-  }
-
-  return lines.length > 0 ? lines.join('\n') : null;
-}
-
-/**
- * Fetch latest messages from public Telegram OSINT channels.
- * Scrapes t.me/s/{channel} (public web preview) and extracts message text.
- * Same channels as the dashboard OSINT panel.
- */
-async function fetchTelegramOsint() {
-  const channels = [
-    // Conflict/geopolitical aggregators (public preview verified)
-    'intelslava', 'militarysummary', 'breakingmash', 'legitimniy',
-    // Middle East / Iran (public preview verified)
-    'iranintl_en', 'CIG_telegram',
-    // Global OSINT & intel aggregators (public preview verified)
-    'IntelRepublic', 'combatftg',
-  ];
-
-  // Fetch all channels in parallel
-  const results = await Promise.allSettled(
-    channels.map(async (channel) => {
-      const url = `https://t.me/s/${channel}`;
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!resp.ok) return [];
-
-      const html = await resp.text();
-
-      // Parse message text from Telegram's widget HTML
-      const posts = [];
-      const blocks = html.split('tgme_widget_message_wrap');
-      for (const block of blocks) {
-        // Extract message text from the widget div
-        const textMatch = block.match(
-          /class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<div[^>]*tgme_widget_message_(?:footer|info)/
-        );
-        if (!textMatch) continue;
-
-        // Strip HTML tags to get plain text
-        const text = textMatch[1]
-          .replace(/<br\s*\/?>/gi, ' ')
-          .replace(/<[^>]+>/g, '')
-          .replace(/&amp;/g, '&')
-          .replace(/&lt;/g, '<')
-          .replace(/&gt;/g, '>')
-          .replace(/&quot;/g, '"')
-          .replace(/&#39;/g, "'")
-          .replace(/\s+/g, ' ')
-          .trim();
-
-        if (text.length > 10) {
-          // Truncate long messages to keep context compact
-          const truncated = text.length > 200 ? text.slice(0, 200) + '...' : text;
-          posts.push({ channel, text: truncated });
+      // Process each tool call
+      for (const toolCall of assistantMessage.tool_calls) {
+        const toolName = toolCall.function?.name;
+        let toolArgs = {};
+        try {
+          toolArgs = JSON.parse(toolCall.function?.arguments || '{}');
+        } catch {
+          toolArgs = {};
         }
+
+        console.log(`[telegram-webhook] Tool call: ${toolName}(${JSON.stringify(toolArgs)})`);
+        const toolResult = await runTool(toolName, toolArgs);
+
+        // Add the tool result
+        currentMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult,
+        });
       }
 
-      // Return only the 3 most recent messages per channel
-      return posts.slice(-3);
-    })
-  );
+      toolCallsUsed++;
+      continue;
+    }
 
-  const allPosts = results
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value);
+    // No tool calls — return the text reply
+    const reply = assistantMessage.content;
+    if (!reply) throw new Error('LLM returned no content');
+    return reply;
+  }
 
-  if (allPosts.length === 0) return null;
-
-  // Take the last 15 messages across all channels (most recent)
-  return allPosts
-    .slice(-15)
-    .map((p) => `- [${p.channel}] ${p.text}`)
-    .join('\n');
+  // Hit tool call limit — do one final call without tools
+  const finalResponse = await callLLMRaw(currentMessages, openRouterKey, groqKey, false);
+  const reply = finalResponse?.choices?.[0]?.message?.content;
+  if (!reply) throw new Error('LLM returned no content after tool calls');
+  return reply;
 }
 
 /**
- * Fetch top posts from geopolitical subreddits via Reddit's public JSON API.
- * Same sources as the dashboard OSINT panel: worldnews, geopolitics, osint, CredibleDefense.
+ * Make a raw LLM API call. Returns the full response JSON.
+ * Tries Qwen 3.5 Plus (primary) → DeepSeek V3.2 (fallback) → Groq Llama (emergency).
  */
-async function fetchRedditOsint() {
-  const subreddits = [
-    'worldnews', 'geopolitics', 'osint', 'CredibleDefense',
-    'internationalsecurity', 'middleeastwar', 'iranpolitics',
-  ];
-  const postsPerSub = 3;
-
-  // Fetch all subreddits in parallel
-  const results = await Promise.allSettled(
-    subreddits.map(async (sub) => {
-      const url = `https://www.reddit.com/r/${sub}/hot.json?limit=${postsPerSub}&raw_json=1`;
-      const resp = await fetch(url, {
-        headers: { 'User-Agent': 'WorldMonitor/1.0' },
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!resp.ok) return [];
-
-      const data = await resp.json();
-      const children = data?.data?.children;
-      if (!Array.isArray(children)) return [];
-
-      return children
-        .filter((c) => c?.data?.title && !c.data.stickied)
-        .map((c) => ({
-          sub,
-          title: c.data.title,
-          score: c.data.score || 0,
-          comments: c.data.num_comments || 0,
-        }));
-    })
-  );
-
-  // Merge all posts, sort by score, take top 10
-  const allPosts = results
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
-
-  if (allPosts.length === 0) return null;
-
-  return allPosts
-    .map((p) => `- [r/${p.sub}, ${p.score}pts] ${p.title}`)
-    .join('\n');
-}
-
-/**
- * Call Groq (primary) then OpenRouter (fallback).
- * Returns the LLM reply text or throws if both fail.
- */
-async function callLLM(messages, groqKey, openRouterKey) {
+async function callLLMRaw(messages, openRouterKey, groqKey, includeTools) {
   const providers = [];
 
+  // Primary: Qwen 3.5 Plus via OpenRouter (1M context, tool-calling)
+  if (openRouterKey) {
+    providers.push({
+      name: 'Qwen',
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'qwen/qwen3.5-plus-02-15',
+      apiKey: openRouterKey,
+      supportsTools: true,
+    });
+
+    // Fallback: DeepSeek V3.2 via OpenRouter (164K context)
+    providers.push({
+      name: 'DeepSeek',
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'deepseek/deepseek-v3.2',
+      apiKey: openRouterKey,
+      supportsTools: true,
+    });
+  }
+
+  // Emergency: Groq Llama (free, always available, no tool-calling)
   if (groqKey) {
     providers.push({
       name: 'Groq',
       url: 'https://api.groq.com/openai/v1/chat/completions',
       model: 'llama-3.1-8b-instant',
       apiKey: groqKey,
-    });
-  }
-
-  if (openRouterKey) {
-    providers.push({
-      name: 'OpenRouter',
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      model: 'meta-llama/llama-3.1-8b-instruct:free',
-      apiKey: openRouterKey,
+      supportsTools: false,
     });
   }
 
   for (const provider of providers) {
     try {
+      const body = {
+        model: provider.model,
+        messages,
+        temperature: TEMPERATURE,
+        max_tokens: MAX_TOKENS,
+      };
+
+      // Only include tools for providers that support them
+      if (includeTools && provider.supportsTools) {
+        body.tools = TOOL_DEFINITIONS;
+      }
+
       const resp = await fetch(provider.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${provider.apiKey}`,
         },
-        body: JSON.stringify({
-          model: provider.model,
-          messages,
-          temperature: TEMPERATURE,
-          max_tokens: MAX_TOKENS,
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
       });
 
@@ -484,12 +555,8 @@ async function callLLM(messages, groqKey, openRouterKey) {
       }
 
       const data = await resp.json();
-      const reply = data?.choices?.[0]?.message?.content;
-      if (!reply) {
-        throw new Error(`${provider.name} returned no content`);
-      }
-
-      return reply;
+      console.log(`[telegram-webhook] ${provider.name} responded successfully`);
+      return data;
     } catch (err) {
       console.error(`[telegram-webhook] ${provider.name} failed:`, err.message || err);
     }
@@ -499,11 +566,223 @@ async function callLLM(messages, groqKey, openRouterKey) {
 }
 
 /**
+ * Simple text-only LLM call (no tool-calling). Used by /brief.
+ */
+async function callLLM(messages, openRouterKey, groqKey) {
+  const response = await callLLMRaw(messages, openRouterKey, groqKey, false);
+  const reply = response?.choices?.[0]?.message?.content;
+  if (!reply) throw new Error('LLM returned no content');
+  return reply;
+}
+
+// ---------------------------------------------------------------------------
+// Conversation memory — Redis-backed
+// ---------------------------------------------------------------------------
+
+/**
+ * Load conversation history from Redis.
+ * Returns array of {role, content} messages (max 30).
+ */
+async function loadHistory(chatId, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return [];
+
+  try {
+    const key = `chat:${chatId}:history`;
+    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return [];
+
+    const data = await resp.json();
+    if (!data.result) return [];
+
+    const history = JSON.parse(data.result);
+    return Array.isArray(history) ? history : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Append a message to conversation history.
+ * Trims to 30 messages, resets TTL to 48 hours.
+ */
+async function appendHistory(chatId, role, content, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    // Load current history
+    const history = await loadHistory(chatId, redisUrl, redisToken);
+
+    // Append new message
+    const updated = [...history, { role, content, ts: Date.now() }];
+
+    // Trim to most recent 30 messages
+    const trimmed = updated.slice(-MAX_HISTORY_MESSAGES);
+
+    // Save with 48h TTL
+    const key = `chat:${chatId}:history`;
+    const value = JSON.stringify(trimmed);
+    await fetch(`${redisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/ex/${HISTORY_TTL_SECONDS}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch (err) {
+    console.error('[telegram-webhook] Failed to save history:', err.message);
+  }
+}
+
+/**
+ * Clear conversation history.
+ */
+async function clearHistory(chatId, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    const key = `chat:${chatId}:history`;
+    await fetch(`${redisUrl}/del/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch {
+    // Non-critical
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Watchlist — Redis-backed persistent storage
+// ---------------------------------------------------------------------------
+
+/**
+ * Load user's watchlist from Redis.
+ * Returns array of { term, addedAt } objects.
+ */
+export async function loadWatchlist(chatId, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return [];
+
+  try {
+    const key = `watchlist:${chatId}`;
+    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return [];
+
+    const data = await resp.json();
+    if (!data.result) return [];
+
+    const watchlist = JSON.parse(data.result);
+    return Array.isArray(watchlist) ? watchlist : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Add a term to the watchlist.
+ */
+async function addToWatchlist(chatId, term, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return 'Watchlist requires Redis. Configure UPSTASH_REDIS_REST_URL.';
+
+  const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+
+  // Check for duplicates (case-insensitive)
+  if (watchlist.some(w => w.term.toLowerCase() === term.toLowerCase())) {
+    return `"${term}" is already on your watchlist.`;
+  }
+
+  if (watchlist.length >= MAX_WATCHLIST_ITEMS) {
+    return `Watchlist full (${MAX_WATCHLIST_ITEMS} max). Remove one first with /unwatch.`;
+  }
+
+  const updated = [...watchlist, { term, addedAt: Date.now() }];
+  await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  return `Added "${term}" to watchlist. I'll alert you when it appears in any intel source.`;
+}
+
+/**
+ * Remove a term from the watchlist.
+ */
+async function removeFromWatchlist(chatId, term, redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return 'Watchlist requires Redis.';
+
+  const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+  const termLower = term.toLowerCase();
+  const updated = watchlist.filter(w => w.term.toLowerCase() !== termLower);
+
+  if (updated.length === watchlist.length) {
+    return `"${term}" was not on your watchlist.`;
+  }
+
+  await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  return `Removed "${term}" from watchlist.`;
+}
+
+/**
+ * Save watchlist to Redis (no TTL — persists indefinitely).
+ */
+async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
+  try {
+    const key = `watchlist:${chatId}`;
+    const value = JSON.stringify(watchlist);
+    await fetch(`${redisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch (err) {
+    console.error('[telegram-webhook] Failed to save watchlist:', err.message);
+  }
+}
+
+/**
+ * Load ALL user watchlists (for the analysis cycle).
+ * Scans Redis for watchlist:* keys. Returns { chatId, terms[] } array.
+ */
+export async function loadAllWatchlists(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return [];
+
+  try {
+    // Use SCAN to find all watchlist keys
+    // Upstash REST: /scan/0/match/watchlist:*/count/100
+    const resp = await fetch(`${redisUrl}/scan/0/match/watchlist:*/count/100`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) return [];
+
+    const data = await resp.json();
+    const keys = data.result?.[1] || [];
+
+    const watchlists = [];
+    for (const key of keys) {
+      const chatId = key.replace('watchlist:', '');
+      const items = await loadWatchlist(chatId, redisUrl, redisToken);
+      if (items.length > 0) {
+        watchlists.push({
+          chatId,
+          terms: items.map(w => w.term),
+        });
+      }
+    }
+    return watchlists;
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram sending
+// ---------------------------------------------------------------------------
+
+/**
  * Send a text message to a Telegram chat via Bot API.
- * Uses Markdown parse mode. Truncates to 4096 chars (Telegram limit).
+ * Uses Markdown parse mode. Truncates to 4096 chars.
  */
 async function sendTelegramMessage(botToken, chatId, text) {
-  // Truncate if needed (Telegram's hard limit is 4096 chars)
   const truncated = text.length > TELEGRAM_MAX_LENGTH
     ? text.slice(0, TELEGRAM_MAX_LENGTH - 3) + '...'
     : text;

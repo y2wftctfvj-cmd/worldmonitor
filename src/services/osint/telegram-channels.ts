@@ -23,11 +23,25 @@ import { STOP_WORDS } from '@/utils/analysis-constants';
  * Channels that return 302 have disabled previews and must be replaced.
  */
 const CHANNELS = [
+  // Conflict/geopolitical aggregators
   'intelslava',       // Intel Slava Z — conflict/geopolitical aggregator
   'militarysummary',  // Military Summary — battlefield analysis
-  'RVvoenkor',        // Russian war correspondents — frontline reporting
   'breakingmash',     // Mash — Russian breaking news aggregator
   'legitimniy',       // Legitimniy — political/geopolitical commentary
+  // Middle East / Iran
+  'iranintl_en',      // Iran International English
+  'CIG_telegram',     // Clandestine Intel Group
+  // Global OSINT & intel aggregators
+  'IntelRepublic',    // Intel Republic — global OSINT
+  'combatftg',        // Combat Footage — conflict documentation
+  'osintdefender',    // OSINT Defender — verified OSINT
+  'BellumActaNews',   // Bellum Acta News — conflict aggregator
+  'OsintTv',          // OSINT TV — open-source intelligence
+  // Military news
+  'GeneralMCNews',    // General MC News — military news
+  'rnintelligence',   // RN Intelligence — military/naval intel
+  // Regional
+  'RVvoenkor',        // Russian war correspondents — frontline reporting
   'usaperiodical',    // USA Periodical — US news from Eastern perspective
 ] as const;
 
