@@ -153,18 +153,36 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     let alertsSent = 0;
     if (analysis && analysis.findings) {
+      // Load recent alert titles for similarity-based dedup
+      const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
+
       for (const finding of analysis.findings) {
         if (finding.severity === 'routine') continue;
 
-        // Dedup: use first 4 words of title as topic key (prevents near-duplicate alerts
-        // where AI generates slightly different titles for the same story each cycle)
-        const topicSlug = slugify(finding.title.split(/\s+/).slice(0, 4).join(' '));
-        const hourBucket = Math.floor(Date.now() / 3600000);
-        const dedupeKey = `alert-${topicSlug}-${hourBucket}`;
-        if (await isRecentlyAlerted(redisUrl, redisToken, dedupeKey)) continue;
+        // Cross-source verification: Telegram-only claims get downgraded
+        const sources = finding.sources || [];
+        const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
+        const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
+        if (isTelegramOnly && finding.severity !== 'developing') {
+          console.log(`[monitor-check] Downgrading "${finding.title}" — Telegram-only source`);
+          finding.severity = 'developing';
+          finding.title = `UNVERIFIED: ${finding.title}`;
+        }
+
+        // Skip developing items from alerting (they go to tracking instead)
+        if (finding.severity === 'developing') continue;
+
+        // Similarity-based dedup: skip if >50% word overlap with any recent alert
+        const isDuplicate = recentTitles.some(
+          recent => jaccardSimilarity(finding.title, recent) > 0.4
+        );
+        if (isDuplicate) {
+          console.log(`[monitor-check] Skipping duplicate alert: "${finding.title}"`);
+          continue;
+        }
 
         await sendIntelAlert(botToken, chatId, finding);
-        await markAlerted(redisUrl, redisToken, dedupeKey);
+        await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
         alertsSent++;
       }
 
@@ -511,12 +529,15 @@ async function updateDevelopingItems(findings, redisUrl, redisToken) {
 
 async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
   const developing = await loadDevelopingItems(redisUrl, redisToken);
+  const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
   for (const item of developing) {
     if (item.count >= DEVELOPING_THRESHOLD) {
-      // Check if we already alerted for this developing item
-      const dedupeKey = `developing-${slugify(item.topic)}-${Math.floor(Date.now() / 3600000)}`;
-      if (await isRecentlyAlerted(redisUrl, redisToken, dedupeKey)) continue;
+      // Similarity dedup for developing alerts too
+      const isDuplicate = recentTitles.some(
+        recent => jaccardSimilarity(item.topic, recent) > 0.4
+      );
+      if (isDuplicate) continue;
 
       await sendIntelAlert(botToken, chatId, {
         severity: 'developing',
@@ -527,7 +548,7 @@ async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
         watch_next: ['Escalation in source volume', 'Mainstream media pickup', 'Market reaction'],
       });
 
-      await markAlerted(redisUrl, redisToken, dedupeKey);
+      await saveRecentAlertTitle(redisUrl, redisToken, item.topic);
     }
   }
 }
@@ -620,34 +641,63 @@ async function loadAllWatchlists(redisUrl, redisToken) {
 }
 
 // ---------------------------------------------------------------------------
-// Deduplication — same pattern as v2.6
+// Similarity-based deduplication
 // ---------------------------------------------------------------------------
 
-async function isRecentlyAlerted(redisUrl, redisToken, key) {
-  if (!redisUrl || !redisToken) return false;
+const RECENT_ALERTS_KEY = 'monitor:recent-alerts';
+const RECENT_ALERTS_TTL = 7200; // 2 hours
+const MAX_RECENT_ALERTS = 50;
+
+/**
+ * Jaccard word similarity — compares word overlap between two strings.
+ * Returns 0.0 (no overlap) to 1.0 (identical words).
+ * Zero dependencies, fast, works well for short alert titles.
+ */
+function jaccardSimilarity(a, b) {
+  const wordsA = new Set(a.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+  const wordsB = new Set(b.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+
+  let intersection = 0;
+  for (const word of wordsA) {
+    if (wordsB.has(word)) intersection++;
+  }
+
+  const union = new Set([...wordsA, ...wordsB]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Load recent alert titles from Redis (last 50, 2h TTL).
+ */
+async function loadRecentAlertTitles(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return [];
   try {
-    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(key)}`, {
+    const resp = await fetch(`${redisUrl}/get/${RECENT_ALERTS_KEY}`, {
       headers: { Authorization: `Bearer ${redisToken}` },
       signal: AbortSignal.timeout(2000),
     });
-    if (!resp.ok) return false;
+    if (!resp.ok) return [];
     const data = await resp.json();
-    return data.result !== null;
+    if (!data.result) return [];
+    const titles = JSON.parse(data.result);
+    return Array.isArray(titles) ? titles : [];
   } catch {
-    return false;
+    return [];
   }
 }
 
-async function markAlerted(redisUrl, redisToken, key) {
+/**
+ * Save a new alert title to the recent alerts list.
+ */
+async function saveRecentAlertTitle(redisUrl, redisToken, title) {
   if (!redisUrl || !redisToken) return;
   try {
-    await fetch(`${redisUrl}/set/${encodeURIComponent(key)}/1/ex/3600`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch {
-    console.error('[monitor-check] Redis SET failed for key:', key);
+    const existing = await loadRecentAlertTitles(redisUrl, redisToken);
+    const updated = [...existing, title].slice(-MAX_RECENT_ALERTS);
+    await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), RECENT_ALERTS_TTL);
+  } catch (err) {
+    console.error('[monitor-check] Failed to save recent alert title:', err.message);
   }
 }
 
