@@ -710,7 +710,7 @@ async function redisSet(redisUrl, redisToken, key, value, exSeconds) {
     const command = exSeconds
       ? ['SET', key, value, 'EX', String(exSeconds)]
       : ['SET', key, value];
-    await fetch(`${redisUrl}/pipeline`, {
+    const resp = await fetch(`${redisUrl}/pipeline`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${redisToken}`,
@@ -719,6 +719,10 @@ async function redisSet(redisUrl, redisToken, key, value, exSeconds) {
       body: JSON.stringify([command]),
       signal: AbortSignal.timeout(3000),
     });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      console.error(`[monitor-check] Redis SET failed for key ${key}: HTTP ${resp.status} ${body}`);
+    }
   } catch (err) {
     console.error(`[monitor-check] Redis SET failed for key ${key}:`, err.message);
   }
