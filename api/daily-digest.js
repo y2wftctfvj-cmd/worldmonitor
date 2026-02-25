@@ -21,7 +21,7 @@
 
 export const config = { runtime: 'edge' };
 
-import { fetchGeopoliticalMarkets } from '../tools/prediction-markets.js';
+import { fetchGeopoliticalMarkets } from './tools/prediction-markets.js';
 
 // ---------------------------------------------------------------------------
 // Constants

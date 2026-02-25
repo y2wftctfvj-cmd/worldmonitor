@@ -13,7 +13,7 @@
 
 const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
 const CRON_SECRET = process.env.CRON_SECRET;
-const DESTINATION = 'https://worldmonitor.app/api/cron/monitor-check';
+const DESTINATION = 'https://worldmonitor.app/api/monitor-check';
 const SCHEDULE = '*/5 * * * *'; // Every 5 minutes
 
 async function setupQStashSchedule() {

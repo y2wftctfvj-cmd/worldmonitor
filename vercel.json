@@ -81,11 +81,11 @@
   ],
   "crons": [
     {
-      "path": "/api/cron/daily-digest",
+      "path": "/api/daily-digest",
       "schedule": "0 0 * * *"
     },
     {
-      "path": "/api/cron/monitor-check",
+      "path": "/api/monitor-check",
       "schedule": "0 12 * * *"
     }
   ]

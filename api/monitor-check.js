@@ -33,7 +33,7 @@ import {
   fetchInternetOutages,
   fetchMilitaryNews,
   fetchGovFeeds,
-} from '../tools/monitor-tools.js';
+} from './tools/monitor-tools.js';
 
 // Import watchlist loader from telegram-webhook
 // (uses the same Redis keys, same format)
