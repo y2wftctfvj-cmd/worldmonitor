@@ -300,31 +300,36 @@ async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, gro
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   const context = `DATA FETCHED AT: ${now}\n\n${sections.join('\n\n')}\n\nUSER WATCHLIST:\n${watchlistStr}`;
 
-  const briefingPrompt = `You are Monitor delivering a full intelligence briefing.
+  const briefingPrompt = `You are Monitor delivering a full intelligence briefing via Telegram.
 
-Structure your response exactly like this:
+Structure your response with these sections, each starting on a new line with *HEADER*:
+
 *INTELLIGENCE BRIEF*
+(one line: date + "Monitor v2.7")
 
 *MARKETS*
-Key prices + daily changes + what's moving and why
+Key prices + daily changes + what's moving and why. Use the EXACT numbers from the data — do not estimate or round. 2-3 sentences max.
 
 *GEOPOLITICAL*
-Top 3 developing situations with source citations
+Top 3 developing situations. Cite which source (Telegram channel, Reddit sub, news outlet) reported each item. 1-2 sentences per situation.
 
 *SIGNALS*
-What's unusual across Telegram/Reddit right now
+What's unusual across Telegram/Reddit right now. Only mention genuinely unusual patterns, not routine news. 2-3 bullet points.
 
 *PREDICTIONS*
-Top prediction market movers (Polymarket)
+Top prediction market movers with probabilities. Use the EXACT percentages from the data. If data shows NaN or N/A, skip that market.
 
 *WATCHLIST*
-Status of each watched item
+Status of each watched item — is it quiet, active, or critical right now?
 
 *OUTLOOK*
-What to watch in the next 24 hours
+2-3 specific indicators to watch in the next 24 hours.
 
-Be specific. Cite sources. Give probabilities where relevant.
-Format for Telegram: use *bold* for section headers. Keep paragraphs short.`;
+IMPORTANT RULES:
+- Use the EXACT market prices and percentages from the data provided. Never invent prices.
+- If a data source returned no results, say "No data available" — don't make things up.
+- Keep each section focused. The full briefing will be split across multiple messages.
+- Format for Telegram: *bold* headers, short paragraphs, bullet points with hyphens.`;
 
   const messages = [
     { role: 'system', content: briefingPrompt },
@@ -800,18 +805,85 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
  * Send a text message to a Telegram chat via Bot API.
  * Uses Markdown parse mode. Truncates to 4096 chars.
  */
+/**
+ * Send a message to Telegram, splitting into multiple messages if needed.
+ * Splits on section headers (*HEADER*) first, then on paragraph breaks.
+ * Each chunk stays under TELEGRAM_MAX_LENGTH.
+ */
 async function sendTelegramMessage(botToken, chatId, text) {
-  const truncated = text.length > TELEGRAM_MAX_LENGTH
-    ? text.slice(0, TELEGRAM_MAX_LENGTH - 3) + '...'
-    : text;
+  const chunks = splitMessage(text, TELEGRAM_MAX_LENGTH);
 
+  for (const chunk of chunks) {
+    await sendSingleTelegramMessage(botToken, chatId, chunk);
+  }
+}
+
+/**
+ * Split a long message into chunks that fit within the Telegram limit.
+ * Prefers splitting on section headers (*BOLD HEADER*), then double newlines,
+ * then single newlines, as a last resort mid-text.
+ */
+function splitMessage(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Find a good split point within the max length
+    let splitAt = -1;
+
+    // Prefer splitting before a section header line (*SOMETHING*)
+    const headerPattern = /\n\*[A-Z]/g;
+    let headerMatch;
+    while ((headerMatch = headerPattern.exec(remaining)) !== null) {
+      if (headerMatch.index > 0 && headerMatch.index <= maxLen) {
+        splitAt = headerMatch.index;
+      }
+      if (headerMatch.index > maxLen) break;
+    }
+
+    // If no header split found, try double newline
+    if (splitAt === -1) {
+      const lastDoubleNewline = remaining.lastIndexOf('\n\n', maxLen);
+      if (lastDoubleNewline > maxLen * 0.3) splitAt = lastDoubleNewline;
+    }
+
+    // If still nothing, try single newline
+    if (splitAt === -1) {
+      const lastNewline = remaining.lastIndexOf('\n', maxLen);
+      if (lastNewline > maxLen * 0.3) splitAt = lastNewline;
+    }
+
+    // Last resort: hard cut
+    if (splitAt === -1) {
+      splitAt = maxLen;
+    }
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  return chunks.filter(c => c.length > 0);
+}
+
+/**
+ * Send a single Telegram message (must be under 4096 chars).
+ * Falls back to plain text if Markdown parsing fails.
+ */
+async function sendSingleTelegramMessage(botToken, chatId, text) {
   const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const resp = await fetch(telegramUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
-      text: truncated,
+      text,
       parse_mode: 'Markdown',
       disable_web_page_preview: true,
     }),
@@ -827,7 +899,7 @@ async function sendTelegramMessage(botToken, chatId, text) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: chatId,
-          text: truncated,
+          text,
           disable_web_page_preview: true,
         }),
         signal: AbortSignal.timeout(5000),

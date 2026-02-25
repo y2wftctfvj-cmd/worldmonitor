@@ -48,12 +48,13 @@ export async function fetchGeopoliticalMarkets() {
       for (const market of event.markets) {
         // Only include markets with meaningful data
         const probability = parseFloat(market.outcomePrices?.[0] || market.bestAsk || '0');
-        if (probability <= 0 || probability >= 1) continue;
+        if (isNaN(probability) || probability <= 0 || probability >= 1) continue;
 
+        const volume = parseFloat(market.volume || '0');
         markets.push({
           title: market.question || event.title || 'Unknown',
           probability: Math.round(probability * 100),
-          volume: parseFloat(market.volume || '0'),
+          volume: isNaN(volume) ? 0 : volume,
           // Polymarket doesn't directly expose 24h change in the API,
           // so we track it ourselves via Redis in the analysis cycle
           slug: market.slug || event.slug || '',
@@ -100,10 +101,11 @@ export async function searchPredictionMarkets(query) {
 
       for (const market of event.markets) {
         const probability = parseFloat(market.outcomePrices?.[0] || market.bestAsk || '0');
+        const volume = parseFloat(market.volume || '0');
         results.push({
           title: market.question || event.title || 'Unknown',
-          probability: probability > 0 && probability < 1 ? Math.round(probability * 100) : null,
-          volume: parseFloat(market.volume || '0'),
+          probability: !isNaN(probability) && probability > 0 && probability < 1 ? Math.round(probability * 100) : null,
+          volume: isNaN(volume) ? 0 : volume,
           slug: market.slug || event.slug || '',
         });
       }
