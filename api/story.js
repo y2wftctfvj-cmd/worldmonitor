@@ -28,8 +28,13 @@ export default function handler(req, res) {
   // Validate ts param: must be numeric timestamp (up to 13 digits)
   const rawTs = url.searchParams.get('ts') || '';
   const ts = /^\d{1,13}$/.test(rawTs) ? rawTs : '';
-  const score = url.searchParams.get('s') || '';
-  const level = url.searchParams.get('l') || '';
+  // Validate score: must be 1-3 digit number (CII score 0-100)
+  const rawScore = url.searchParams.get('s') || '';
+  const score = /^\d{1,3}$/.test(rawScore) ? rawScore : '';
+  // Validate level: must be a known instability classification
+  const VALID_LEVELS = new Set(['critical', 'high', 'elevated', 'normal', 'low']);
+  const rawLevel = (url.searchParams.get('l') || '').toLowerCase();
+  const level = VALID_LEVELS.has(rawLevel) ? rawLevel : '';
 
   const ua = req.headers['user-agent'] || '';
   const isBot = BOT_UA.test(ua);
