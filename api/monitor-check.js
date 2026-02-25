@@ -156,8 +156,11 @@ export default async function handler(request) {
       for (const finding of analysis.findings) {
         if (finding.severity === 'routine') continue;
 
-        // Dedup: skip if we already sent this finding recently
-        const dedupeKey = `alert-${slugify(finding.title)}-${Math.floor(Date.now() / 3600000)}`;
+        // Dedup: use first 4 words of title as topic key (prevents near-duplicate alerts
+        // where AI generates slightly different titles for the same story each cycle)
+        const topicSlug = slugify(finding.title.split(/\s+/).slice(0, 4).join(' '));
+        const hourBucket = Math.floor(Date.now() / 3600000);
+        const dedupeKey = `alert-${topicSlug}-${hourBucket}`;
         if (await isRecentlyAlerted(redisUrl, redisToken, dedupeKey)) continue;
 
         await sendIntelAlert(botToken, chatId, finding);
@@ -295,7 +298,14 @@ SEVERITY RULES:
 - Cross-domain convergence (e.g., military news + market move + prediction shift) should ALWAYS be flagged as notable or urgent.
 - Only flag "notable" if genuinely unusual (not routine news cycles).
 - Check watchlist terms against ALL sources.
-- Maximum 5 findings per cycle to avoid alert fatigue.`;
+- Maximum 5 findings per cycle to avoid alert fatigue.
+
+SOURCE VERIFICATION (CRITICAL):
+- Telegram channels often post unverified, exaggerated, or completely false claims.
+- NEVER treat a claim as fact if it ONLY appears in Telegram channels and nowhere else.
+- Deaths, assassinations, major attacks: require confirmation from at least one mainstream news source (headlines or wire services). If only Telegram reports it, explicitly label it "UNVERIFIED" in the title and analysis.
+- If a Telegram claim contradicts or has no support from headlines/wire services, downgrade its severity.
+- Use consistent topic-level titles across cycles. For example, if you flagged "US-Iran tensions" last cycle, use the same or very similar title this cycle, not a completely reworded version.`;
 
   const messages = [
     { role: 'system', content: 'You are an intelligence analysis system. Output ONLY valid JSON. No explanatory text.' },
