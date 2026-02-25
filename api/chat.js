@@ -92,7 +92,7 @@ export default async function handler(request) {
 
   // Rate limit
   const ip = request.headers.get('x-real-ip')?.trim()
-    || request.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
+    || request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
     || 'anonymous';
   if (await isRateLimited(ip)) {
     return new Response(JSON.stringify({ error: 'Rate limited' }), {

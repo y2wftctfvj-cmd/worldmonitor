@@ -209,9 +209,19 @@ async function toolSearchNews(query) {
   return headlines;
 }
 
-async function toolCheckMarkets() {
+async function toolCheckMarkets(symbols) {
   const quotes = await fetchMarketQuotes();
   if (!quotes) return 'Market data unavailable right now.';
+
+  // If the LLM passed specific symbols, filter the output
+  if (Array.isArray(symbols) && symbols.length > 0) {
+    const requested = new Set(symbols.map(s => s.toLowerCase()));
+    const filtered = quotes
+      .split('\n')
+      .filter(line => requested.has('all') || symbols.some(s => line.toLowerCase().includes(s.toLowerCase())));
+    return filtered.length > 0 ? filtered.join('\n') : quotes;
+  }
+
   return quotes;
 }
 
@@ -233,8 +243,8 @@ async function toolSearchTelegram(query) {
 }
 
 async function toolSearchReddit(query) {
-  // Use Reddit search API across geopolitical subs
-  const subredditsToSearch = ['worldnews', 'geopolitics', 'osint', 'CredibleDefense'];
+  // Use Reddit search API across all tracked subreddits
+  const subredditsToSearch = SUBREDDITS;
   const allResults = [];
 
   const searches = await Promise.allSettled(
@@ -277,7 +287,7 @@ async function toolCheckPredictions(query) {
   }
 
   return markets
-    .map(m => `- ${m.title}: ${m.probability != null ? m.probability + '%' : 'N/A'} (vol: $${Math.round(m.volume).toLocaleString()})`)
+    .map(m => `- ${m.title}: ${m.probability != null ? m.probability + '%' : 'N/A'} (vol: $${Math.round(m.volume).toLocaleString('en-US')})`)
     .join('\n');
 }
 

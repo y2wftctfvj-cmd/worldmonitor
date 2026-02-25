@@ -51,18 +51,13 @@ const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" 
 // ---------------------------------------------------------------------------
 export default async function handler(request) {
   // --- AUTH: accept Vercel cron OR QStash signature ---
+  // AUTH: QStash forwards our Bearer token via Upstash-Forward-Authorization header,
+  // which arrives as a standard Authorization header. Both Vercel cron and QStash
+  // use the same Bearer token mechanism — no separate signature verification needed.
   const authHeader = request.headers.get('authorization');
   const cronSecret = process.env.CRON_SECRET;
-  const qstashSignature = request.headers.get('upstash-signature');
 
-  // Check Vercel cron auth
-  const isVercelCron = cronSecret && authHeader === `Bearer ${cronSecret}`;
-
-  // Check QStash signature (simplified — for full verification use @upstash/qstash SDK)
-  // QStash also forwards the Bearer token we set in setup-qstash.js
-  const isQStash = !!qstashSignature || (cronSecret && authHeader === `Bearer ${cronSecret}`);
-
-  if (!isVercelCron && !isQStash) {
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
@@ -177,7 +172,7 @@ export default async function handler(request) {
     });
   } catch (err) {
     console.error('[monitor-check] Cycle failed:', err.message || err);
-    return jsonResponse(500, { error: 'Analysis cycle failed', message: err.message });
+    return jsonResponse(500, { error: 'Analysis cycle failed' });
   }
 }
 
@@ -215,7 +210,7 @@ function buildSnapshot(results) {
   // Prediction markets
   if (results.predictions.status === 'fulfilled' && results.predictions.value?.length > 0) {
     const markets = results.predictions.value.slice(0, 10);
-    sections.push(`PREDICTION MARKETS (Polymarket):\n${markets.map(m => `- ${m.title}: ${m.probability}% (vol: $${Math.round(m.volume).toLocaleString()})`).join('\n')}`);
+    sections.push(`PREDICTION MARKETS (Polymarket):\n${markets.map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume).toLocaleString('en-US')})`).join('\n')}`);
   }
 
   // Earthquakes
@@ -374,7 +369,7 @@ async function sendIntelAlert(botToken, chatId, finding) {
   const severityLabel = finding.severity.toUpperCase();
 
   const parts = [
-    `${emoji} *${severityLabel}* — ${escapeMarkdown(finding.title)}`,
+    `${emoji} *${severityLabel}* \\- ${escapeMarkdown(finding.title)}`,
     '',
   ];
 
@@ -461,34 +456,30 @@ async function loadDevelopingItems(redisUrl, redisToken) {
 async function updateDevelopingItems(findings, redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return;
 
-  const developing = await loadDevelopingItems(redisUrl, redisToken);
+  const existing = await loadDevelopingItems(redisUrl, redisToken);
+  const now = Date.now();
 
-  // Increment count for developing findings, add new ones
+  // Build updated list immutably — increment existing, add new
   const developingFindings = findings.filter(f => f.severity === 'developing');
+  let updated = existing.map(d => {
+    const match = developingFindings.find(f => f.title.toLowerCase() === d.topic.toLowerCase());
+    if (match) return { ...d, count: d.count + 1, lastSeen: now };
+    return d;
+  });
+
+  // Add new developing items not already tracked
   for (const finding of developingFindings) {
-    const topic = finding.title.toLowerCase();
-    const existing = developing.find(d => d.topic.toLowerCase() === topic);
-    if (existing) {
-      existing.count++;
-      existing.lastSeen = Date.now();
-    } else {
-      developing.push({ topic: finding.title, count: 1, lastSeen: Date.now() });
+    const alreadyTracked = updated.some(d => d.topic.toLowerCase() === finding.title.toLowerCase());
+    if (!alreadyTracked) {
+      updated = [...updated, { topic: finding.title, count: 1, lastSeen: now }];
     }
   }
 
   // Remove items not seen in last 30 min (6 cycles)
-  const thirtyMinAgo = Date.now() - 30 * 60 * 1000;
-  const active = developing.filter(d => d.lastSeen > thirtyMinAgo);
+  const thirtyMinAgo = now - 30 * 60 * 1000;
+  const active = updated.filter(d => d.lastSeen > thirtyMinAgo);
 
-  try {
-    await fetch(`${redisUrl}/set/monitor:developing/${encodeURIComponent(JSON.stringify(active))}/ex/3600`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch {
-    // Non-critical
-  }
+  await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(active), 3600);
 }
 
 async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
@@ -540,11 +531,7 @@ async function storeSnapshot(redisUrl, redisToken, snapshot) {
   try {
     // Truncate snapshot if too large for Redis (max ~1MB for free tier)
     const truncated = snapshot.length > 500000 ? snapshot.slice(0, 500000) : snapshot;
-    await fetch(`${redisUrl}/set/monitor:snapshot/${encodeURIComponent(truncated)}/ex/${SNAPSHOT_TTL_SECONDS}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(3000),
-    });
+    await redisSet(redisUrl, redisToken, 'monitor:snapshot', truncated, SNAPSHOT_TTL_SECONDS);
   } catch (err) {
     console.error('[monitor-check] Failed to store snapshot:', err.message);
   }
@@ -622,6 +609,29 @@ async function markAlerted(redisUrl, redisToken, key) {
     });
   } catch {
     console.error('[monitor-check] Redis SET failed for key:', key);
+  }
+}
+
+/**
+ * Set a Redis key via pipeline POST body (safe for large values).
+ * URL-path encoding breaks for values >8KB, so we use the pipeline endpoint.
+ */
+async function redisSet(redisUrl, redisToken, key, value, exSeconds) {
+  try {
+    const command = exSeconds
+      ? ['SET', key, value, 'EX', String(exSeconds)]
+      : ['SET', key, value];
+    await fetch(`${redisUrl}/pipeline`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${redisToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify([command]),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch (err) {
+    console.error(`[monitor-check] Redis SET failed for key ${key}:`, err.message);
   }
 }
 

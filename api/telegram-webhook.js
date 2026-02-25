@@ -289,7 +289,7 @@ async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, gro
   }
 
   if (predictions.status === 'fulfilled' && predictions.value?.length > 0) {
-    const predStr = predictions.value.slice(0, 10).map(m => `- ${m.title}: ${m.probability}% (vol: $${Math.round(m.volume).toLocaleString()})`).join('\n');
+    const predStr = predictions.value.slice(0, 10).map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume).toLocaleString('en-US')})`).join('\n');
     sections.push(`PREDICTION MARKETS (Polymarket):\n${predStr}`);
   }
 
@@ -598,7 +598,13 @@ async function loadHistory(chatId, redisUrl, redisToken) {
     if (!data.result) return [];
 
     const history = JSON.parse(data.result);
-    return Array.isArray(history) ? history : [];
+    if (!Array.isArray(history)) return [];
+
+    // Validate each entry — only allow user/assistant roles with string content
+    const validRoles = new Set(['user', 'assistant']);
+    return history.filter(
+      (entry) => validRoles.has(entry?.role) && typeof entry?.content === 'string'
+    );
   } catch {
     return [];
   }
@@ -621,12 +627,16 @@ async function appendHistory(chatId, role, content, redisUrl, redisToken) {
     // Trim to most recent 30 messages
     const trimmed = updated.slice(-MAX_HISTORY_MESSAGES);
 
-    // Save with 48h TTL
+    // Save with 48h TTL — use pipeline POST body (safe for large values)
     const key = `chat:${chatId}:history`;
     const value = JSON.stringify(trimmed);
-    await fetch(`${redisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}/ex/${HISTORY_TTL_SECONDS}`, {
+    await fetch(`${redisUrl}/pipeline`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
+      headers: {
+        Authorization: `Bearer ${redisToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify([['SET', key, value, 'EX', String(HISTORY_TTL_SECONDS)]]),
       signal: AbortSignal.timeout(2000),
     });
   } catch (err) {
@@ -684,8 +694,12 @@ export async function loadWatchlist(chatId, redisUrl, redisToken) {
 /**
  * Add a term to the watchlist.
  */
-async function addToWatchlist(chatId, term, redisUrl, redisToken) {
+async function addToWatchlist(chatId, rawTerm, redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return 'Watchlist requires Redis. Configure UPSTASH_REDIS_REST_URL.';
+
+  // Sanitize: strip to alphanumeric/spaces/hyphens, max 50 chars
+  const term = rawTerm.replace(/[^\w\s\-]/g, '').trim().slice(0, 50);
+  if (term.length === 0) return 'Invalid watchlist term.';
 
   const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
 
@@ -728,9 +742,13 @@ async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
   try {
     const key = `watchlist:${chatId}`;
     const value = JSON.stringify(watchlist);
-    await fetch(`${redisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`, {
+    await fetch(`${redisUrl}/pipeline`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
+      headers: {
+        Authorization: `Bearer ${redisToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify([['SET', key, value]]),
       signal: AbortSignal.timeout(2000),
     });
   } catch (err) {
