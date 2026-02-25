@@ -26,6 +26,11 @@ export default function middleware(request: Request) {
     return;
   }
 
+  // Allow cron/scheduled endpoints — QStash and Vercel cron use bot-like UAs
+  if (path === '/api/monitor-check' || path === '/api/daily-digest') {
+    return;
+  }
+
   // Allow social preview/image bots on favico assets (bypasses Vercel Attack Challenge)
   if (path.startsWith('/favico/')) {
     if (SOCIAL_IMAGE_UA.test(ua)) {
