@@ -41,8 +41,8 @@ import {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const LLM_TIMEOUT_MS = 12000; // Edge runtime = 25s total. Collection ~10s, LLM gets ~12s.
-const MAX_TOKENS = 2000;  // Shorter output = faster response
+const LLM_TIMEOUT_MS = 10000; // Edge = 25s total. Budget: collect 8s + LLM 10s + overhead 5s
+const MAX_TOKENS = 1500;  // Shorter output = faster response
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
 
@@ -84,7 +84,7 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     // 1. COLLECT — fetch all data sources in parallel (15s max for entire phase)
     // -----------------------------------------------------------------------
-    const COLLECT_TIMEOUT_MS = 15000;
+    const COLLECT_TIMEOUT_MS = 8000;
     const collectPromise = Promise.allSettled([
       fetchGoogleNewsHeadlines(),
       fetchMarketQuotes(),
@@ -338,26 +338,22 @@ SOURCE VERIFICATION (CRITICAL):
 
   // Call LLM
   const providers = [];
-  if (openRouterKey) {
+  // Groq first — free, fast (500 tok/s), fits in edge timeout
+  if (groqKey) {
     providers.push({
-      name: 'Qwen',
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      model: 'qwen/qwen3.5-plus-02-15',
-      apiKey: openRouterKey,
+      name: 'Groq',
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      model: 'llama-3.3-70b-versatile',
+      apiKey: groqKey,
     });
+  }
+  // OpenRouter fallback — smarter but slower
+  if (openRouterKey) {
     providers.push({
       name: 'DeepSeek',
       url: 'https://openrouter.ai/api/v1/chat/completions',
       model: 'deepseek/deepseek-v3.2',
       apiKey: openRouterKey,
-    });
-  }
-  if (groqKey) {
-    providers.push({
-      name: 'Groq',
-      url: 'https://api.groq.com/openai/v1/chat/completions',
-      model: 'llama-3.1-8b-instant',
-      apiKey: groqKey,
     });
   }
 
