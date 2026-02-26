@@ -271,36 +271,27 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
 // ---------------------------------------------------------------------------
 
 async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, groqKey) {
-  // Each fetch has its own AbortSignal.timeout (5-8s), so allSettled
-  // completes within ~8s with partial results for any that timed out.
-  const [headlines, markets, telegram, reddit, predictions] = await Promise.allSettled([
-    fetchGoogleNewsHeadlines(),
-    fetchMarketQuotes(),
-    fetchAllTelegramChannels(),
-    fetchAllRedditPosts(),
-    fetchGeopoliticalMarkets(),
+  // Use cached snapshot from Redis (stored every 5 min by monitor-check).
+  // This saves ~8s of data fetching — critical for the 25s Edge timeout.
+  const [watchlist, snapshot] = await Promise.all([
+    loadWatchlist(chatId, redisUrl, redisToken),
+    loadSnapshot(redisUrl, redisToken),
   ]);
 
-  const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
-
-  // Build context string
-  const sections = [];
-  if (headlines.status === 'fulfilled' && headlines.value) sections.push(`HEADLINES:\n${headlines.value}`);
-  if (markets.status === 'fulfilled' && markets.value) sections.push(`MARKETS:\n${markets.value}`);
-
-  if (telegram.status === 'fulfilled' && telegram.value?.length > 0) {
-    const telegramStr = telegram.value.slice(-15).map(p => `- [${p.channel}] ${p.text}`).join('\n');
-    sections.push(`TELEGRAM OSINT:\n${telegramStr}`);
-  }
-
-  if (reddit.status === 'fulfilled' && reddit.value?.length > 0) {
-    const redditStr = reddit.value.slice(0, 10).map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`).join('\n');
-    sections.push(`REDDIT OSINT:\n${redditStr}`);
-  }
-
-  if (predictions.status === 'fulfilled' && predictions.value?.length > 0) {
-    const predStr = predictions.value.slice(0, 10).map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume).toLocaleString('en-US')})`).join('\n');
-    sections.push(`PREDICTION MARKETS (Polymarket):\n${predStr}`);
+  let context;
+  if (snapshot) {
+    // Cached snapshot exists — use it directly (fast path, ~100ms)
+    context = snapshot;
+  } else {
+    // No snapshot (first run or expired) — fetch minimal data sources
+    const [headlines, markets] = await Promise.allSettled([
+      fetchGoogleNewsHeadlines(),
+      fetchMarketQuotes(),
+    ]);
+    const sections = [];
+    if (headlines.status === 'fulfilled' && headlines.value) sections.push(`HEADLINES:\n${headlines.value}`);
+    if (markets.status === 'fulfilled' && markets.value) sections.push(`MARKETS:\n${markets.value}`);
+    context = sections.length > 0 ? sections.join('\n\n') : 'No data available — monitor cycle may not have run yet.';
   }
 
   const watchlistStr = watchlist.length > 0
@@ -308,14 +299,14 @@ async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, gro
     : 'No active watches.';
 
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-  const context = `DATA FETCHED AT: ${now}\n\n${sections.join('\n\n')}\n\nUSER WATCHLIST:\n${watchlistStr}`;
+  const fullContext = `BRIEFING REQUESTED: ${now}\n\n${context}\n\nUSER WATCHLIST:\n${watchlistStr}`;
 
   const briefingPrompt = `You are Monitor delivering a full intelligence briefing via Telegram.
 
 Structure your response with these sections, each starting on a new line with *HEADER*:
 
 *INTELLIGENCE BRIEF*
-(one line: date + "Monitor v2.7")
+(one line: date + "Monitor v3.0 — Evidence Fusion")
 
 *MARKETS*
 Key prices + daily changes + what's moving and why. Use the EXACT numbers from the data — do not estimate or round. 2-3 sentences max.
@@ -343,16 +334,99 @@ IMPORTANT RULES:
 
   const messages = [
     { role: 'system', content: briefingPrompt },
-    { role: 'system', content: `CURRENT INTELLIGENCE DATA:\n${context}` },
+    { role: 'system', content: `CURRENT INTELLIGENCE DATA:\n${fullContext}` },
     { role: 'user', content: 'Deliver the full intelligence briefing.' },
   ];
 
   try {
-    const reply = await callLLM(messages, openRouterKey, groqKey);
+    // Use Groq-first for /brief — fast (~2s) and doesn't need tool-calling
+    const reply = await callBriefLLM(messages, groqKey, openRouterKey);
     return reply;
   } catch {
     return 'Failed to generate briefing. Try again in a moment.';
   }
+}
+
+/**
+ * Load the latest snapshot from Redis (stored by monitor-check every 5 min).
+ */
+async function loadSnapshot(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return null;
+  try {
+    const resp = await fetch(`${redisUrl}/get/monitor:snapshot`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.result || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * LLM call optimized for /brief — Groq first (fast, ~2s), OpenRouter fallback.
+ * No tool-calling needed. Separate from callLLMRaw to avoid the slow Qwen/DeepSeek
+ * primary path that burns 15s+ of the 25s Edge budget.
+ */
+async function callBriefLLM(messages, groqKey, openRouterKey) {
+  const providers = [];
+
+  // Groq first — fast (500 tok/s), free, perfect for briefings
+  if (groqKey) {
+    providers.push({
+      name: 'Groq',
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      model: 'llama-3.3-70b-versatile',
+      apiKey: groqKey,
+    });
+  }
+
+  // OpenRouter fallback — slower but smarter
+  if (openRouterKey) {
+    providers.push({
+      name: 'DeepSeek',
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'deepseek/deepseek-v3.2',
+      apiKey: openRouterKey,
+    });
+  }
+
+  for (const provider of providers) {
+    try {
+      const resp = await fetch(provider.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${provider.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          messages,
+          temperature: TEMPERATURE,
+          max_tokens: MAX_TOKENS,
+        }),
+        signal: AbortSignal.timeout(15000), // 15s — leaves headroom in the 25s Edge budget
+      });
+
+      if (!resp.ok) {
+        const errBody = await resp.text();
+        throw new Error(`${provider.name} returned ${resp.status}: ${errBody}`);
+      }
+
+      const data = await resp.json();
+      const reply = data?.choices?.[0]?.message?.content;
+      if (!reply) throw new Error(`${provider.name} returned no content`);
+
+      console.log(`[telegram-webhook] /brief served by ${provider.name}`);
+      return reply;
+    } catch (err) {
+      console.error(`[telegram-webhook] /brief ${provider.name} failed:`, err.message || err);
+    }
+  }
+
+  throw new Error('All LLM providers failed for /brief');
 }
 
 // ---------------------------------------------------------------------------
