@@ -21,9 +21,7 @@
  *   CLOUDFLARE_RADAR_TOKEN
  */
 
-// Node.js serverless runtime — 60s timeout (edge only gets 25s, not enough for
-// data collection + LLM analysis)
-export const config = { maxDuration: 60 };
+export const config = { runtime: 'edge' };
 
 import {
   fetchGoogleNewsHeadlines,
@@ -43,8 +41,8 @@ import {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const LLM_TIMEOUT_MS = 60000; // AI analysis can take a while with huge context
-const MAX_TOKENS = 3000;
+const LLM_TIMEOUT_MS = 12000; // Edge runtime = 25s total. Collection ~10s, LLM gets ~12s.
+const MAX_TOKENS = 2000;  // Shorter output = faster response
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
 
@@ -318,14 +316,13 @@ OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
   "situation_summary": "1 paragraph overall assessment"
 }
 
-SEVERITY RULES (BE STRICT — the user gets a phone notification for each alert):
-- "routine": The DEFAULT for everything. Ongoing situations, diplomatic rhetoric, political statements, policy debates, existing conflicts with no new development — ALL routine. If you saw similar headlines yesterday, it is routine.
-- "notable": Reserve for genuinely NEW developments that changed in the last 5 minutes. Examples: a new military strike, a sudden market crash (>3% in an hour), a new natural disaster, a surprise political event (resignation, coup, emergency declaration). NOT: "tensions are escalating" (that is just commentary), "contradictory signals" (that is analysis, not an event), "rhetoric intensifies" (words are not events).
-- "urgent": A concrete, confirmed event that is happening RIGHT NOW and affects multiple domains. Examples: active military engagement confirmed by 2+ sources, market circuit breaker triggered, major leader killed/captured (confirmed). Must have hard evidence, not just rhetoric or speculation.
-- "developing": Something might be emerging but is too early to call. Use this instead of notable when uncertain.
-- Cross-domain convergence (e.g., military strike + oil spike + prediction market jump) can elevate to urgent.
-- Check watchlist terms against ALL sources. Watchlist match = "notable" ONLY if there is a new concrete event, not just another article about the same ongoing situation.
-- Maximum 3 findings per cycle. Most cycles should have 0 notable/urgent findings — that is normal and correct. Do NOT manufacture alerts from routine news.
+SEVERITY RULES (user gets a phone notification — be selective, not silent):
+- "routine": Ongoing stories with no new development since last cycle. Commentary, opinion, rhetoric without action.
+- "notable": Something NEW happened — a concrete event, a significant data change, or a meaningful new development. Examples: new military action, market move >2%, earthquake >5.0, new sanctions announced, ceasefire broken, major policy reversal. Also: watchlist term found with a new development.
+- "urgent": A major confirmed event from 2+ sources with cross-domain impact. Examples: active military engagement, market crash, confirmed attack.
+- "developing": Signals building but nothing concrete yet.
+- The key question: "Did something HAPPEN, or is this just the same story continuing?" If nothing new happened, it's routine.
+- Maximum 4 findings. Aim for 1-2 notable per cycle when real news exists, 0 when it's a quiet news day.
 
 SOURCE VERIFICATION (CRITICAL):
 - Telegram channels often post unverified, exaggerated, or completely false claims.
