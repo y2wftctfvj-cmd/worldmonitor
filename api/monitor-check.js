@@ -21,7 +21,9 @@
  *   CLOUDFLARE_RADAR_TOKEN
  */
 
-export const config = { runtime: 'edge' };
+// Node.js serverless runtime — 60s timeout (edge only gets 25s, not enough for
+// data collection + LLM analysis)
+export const config = { maxDuration: 60 };
 
 import {
   fetchGoogleNewsHeadlines,
