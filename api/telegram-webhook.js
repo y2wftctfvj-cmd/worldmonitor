@@ -5,12 +5,13 @@
  * conversation memory (Redis, 30 turns, 48h TTL), watchlist commands,
  * and the full Monitor intelligence analyst persona.
  *
- * Auth: secret token passed as ?token= query param (must match CRON_SECRET).
+ * Auth: Telegram's X-Telegram-Bot-Api-Secret-Token header (set via setWebhook).
+ *   Falls back to ?token= query param for backwards compatibility.
  *
  * Commands: /watch, /unwatch, /watches, /brief, /status, /clear
  *
  * Setup (one-time):
- *   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=https://worldmonitor.app/api/telegram-webhook?token=${CRON_SECRET}"
+ *   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=https://worldmonitor-two-kappa.vercel.app/api/telegram-webhook&secret_token=${CRON_SECRET}"
  */
 
 export const config = { runtime: 'edge' };
@@ -25,6 +26,12 @@ import {
   fetchTopicNews,
   fetchGeopoliticalMarkets,
 } from './tools/monitor-tools.js';
+
+import {
+  loadWatchlist,
+  saveWatchlist,
+  loadAllWatchlists,
+} from './tools/redis-helpers.js';
 
 // ---------------------------------------------------------------------------
 // LLM settings
@@ -77,10 +84,12 @@ export default async function handler(request) {
     return new Response('Method not allowed', { status: 405 });
   }
 
-  // Validate secret token
-  const url = new URL(request.url);
-  const token = url.searchParams.get('token');
+  // Validate secret token — prefer Telegram's header, fall back to query param
   const cronSecret = process.env.CRON_SECRET;
+  const headerToken = request.headers.get('x-telegram-bot-api-secret-token');
+  const url = new URL(request.url);
+  const queryToken = url.searchParams.get('token');
+  const token = headerToken || queryToken;
   if (!cronSecret || token !== cronSecret) {
     return new Response('Unauthorized', { status: 401 });
   }
@@ -262,26 +271,15 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
 // ---------------------------------------------------------------------------
 
 async function generateBriefing(chatId, redisUrl, redisToken, openRouterKey, groqKey) {
-  // Fetch ALL data sources in parallel — 10s max, leaves ~18s for LLM
-  const BRIEF_FETCH_TIMEOUT_MS = 10000;
-  const fetchPromise = Promise.allSettled([
+  // Each fetch has its own AbortSignal.timeout (5-8s), so allSettled
+  // completes within ~8s with partial results for any that timed out.
+  const [headlines, markets, telegram, reddit, predictions] = await Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
     fetchAllTelegramChannels(),
     fetchAllRedditPosts(),
     fetchGeopoliticalMarkets(),
   ]);
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve(null), BRIEF_FETCH_TIMEOUT_MS)
-  );
-  const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-  const defaultRejected = { status: 'rejected', reason: 'brief fetch timeout' };
-  const [headlines, markets, telegram, reddit, predictions] = result || Array(5).fill(defaultRejected);
-
-  if (!result) {
-    console.warn('[telegram-webhook] Brief fetch timed out after 10s, using partial data');
-  }
 
   const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
 
@@ -398,26 +396,15 @@ async function generateStatus() {
 async function fetchContext(userQuery = '') {
   const sections = [];
 
-  // 8s max for context fetching — leaves ~20s for LLM within Vercel's 30s edge limit
-  const CONTEXT_TIMEOUT_MS = 8000;
-  const fetchPromise = Promise.allSettled([
+  // Each fetch has its own AbortSignal.timeout (5-8s), so allSettled
+  // completes within ~8s with partial results for any that timed out.
+  const [headlines, quotes, reddit, telegram, topicNews] = await Promise.allSettled([
     fetchGoogleNewsHeadlines(),
     fetchMarketQuotes(),
     fetchAllRedditPosts(),
     fetchAllTelegramChannels(),
     fetchTopicNews(userQuery),
   ]);
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve(null), CONTEXT_TIMEOUT_MS)
-  );
-  const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-  const defaultRejected = { status: 'rejected', reason: 'context timeout' };
-  const [headlines, quotes, reddit, telegram, topicNews] = result || Array(5).fill(defaultRejected);
-
-  if (!result) {
-    console.warn('[telegram-webhook] Context fetch timed out after 8s, using partial data');
-  }
 
   if (topicNews.status === 'fulfilled' && topicNews.value) {
     sections.push(`TOPIC-SPECIFIC NEWS:\n${topicNews.value}`);
@@ -699,33 +686,8 @@ async function clearHistory(chatId, redisUrl, redisToken) {
 }
 
 // ---------------------------------------------------------------------------
-// Watchlist — Redis-backed persistent storage
+// Watchlist — commands (add/remove use shared helpers from redis-helpers.js)
 // ---------------------------------------------------------------------------
-
-/**
- * Load user's watchlist from Redis.
- * Returns array of { term, addedAt } objects.
- */
-export async function loadWatchlist(chatId, redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return [];
-
-  try {
-    const key = `watchlist:${chatId}`;
-    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return [];
-
-    const data = await resp.json();
-    if (!data.result) return [];
-
-    const watchlist = JSON.parse(data.result);
-    return Array.isArray(watchlist) ? watchlist : [];
-  } catch {
-    return [];
-  }
-}
 
 /**
  * Add a term to the watchlist.
@@ -781,87 +743,10 @@ async function removeFromWatchlist(chatId, term, redisUrl, redisToken) {
   return `Removed "${term}" from watchlist.`;
 }
 
-/**
- * Save watchlist to Redis (no TTL — persists indefinitely).
- */
-async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
-  const key = `watchlist:${chatId}`;
-  const value = JSON.stringify(watchlist);
-  const resp = await fetch(`${redisUrl}/pipeline`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${redisToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify([['SET', key, value]]),
-    signal: AbortSignal.timeout(2000),
-  });
-  if (!resp.ok) {
-    throw new Error(`Redis SET failed: ${resp.status}`);
-  }
-}
-
-/**
- * Load ALL user watchlists (for the analysis cycle).
- * Scans Redis for watchlist:* keys. Returns { chatId, terms[] } array.
- */
-export async function loadAllWatchlists(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return [];
-
-  try {
-    // SCAN for all watchlist keys
-    const resp = await fetch(`${redisUrl}/scan/0/match/watchlist:*/count/100`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!resp.ok) return [];
-
-    const data = await resp.json();
-    const keys = data.result?.[1] || [];
-    if (keys.length === 0) return [];
-
-    // Batch GET all keys in a single pipeline call (instead of N+1 sequential)
-    const pipeline = keys.map(key => ['GET', key]);
-    const batchResp = await fetch(`${redisUrl}/pipeline`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${redisToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(pipeline),
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!batchResp.ok) return [];
-
-    const batchData = await batchResp.json();
-    const watchlists = [];
-    for (let i = 0; i < keys.length; i++) {
-      const result = batchData[i]?.result;
-      if (!result) continue;
-      try {
-        const items = JSON.parse(result);
-        if (Array.isArray(items) && items.length > 0) {
-          const chatId = keys[i].replace('watchlist:', '');
-          watchlists.push({ chatId, terms: items.map(w => w.term) });
-        }
-      } catch {
-        // Skip malformed watchlist
-      }
-    }
-    return watchlists;
-  } catch {
-    return [];
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Telegram sending
 // ---------------------------------------------------------------------------
 
-/**
- * Send a text message to a Telegram chat via Bot API.
- * Uses Markdown parse mode. Truncates to 4096 chars.
- */
 /**
  * Send a message to Telegram, splitting into multiple messages if needed.
  * Splits on section headers (*HEADER*) first, then on paragraph breaks.

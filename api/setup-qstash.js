@@ -13,7 +13,9 @@
 
 const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
 const CRON_SECRET = process.env.CRON_SECRET;
-const DESTINATION = 'https://worldmonitor.app/api/monitor-check';
+const DESTINATION = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}/api/monitor-check`
+  : 'https://worldmonitor-two-kappa.vercel.app/api/monitor-check';
 const SCHEDULE = '*/5 * * * *'; // Every 5 minutes
 
 async function setupQStashSchedule() {

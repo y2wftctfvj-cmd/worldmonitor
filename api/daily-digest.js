@@ -85,45 +85,16 @@ export default async function handler(request) {
   // Build the message
   const message = buildDigestMessage(headlineData, marketQuotes, predictionData, aiBriefing);
 
-  // Send to Telegram
+  // Send to Telegram — split into chunks if message exceeds 4096 char limit
   try {
-    const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const resp = await fetch(telegramUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'MarkdownV2',
-        disable_web_page_preview: true,
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!resp.ok) {
-      const errBody = await resp.text();
-      console.error('[daily-digest] Telegram API error:', resp.status, errBody);
-
-      // Retry without MarkdownV2 on parse failure
-      if (resp.status === 400) {
-        const plainMsg = buildPlainDigest(headlineData, marketQuotes, predictionData, aiBriefing);
-        await fetch(telegramUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: plainMsg,
-            disable_web_page_preview: true,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-      }
-
-      return jsonResponse(502, { error: 'Telegram API error', status: resp.status });
+    const chunks = splitMessage(message, 4096);
+    for (const chunk of chunks) {
+      await sendDigestChunk(botToken, chatId, chunk, headlineData, marketQuotes, predictionData, aiBriefing);
     }
 
     return jsonResponse(200, {
       ok: true,
+      chunks: chunks.length,
       sections: {
         headlines: headlineData.length,
         markets: marketQuotes.length,
@@ -422,6 +393,104 @@ function buildPlainDigest(headlines, marketQuotes, predictions, aiBriefing) {
   headlines.forEach((h, i) => parts.push(`${i + 1}. ${h.title}`));
   parts.push('\nMonitor is watching. Sleep well.');
   return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Telegram message splitting and sending
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a long message into chunks under maxLen.
+ * Prefers splitting on section headers, then double newlines, then single newlines.
+ */
+function splitMessage(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+
+    let splitAt = -1;
+
+    // Prefer splitting before a section header (*SOMETHING*)
+    const headerPattern = /\n\*[A-Z]/g;
+    let headerMatch;
+    while ((headerMatch = headerPattern.exec(remaining)) !== null) {
+      if (headerMatch.index > 0 && headerMatch.index <= maxLen) {
+        splitAt = headerMatch.index;
+      }
+      if (headerMatch.index > maxLen) break;
+    }
+
+    // Try double newline
+    if (splitAt === -1) {
+      const lastDoubleNewline = remaining.lastIndexOf('\n\n', maxLen);
+      if (lastDoubleNewline > maxLen * 0.3) splitAt = lastDoubleNewline;
+    }
+
+    // Try single newline
+    if (splitAt === -1) {
+      const lastNewline = remaining.lastIndexOf('\n', maxLen);
+      if (lastNewline > maxLen * 0.3) splitAt = lastNewline;
+    }
+
+    // Hard cut as last resort
+    if (splitAt === -1) splitAt = maxLen;
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  return chunks.filter(c => c.length > 0);
+}
+
+/**
+ * Send a single digest chunk to Telegram.
+ * Tries MarkdownV2 first, falls back to plain text on parse failure.
+ */
+async function sendDigestChunk(botToken, chatId, chunk) {
+  const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const resp = await fetch(telegramUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: chunk,
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text();
+    console.error('[daily-digest] Telegram chunk error:', resp.status, errBody);
+
+    // Retry without MarkdownV2 on parse failure
+    if (resp.status === 400) {
+      // Strip MarkdownV2 escapes for plain text
+      const plainChunk = chunk.replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, '$1');
+      const retryResp = await fetch(telegramUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: plainChunk,
+          disable_web_page_preview: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (retryResp.ok) return;
+    }
+
+    throw new Error(`Telegram API error ${resp.status}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

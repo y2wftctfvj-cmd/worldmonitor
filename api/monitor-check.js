@@ -18,7 +18,7 @@
  *   OPENROUTER_API_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
  * Optional:
  *   QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY (for QStash auth)
- *   CLOUDFLARE_RADAR_TOKEN
+ *   CLOUDFLARE_API_TOKEN
  */
 
 export const config = { runtime: 'edge' };
@@ -35,8 +35,10 @@ import {
   fetchGovFeeds,
 } from './tools/monitor-tools.js';
 
-// Import watchlist loader from telegram-webhook
-// (uses the same Redis keys, same format)
+import {
+  loadAllWatchlists,
+  redisSet,
+} from './tools/redis-helpers.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,6 +47,8 @@ const LLM_TIMEOUT_MS = 10000; // Edge = 25s total. Budget: collect 8s + LLM 10s 
 const MAX_TOKENS = 1500;  // Shorter output = faster response
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
+const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
+const CYCLE_LOCK_TTL = 30; // seconds — auto-expires if handler crashes
 
 // ---------------------------------------------------------------------------
 // Main handler
@@ -78,14 +82,26 @@ export default async function handler(request) {
   // Redis config
   const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
-  const cloudflareToken = process.env.CLOUDFLARE_RADAR_TOKEN;
+  const cloudflareToken = process.env.CLOUDFLARE_API_TOKEN;
+
+  // Overlap protection: acquire a Redis lock so QStash + Vercel cron
+  // can't run concurrent cycles. Lock auto-expires after 30s.
+  const lockAcquired = await acquireLock(redisUrl, redisToken);
+  if (!lockAcquired) {
+    return jsonResponse(200, { skipped: true, reason: 'Another cycle is already running' });
+  }
 
   try {
     // -----------------------------------------------------------------------
     // 1. COLLECT — fetch all data sources in parallel (15s max for entire phase)
     // -----------------------------------------------------------------------
-    const COLLECT_TIMEOUT_MS = 8000;
-    const collectPromise = Promise.allSettled([
+    // Each fetch has its own AbortSignal.timeout (5-8s), so allSettled
+    // finishes within ~8s. No outer timeout needed — it would discard ALL
+    // partial results on timeout (allSettled returns nothing until done).
+    const [
+      headlines, markets, telegram, reddit, predictions,
+      earthquakes, outages, military, govFeeds,
+    ] = await Promise.allSettled([
       fetchGoogleNewsHeadlines(),
       fetchMarketQuotes(),
       fetchAllTelegramChannels(),
@@ -96,21 +112,6 @@ export default async function handler(request) {
       fetchMilitaryNews(),
       fetchGovFeeds(),
     ]);
-    const timeoutPromise = new Promise((resolve) =>
-      setTimeout(() => resolve(null), COLLECT_TIMEOUT_MS)
-    );
-    const collectResult = await Promise.race([collectPromise, timeoutPromise]);
-
-    // If collection timed out, use whatever we have (allSettled would have partial results)
-    const defaultRejected = { status: 'rejected', reason: 'collection timeout' };
-    const [
-      headlines, markets, telegram, reddit, predictions,
-      earthquakes, outages, military, govFeeds,
-    ] = collectResult || Array(9).fill(defaultRejected);
-
-    if (!collectResult) {
-      console.warn('[monitor-check] Collection phase timed out after 15s, using partial data');
-    }
 
     // -----------------------------------------------------------------------
     // 2. BUILD SNAPSHOT — assemble all data into one context string
@@ -154,15 +155,22 @@ export default async function handler(request) {
     let alertsSent = 0;
     let skippedDeveloping = 0;
     let skippedDuplicate = 0;
-    if (analysis && analysis.findings) {
+    if (analysis && Array.isArray(analysis.findings)) {
       // Load recent alert titles for similarity-based dedup
       const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
       for (const finding of analysis.findings) {
+        // Validate finding structure — LLM output can be malformed
+        if (!finding || typeof finding !== 'object') continue;
+        if (typeof finding.severity !== 'string') continue;
+        if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
+
         if (finding.severity === 'routine') continue;
 
-        // Cross-source verification: Telegram-only claims get downgraded
-        const sources = finding.sources || [];
+        // Normalize sources to string array (LLM sometimes returns non-strings)
+        const sources = Array.isArray(finding.sources)
+          ? finding.sources.filter(s => typeof s === 'string')
+          : [];
         const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
         const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
         if (isTelegramOnly && finding.severity !== 'developing') {
@@ -204,6 +212,7 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     await storeSnapshot(redisUrl, redisToken, currentSnapshot);
 
+    await releaseLock(redisUrl, redisToken);
     return jsonResponse(200, {
       ok: true,
       alertsSent,
@@ -213,8 +222,51 @@ export default async function handler(request) {
       summary: analysis?.situation_summary?.substring(0, 200) || '',
     });
   } catch (err) {
+    await releaseLock(redisUrl, redisToken);
     console.error('[monitor-check] Cycle failed:', err.message || err);
     return jsonResponse(500, { error: 'Analysis cycle failed' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle lock — prevents overlapping runs from QStash + Vercel cron
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to acquire an exclusive lock via Redis SET NX EX.
+ * Returns true if lock acquired, false if another cycle holds it.
+ */
+async function acquireLock(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return true; // No Redis = no locking, proceed
+
+  try {
+    const resp = await fetch(`${redisUrl}/set/${CYCLE_LOCK_KEY}/1/EX/${CYCLE_LOCK_TTL}/NX`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return true; // Redis error = don't block, proceed
+
+    const data = await resp.json();
+    return data.result === 'OK';
+  } catch {
+    return true; // Network error = don't block, proceed
+  }
+}
+
+/**
+ * Release the cycle lock.
+ */
+async function releaseLock(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    await fetch(`${redisUrl}/del/${CYCLE_LOCK_KEY}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch {
+    // Lock will auto-expire via TTL
   }
 }
 
@@ -591,58 +643,6 @@ async function storeSnapshot(redisUrl, redisToken, snapshot) {
 }
 
 // ---------------------------------------------------------------------------
-// Watchlist loading (same format as telegram-webhook.js)
-// ---------------------------------------------------------------------------
-
-async function loadAllWatchlists(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return [];
-
-  try {
-    const resp = await fetch(`${redisUrl}/scan/0/match/watchlist:*/count/100`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!resp.ok) return [];
-
-    const data = await resp.json();
-    const keys = data.result?.[1] || [];
-    if (keys.length === 0) return [];
-
-    // Batch GET all keys in a single pipeline call (instead of N+1 sequential)
-    const pipeline = keys.map(key => ['GET', key]);
-    const batchResp = await fetch(`${redisUrl}/pipeline`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${redisToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(pipeline),
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!batchResp.ok) return [];
-
-    const batchData = await batchResp.json();
-    const watchlists = [];
-    for (let i = 0; i < keys.length; i++) {
-      const result = batchData[i]?.result;
-      if (!result) continue;
-      try {
-        const items = JSON.parse(result);
-        if (Array.isArray(items) && items.length > 0) {
-          const chatId = keys[i].replace('watchlist:', '');
-          watchlists.push({ chatId, terms: items.map(w => w.term) });
-        }
-      } catch {
-        // Skip malformed watchlist
-      }
-    }
-    return watchlists;
-  } catch {
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Similarity-based deduplication
 // ---------------------------------------------------------------------------
 
@@ -700,33 +700,6 @@ async function saveRecentAlertTitle(redisUrl, redisToken, title) {
     await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), RECENT_ALERTS_TTL);
   } catch (err) {
     console.error('[monitor-check] Failed to save recent alert title:', err.message);
-  }
-}
-
-/**
- * Set a Redis key via pipeline POST body (safe for large values).
- * URL-path encoding breaks for values >8KB, so we use the pipeline endpoint.
- */
-async function redisSet(redisUrl, redisToken, key, value, exSeconds) {
-  try {
-    const command = exSeconds
-      ? ['SET', key, value, 'EX', String(exSeconds)]
-      : ['SET', key, value];
-    const resp = await fetch(`${redisUrl}/pipeline`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${redisToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify([command]),
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      console.error(`[monitor-check] Redis SET failed for key ${key}: HTTP ${resp.status} ${body}`);
-    }
-  } catch (err) {
-    console.error(`[monitor-check] Redis SET failed for key ${key}:`, err.message);
   }
 }
 
