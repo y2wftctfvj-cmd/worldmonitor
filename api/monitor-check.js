@@ -1,15 +1,16 @@
 /**
- * Smart Monitor Check — AI-powered intelligence analysis cycle.
+ * Smart Monitor Check — Evidence Fusion intelligence analysis cycle.
  *
- * v2.7.0: Complete rewrite. Replaces threshold-based checks with an
- * AI analysis loop that runs every 5 minutes via QStash (or daily via
- * Vercel cron as backup).
+ * v3.0.0: Evidence Fusion. Replaces monolithic LLM-decides-severity approach
+ * with a structured normalize -> cluster -> score -> promote pipeline.
+ * LLM now only summarizes pre-scored candidates — it doesn't decide what to alert on.
  *
  * The cycle:
- *   1. COLLECT — fetch all data sources in parallel
- *   2. ANALYZE — feed everything into Qwen 3.5 Plus with previous snapshot
- *   3. DECIDE  — if AI flags notable/urgent findings, push Telegram alerts
- *   4. STORE   — save current snapshot for next cycle comparison
+ *   1. COLLECT   — fetch all 9 data sources in parallel
+ *   2. FUSE      — normalize records, cluster by entity, score additively, promote by threshold
+ *   3. SUMMARIZE — LLM writes analysis + watch_next for promoted candidates only
+ *   4. ALERT     — send notable/urgent findings to Telegram with confidence metadata
+ *   5. STORE     — save record IDs + snapshot for next cycle
  *
  * Auth: accepts both Vercel cron auth (Bearer token) AND QStash signatures.
  *
@@ -33,12 +34,16 @@ import {
   fetchInternetOutages,
   fetchMilitaryNews,
   fetchGovFeeds,
-} from './tools/monitor-tools.js';
+} from './_tools/monitor-tools.js';
 
 import {
   loadAllWatchlists,
   redisSet,
-} from './tools/redis-helpers.js';
+  loadPreviousRecordIds,
+  storeRecordIds,
+} from './_tools/redis-helpers.js';
+
+import { runFusion } from './_tools/evidence-fusion.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -114,112 +119,133 @@ export default async function handler(request) {
     ]);
 
     // -----------------------------------------------------------------------
-    // 2. BUILD SNAPSHOT — assemble all data into one context string
+    // 2. EVIDENCE FUSION — normalize, cluster, score, promote
     // -----------------------------------------------------------------------
-    const currentSnapshot = buildSnapshot({
+    const collectResults = {
       headlines, markets, telegram, reddit, predictions,
       earthquakes, outages, military, govFeeds,
-    });
+    };
 
-    // -----------------------------------------------------------------------
-    // 3. LOAD PREVIOUS — get last cycle's snapshot from Redis
-    // -----------------------------------------------------------------------
-    const previousSnapshot = await loadPreviousSnapshot(redisUrl, redisToken);
-
-    // -----------------------------------------------------------------------
-    // 4. LOAD WATCHLISTS — all user watchlists
-    // -----------------------------------------------------------------------
-    const watchlists = await loadAllWatchlists(redisUrl, redisToken);
+    // Load watchlists and previous record IDs in parallel
+    const [watchlists, previousRecordIds, developingItems] = await Promise.all([
+      loadAllWatchlists(redisUrl, redisToken),
+      loadPreviousRecordIds(redisUrl, redisToken),
+      loadDevelopingItems(redisUrl, redisToken),
+    ]);
     const watchlistTerms = watchlists.flatMap(w => w.terms);
 
-    // -----------------------------------------------------------------------
-    // 5. LOAD DEVELOPING ITEMS — track multi-cycle patterns
-    // -----------------------------------------------------------------------
-    const developingItems = await loadDevelopingItems(redisUrl, redisToken);
+    // Run the fusion pipeline: normalize -> cluster -> score -> promote
+    const { allCandidates, records } = runFusion(collectResults, previousRecordIds, watchlistTerms);
+    const promotedCandidates = allCandidates.filter(c => c.severity !== 'routine');
+
+    console.log(`[monitor-check] Fusion: ${records.length} records -> ${allCandidates.length} clusters -> ${promotedCandidates.length} promoted`);
 
     // -----------------------------------------------------------------------
-    // 6. ANALYZE — feed everything to the AI
+    // 3. LLM SUMMARIZE — only for promoted candidates (notable/urgent)
     // -----------------------------------------------------------------------
-    const analysis = await runAnalysisCycle(
-      currentSnapshot,
-      previousSnapshot,
-      watchlistTerms,
-      developingItems,
-      openRouterKey,
-      groqKey
-    );
+    let findings = [];
+    if (promotedCandidates.length > 0) {
+      // Ask LLM to write analysis + watch_next for each promoted candidate
+      const llmResult = await summarizeCandidates(
+        promotedCandidates,
+        developingItems,
+        openRouterKey,
+        groqKey
+      );
+
+      if (llmResult && Array.isArray(llmResult.findings)) {
+        findings = llmResult.findings;
+      } else {
+        // LLM failed — use fusion data directly (no analysis text, but scores are valid)
+        findings = promotedCandidates.map(c => ({
+          severity: c.severity,
+          title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
+          analysis: `Confidence ${c.confidence}: ${c.records.length} records from ${new Set(c.records.map(r => r.sourceId)).size} sources.`,
+          sources: [...new Set(c.records.map(r => r.sourceId))],
+          watchlist_match: c.watchlistMatch,
+          watch_next: ['Monitor source volume', 'Check for mainstream pickup'],
+          _confidence: c.confidence,
+          _scoreBreakdown: c.scoreBreakdown,
+        }));
+      }
+    }
 
     // -----------------------------------------------------------------------
-    // 7. ALERT — send notable/urgent findings to Telegram
+    // 4. ALERT — send notable/urgent findings to Telegram
     // -----------------------------------------------------------------------
     let alertsSent = 0;
     let skippedDeveloping = 0;
     let skippedDuplicate = 0;
-    if (analysis && Array.isArray(analysis.findings)) {
-      // Load recent alert titles for similarity-based dedup
+
+    if (findings.length > 0) {
       const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
-      for (const finding of analysis.findings) {
-        // Validate finding structure — LLM output can be malformed
+      for (const finding of findings) {
         if (!finding || typeof finding !== 'object') continue;
         if (typeof finding.severity !== 'string') continue;
         if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
 
         if (finding.severity === 'routine') continue;
 
-        // Normalize sources to string array (LLM sometimes returns non-strings)
+        // Telegram-only source check — create new object instead of mutating
         const sources = Array.isArray(finding.sources)
           ? finding.sources.filter(s => typeof s === 'string')
           : [];
         const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
         const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
+        let alertFinding = finding;
         if (isTelegramOnly && finding.severity !== 'developing') {
-          finding.severity = 'developing';
-          // Avoid double prefix if AI already added UNVERIFIED
-          if (!finding.title.startsWith('UNVERIFIED')) {
-            finding.title = `UNVERIFIED: ${finding.title}`;
-          }
+          alertFinding = {
+            ...finding,
+            severity: 'developing',
+            title: finding.title.startsWith('UNVERIFIED')
+              ? finding.title
+              : `UNVERIFIED: ${finding.title}`,
+          };
         }
 
-        // Skip developing items from alerting (they go to tracking instead)
-        if (finding.severity === 'developing') { skippedDeveloping++; continue; }
+        if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
 
-        // At this point only "urgent" findings remain
-
-        // Similarity-based dedup: skip if >40% word overlap with any recent alert
+        // Similarity dedup
         const isDuplicate = recentTitles.some(
           recent => jaccardSimilarity(finding.title, recent) > 0.4
         );
-        if (isDuplicate) {
-          skippedDuplicate++;
-          continue;
-        }
+        if (isDuplicate) { skippedDuplicate++; continue; }
 
-        await sendIntelAlert(botToken, chatId, finding);
+        // Add fusion metadata to the alert
+        await sendIntelAlert(botToken, chatId, alertFinding);
         await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
         alertsSent++;
       }
 
-      // Track developing items
-      await updateDevelopingItems(analysis.findings, redisUrl, redisToken);
+      // Track developing items from LLM findings
+      await updateDevelopingItems(findings, redisUrl, redisToken);
     }
 
     // Check developing items that have hit the threshold
     await checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken);
 
     // -----------------------------------------------------------------------
-    // 8. STORE — save current snapshot for next cycle
+    // 5. STORE — save record IDs for next-cycle delta detection
     // -----------------------------------------------------------------------
-    await storeSnapshot(redisUrl, redisToken, currentSnapshot);
+    const currentRecordIds = records.map(r => r.id);
+    await storeRecordIds(redisUrl, redisToken, currentRecordIds);
+
+    // Also store snapshot for /brief and other features that use it
+    if (records.length > 0) {
+      const currentSnapshot = buildSnapshot(collectResults);
+      await storeSnapshot(redisUrl, redisToken, currentSnapshot);
+    }
 
     await releaseLock(redisUrl, redisToken);
     return jsonResponse(200, {
       ok: true,
       alertsSent,
-      findings: analysis?.findings?.length || 0,
+      fusionClusters: allCandidates.length,
+      promoted: promotedCandidates.length,
+      findings: findings.length,
       skippedDeveloping,
       skippedDuplicate,
-      summary: analysis?.situation_summary?.substring(0, 200) || '',
     });
   } catch (err) {
     await releaseLock(redisUrl, redisToken);
@@ -304,12 +330,12 @@ function buildSnapshot(results) {
   // Prediction markets
   if (results.predictions.status === 'fulfilled' && results.predictions.value?.length > 0) {
     const markets = results.predictions.value.slice(0, 10);
-    sections.push(`PREDICTION MARKETS (Polymarket):\n${markets.map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume).toLocaleString('en-US')})`).join('\n')}`);
+    sections.push(`PREDICTION MARKETS (Polymarket):\n${markets.map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume || 0).toLocaleString('en-US')})`).join('\n')}`);
   }
 
   // Earthquakes
   if (results.earthquakes.status === 'fulfilled' && results.earthquakes.value?.length > 0) {
-    sections.push(`EARTHQUAKES:\n${results.earthquakes.value.map(eq => `- M${eq.mag.toFixed(1)} — ${eq.place} (${eq.time})`).join('\n')}`);
+    sections.push(`EARTHQUAKES:\n${results.earthquakes.value.map(eq => `- M${(eq.mag || 0).toFixed(1)} — ${eq.place} (${eq.time})`).join('\n')}`);
   }
 
   // Internet outages
@@ -335,62 +361,66 @@ function buildSnapshot(results) {
 // AI analysis cycle
 // ---------------------------------------------------------------------------
 
-async function runAnalysisCycle(currentSnapshot, previousSnapshot, watchlistTerms, developingItems, openRouterKey, groqKey) {
-  const watchlistSection = watchlistTerms.length > 0
-    ? `\nUSER WATCHLIST:\n${watchlistTerms.map(t => `- "${t}"`).join('\n')}\n\nFor each watchlist term: search ALL current data for mentions. If found in any source, include in findings with severity "notable" minimum. If found in 2+ sources, severity "urgent".`
-    : '';
-
+/**
+ * Summarize pre-scored fusion candidates using LLM.
+ *
+ * The LLM writes analysis + watch_next for each candidate.
+ * It does NOT set severity or confidence — those come from the fusion engine.
+ * This cuts LLM input tokens by ~60% vs the old full-dump approach.
+ */
+async function summarizeCandidates(promotedCandidates, developingItems, openRouterKey, groqKey) {
   const developingSection = developingItems.length > 0
     ? `\nDEVELOPING ITEMS FROM PREVIOUS CYCLES:\n${developingItems.map(d => `- "${d.topic}" (${d.count} consecutive cycles)`).join('\n')}`
     : '';
 
-  const analysisPrompt = `Analyze the intelligence data below. Compare against the PREVIOUS CYCLE data to detect changes.
+  // Build compact candidate summaries for the LLM
+  const candidateSummaries = promotedCandidates.map((c, i) => {
+    const sources = [...new Set(c.records.map(r => r.sourceId))];
+    const sampleTexts = c.records.slice(0, 5).map(r => `  - [${r.sourceId}] ${r.text.substring(0, 150)}`).join('\n');
+    return `EVENT ${i + 1} (severity: ${c.severity}, confidence: ${c.confidence}, entities: ${c.entities.join(', ')}):
+Sources: ${sources.join(', ')}
+Score breakdown: reliability=${c.scoreBreakdown.reliability}, corroboration=${c.scoreBreakdown.corroboration}, recency=${c.scoreBreakdown.recency}, cross_domain=${c.scoreBreakdown.crossDomain}, novelty=${c.scoreBreakdown.novelty}, contradiction=${c.scoreBreakdown.contradiction}
+${c.watchlistMatch ? `Watchlist match: "${c.watchlistMatch}"` : ''}
+Sample records:
+${sampleTexts}`;
+  }).join('\n\n');
 
-CURRENT DATA:
-${currentSnapshot}
+  const analysisPrompt = `These events have been pre-scored by the evidence fusion system.
+For each event, write:
+1. A short headline title (5-10 words)
+2. A 2-3 sentence analysis explaining what is happening and why it matters
+3. 2-3 specific indicators to watch next
 
-${previousSnapshot ? `PREVIOUS CYCLE DATA:\n${previousSnapshot}` : 'No previous cycle data available (first run).'}
-${watchlistSection}
+Do NOT change the severity — it has been set by the scoring system.
 ${developingSection}
+
+PRE-SCORED EVENTS:
+${candidateSummaries}
 
 OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
 {
   "findings": [
     {
-      "severity": "urgent|notable|developing|routine",
       "title": "Short headline",
       "analysis": "2-3 sentences explaining what is happening and why it matters",
-      "sources": ["telegram:intelslava", "reddit:worldnews", "markets:USO"],
-      "watchlist_match": "Taiwan" or null,
       "watch_next": ["indicator 1", "indicator 2"]
     }
-  ],
-  "situation_summary": "1 paragraph overall assessment"
+  ]
 }
 
-SEVERITY RULES (user gets a phone notification — be selective, not silent):
-- "routine": Ongoing stories with no new development since last cycle. Commentary, opinion, rhetoric without action.
-- "notable": Something NEW happened — a concrete event, a significant data change, or a meaningful new development. Examples: new military action, market move >2%, earthquake >5.0, new sanctions announced, ceasefire broken, major policy reversal. Also: watchlist term found with a new development.
-- "urgent": A major confirmed event from 2+ sources with cross-domain impact. Examples: active military engagement, market crash, confirmed attack.
-- "developing": Signals building but nothing concrete yet.
-- The key question: "Did something HAPPEN, or is this just the same story continuing?" If nothing new happened, it's routine.
-- Maximum 4 findings. Aim for 1-2 notable per cycle when real news exists, 0 when it's a quiet news day.
-
-SOURCE VERIFICATION (CRITICAL):
-- Telegram channels often post unverified, exaggerated, or completely false claims.
-- NEVER treat a claim as fact if it ONLY appears in Telegram channels and nowhere else.
-- Deaths, assassinations, major attacks: require confirmation from at least one mainstream news source (headlines or wire services). If only Telegram reports it, explicitly label it "UNVERIFIED" in the title and analysis.
-- If a Telegram claim contradicts or has no support from headlines/wire services, downgrade its severity.
-- Use consistent topic-level titles across cycles. For example, if you flagged "US-Iran tensions" last cycle, use the same or very similar title this cycle, not a completely reworded version.`;
+RULES:
+- Output exactly ${promotedCandidates.length} findings, one per event, in the same order.
+- Keep titles consistent across cycles. Use consistent topic-level names.
+- Telegram-only claims should note "UNVERIFIED" in analysis.
+- Be concise. The scoring system already determined importance.`;
 
   const messages = [
     { role: 'system', content: 'You are an intelligence analysis system. Output ONLY valid JSON. No explanatory text.' },
     { role: 'user', content: analysisPrompt },
   ];
 
-  // Call LLM
+  // Call LLM — same provider cascade as before
   const providers = [];
-  // Groq first — free, fast (500 tok/s), fits in edge timeout
   if (groqKey) {
     providers.push({
       name: 'Groq',
@@ -399,7 +429,6 @@ SOURCE VERIFICATION (CRITICAL):
       apiKey: groqKey,
     });
   }
-  // OpenRouter fallback — smarter but slower
   if (openRouterKey) {
     providers.push({
       name: 'DeepSeek',
@@ -436,16 +465,34 @@ SOURCE VERIFICATION (CRITICAL):
       const content = data?.choices?.[0]?.message?.content;
       if (!content) throw new Error(`${provider.name} returned no content`);
 
-      // Parse JSON response
-      const analysis = JSON.parse(content);
-      console.log(`[monitor-check] ${provider.name} analysis: ${analysis.findings?.length || 0} findings`);
-      return analysis;
+      const parsed = JSON.parse(content);
+
+      // Merge LLM output back into fusion candidates
+      // LLM provides title + analysis + watch_next; fusion provides severity, sources, confidence
+      const mergedFindings = promotedCandidates.map((candidate, i) => {
+        const llmFinding = parsed.findings?.[i] || {};
+        const sources = [...new Set(candidate.records.map(r => r.sourceId))];
+
+        return {
+          severity: candidate.severity,
+          title: llmFinding.title || candidate.entities.slice(0, 3).join(' / '),
+          analysis: llmFinding.analysis || '',
+          sources,
+          watchlist_match: candidate.watchlistMatch,
+          watch_next: llmFinding.watch_next || [],
+          _confidence: candidate.confidence,
+          _scoreBreakdown: candidate.scoreBreakdown,
+        };
+      });
+
+      console.log(`[monitor-check] ${provider.name} summarized ${mergedFindings.length} candidates`);
+      return { findings: mergedFindings };
     } catch (err) {
       console.error(`[monitor-check] ${provider.name} failed:`, err.message || err);
     }
   }
 
-  console.error('[monitor-check] All LLM providers failed for analysis');
+  console.error('[monitor-check] All LLM providers failed for summarization');
   return null;
 }
 
@@ -489,8 +536,18 @@ async function sendIntelAlert(botToken, chatId, finding) {
     }
   }
 
+  // Fusion metadata — show confidence score and source count
+  if (finding._confidence != null) {
+    const sourceCount = Array.isArray(finding.sources) ? finding.sources.length : 0;
+    const breakdown = finding._scoreBreakdown || {};
+    const metaParts = [`conf: ${finding._confidence}`];
+    if (sourceCount > 0) metaParts.push(`${sourceCount} sources`);
+    if (breakdown.crossDomain > 0) metaParts.push(`cross\\-domain`);
+    parts.push(`_${metaParts.join(' \\| ')}_`);
+  }
+
   parts.push('');
-  parts.push('_5\\-min cycle \\| AI analysis_');
+  parts.push('_5\\-min cycle \\| evidence fusion_');
 
   const text = parts.join('\n');
 
@@ -511,7 +568,8 @@ async function sendIntelAlert(botToken, chatId, finding) {
     // Retry without markdown on parse failure
     const errBody = await resp.text();
     if (resp.status === 400 && errBody.includes("can't parse")) {
-      const plainText = `${finding.severity.toUpperCase()} — ${finding.title}\n\n${finding.analysis || ''}\n\nSources: ${(finding.sources || []).join(', ')}`;
+      const confStr = finding._confidence != null ? `\n\nConfidence: ${finding._confidence}` : '';
+      const plainText = `${finding.severity.toUpperCase()} — ${finding.title}\n\n${finding.analysis || ''}\n\nSources: ${(finding.sources || []).join(', ')}${confStr}`;
       await fetch(telegramUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -611,22 +669,6 @@ async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
 // Redis snapshot storage
 // ---------------------------------------------------------------------------
 
-async function loadPreviousSnapshot(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return null;
-
-  try {
-    const resp = await fetch(`${redisUrl}/get/monitor:snapshot`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return data.result || null;
-  } catch {
-    return null;
-  }
-}
-
 async function storeSnapshot(redisUrl, redisToken, snapshot) {
   if (!redisUrl || !redisToken) return;
 
@@ -709,14 +751,6 @@ async function saveRecentAlertTitle(redisUrl, redisToken, title) {
 
 function escapeMarkdown(text) {
   return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
-}
-
-function slugify(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .substring(0, 50);
 }
 
 function jsonResponse(status, body) {

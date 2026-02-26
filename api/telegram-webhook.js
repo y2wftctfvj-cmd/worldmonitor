@@ -25,13 +25,13 @@ import {
   fetchAllRedditPosts,
   fetchTopicNews,
   fetchGeopoliticalMarkets,
-} from './tools/monitor-tools.js';
+} from './_tools/monitor-tools.js';
 
 import {
   loadWatchlist,
   saveWatchlist,
   loadAllWatchlists,
-} from './tools/redis-helpers.js';
+} from './_tools/redis-helpers.js';
 
 // ---------------------------------------------------------------------------
 // LLM settings

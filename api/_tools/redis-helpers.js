@@ -117,6 +117,51 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
 }
 
 // ---------------------------------------------------------------------------
+// Record IDs — delta detection between fusion cycles
+// ---------------------------------------------------------------------------
+
+const RECORD_IDS_KEY = 'monitor:record-ids';
+const RECORD_IDS_TTL = 600; // 10 min — same as snapshot TTL
+
+/**
+ * Load previous cycle's record IDs from Redis.
+ * Used by the fusion scoring step to detect new vs continuing items.
+ * Returns a Set of record ID strings.
+ */
+export async function loadPreviousRecordIds(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return new Set();
+
+  try {
+    const resp = await fetch(`${redisUrl}/get/${RECORD_IDS_KEY}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return new Set();
+
+    const data = await resp.json();
+    if (!data.result) return new Set();
+
+    const ids = JSON.parse(data.result);
+    return new Set(Array.isArray(ids) ? ids : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Store current cycle's record IDs in Redis for next-cycle delta detection.
+ */
+export async function storeRecordIds(redisUrl, redisToken, recordIds) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    await redisSet(redisUrl, redisToken, RECORD_IDS_KEY, JSON.stringify(recordIds), RECORD_IDS_TTL);
+  } catch (err) {
+    console.error('[redis] Failed to store record IDs:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Generic Redis SET via pipeline (safe for large values)
 // ---------------------------------------------------------------------------
 
