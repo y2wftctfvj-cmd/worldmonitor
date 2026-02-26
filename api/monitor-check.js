@@ -159,8 +159,7 @@ export default async function handler(request) {
       const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
       for (const finding of analysis.findings) {
-        // Only routine and urgent pass through — notable is logged, not pushed
-        if (finding.severity === 'routine' || finding.severity === 'notable') continue;
+        if (finding.severity === 'routine') continue;
 
         // Cross-source verification: Telegram-only claims get downgraded
         const sources = finding.sources || [];
