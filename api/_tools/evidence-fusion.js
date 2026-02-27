@@ -282,7 +282,9 @@ export function score(candidates, previousRecordIds) {
  * Assign severity labels based on confidence thresholds.
  *
  * - confidence >= 65 AND crossDomain >= 10 -> "urgent"
- * - confidence >= 45 -> "notable"
+ * - confidence >= 45 AND (corroboration >= 16 OR reliability >= 32) -> "notable"
+ *     Requires 2+ distinct sources, OR a single wire/mainstream source.
+ *     Prevents single domain/social records from reaching notable alone.
  * - confidence >= 25 AND watchlistMatch -> "notable" (lower bar for watched topics)
  * - everything else -> "routine"
  *
@@ -297,7 +299,7 @@ export function promote(candidates) {
 
     if (confidence >= 65 && scoreBreakdown.crossDomain >= 10) {
       severity = 'urgent';
-    } else if (confidence >= 45) {
+    } else if (confidence >= 45 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 32)) {
       severity = 'notable';
     } else if (confidence >= 25 && watchlistMatch) {
       severity = 'notable';

@@ -186,18 +186,27 @@ export default async function handler(request) {
         if (llmResult && Array.isArray(llmResult.findings)) {
           return { _value: llmResult.findings };
         }
-        // LLM failed — use fusion data directly (no analysis text, but scores are valid)
+        // LLM failed — build alerts from raw record text so there's real content
         return {
-          _value: promotedCandidates.map(c => ({
-            severity: c.severity,
-            title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
-            analysis: `Confidence ${c.confidence}: ${c.records.length} records from ${new Set(c.records.map(r => r.sourceId)).size} sources.`,
-            sources: [...new Set(c.records.map(r => r.sourceId))],
-            watchlist_match: c.watchlistMatch,
-            watch_next: ['Monitor source volume', 'Check for mainstream pickup'],
-            _confidence: c.confidence,
-            _scoreBreakdown: c.scoreBreakdown,
-          })),
+          _value: promotedCandidates.map(c => {
+            const sourceNames = [...new Set(c.records.map(r => r.sourceId))];
+            // Use actual record text as the analysis — truncate each to 200 chars
+            const sampleTexts = c.records
+              .slice(0, 3)
+              .map(r => `[${r.sourceId}] ${r.text.substring(0, 200)}`)
+              .join('\n');
+            return {
+              severity: c.severity,
+              title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
+              analysis: sampleTexts,
+              sources: sourceNames,
+              watchlist_match: c.watchlistMatch,
+              watch_next: [`${c.records.length} record(s) from ${sourceNames.length} source(s)`, `Score: ${c.confidence}`],
+              _confidence: c.confidence,
+              _scoreBreakdown: c.scoreBreakdown,
+              _entities: c.entities,
+            };
+          }),
         };
       });
     }
@@ -211,7 +220,7 @@ export default async function handler(request) {
       let skippedDuplicate = 0;
 
       if (findings.length > 0) {
-        const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
+        const recentAlerts = await loadRecentAlerts(redisUrl, redisToken);
 
         for (const finding of findings) {
           if (!finding || typeof finding !== 'object') continue;
@@ -239,15 +248,24 @@ export default async function handler(request) {
 
           if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
 
-          // Similarity dedup
-          const isDuplicate = recentTitles.some(
-            recent => jaccardSimilarity(finding.title, recent) > 0.4
-          );
+          // Similarity dedup — check title similarity AND entity overlap
+          const findingEntities = finding._entities || [];
+          const isDuplicate = recentAlerts.some(recent => {
+            // Title word overlap
+            const titleMatch = jaccardSimilarity(finding.title, recent.title) > 0.4;
+            // Entity set overlap — same entities = same story regardless of wording
+            const recentEntities = recent.entities || [];
+            if (recentEntities.length === 0 || findingEntities.length === 0) return titleMatch;
+            const overlap = findingEntities.filter(e => recentEntities.includes(e)).length;
+            const minLen = Math.min(findingEntities.length, recentEntities.length);
+            const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
+            return titleMatch || entityMatch;
+          });
           if (isDuplicate) { skippedDuplicate++; continue; }
 
           // Add fusion metadata to the alert
           await sendIntelAlert(botToken, chatId, alertFinding);
-          await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
+          await saveRecentAlert(redisUrl, redisToken, finding.title, finding._entities);
           alertsSent++;
         }
 
@@ -526,6 +544,7 @@ RULES:
           watch_next: llmFinding.watch_next || [],
           _confidence: candidate.confidence,
           _scoreBreakdown: candidate.scoreBreakdown,
+          _entities: candidate.entities,
         };
       });
 
@@ -586,7 +605,7 @@ async function sendIntelAlert(botToken, chatId, finding) {
     const breakdown = finding._scoreBreakdown || {};
     const metaParts = [`conf: ${finding._confidence}`];
     if (sourceCount > 0) metaParts.push(`${sourceCount} sources`);
-    if (breakdown.crossDomain > 0) metaParts.push(`cross\\-domain`);
+    if (breakdown.crossDomain > 5) metaParts.push(`cross\\-domain`);
     parts.push(`_${metaParts.join(' \\| ')}_`);
   }
 
@@ -685,13 +704,13 @@ async function updateDevelopingItems(findings, redisUrl, redisToken) {
 
 async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
   const developing = await loadDevelopingItems(redisUrl, redisToken);
-  const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
+  const recentAlerts = await loadRecentAlerts(redisUrl, redisToken);
 
   for (const item of developing) {
     if (item.count >= DEVELOPING_THRESHOLD) {
       // Similarity dedup for developing alerts too
-      const isDuplicate = recentTitles.some(
-        recent => jaccardSimilarity(item.topic, recent) > 0.4
+      const isDuplicate = recentAlerts.some(
+        recent => jaccardSimilarity(item.topic, recent.title) > 0.4
       );
       if (isDuplicate) continue;
 
@@ -704,7 +723,7 @@ async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
         watch_next: ['Escalation in source volume', 'Mainstream media pickup', 'Market reaction'],
       });
 
-      await saveRecentAlertTitle(redisUrl, redisToken, item.topic);
+      await saveRecentAlert(redisUrl, redisToken, item.topic, []);
     }
   }
 }
@@ -756,9 +775,11 @@ function jaccardSimilarity(a, b) {
 }
 
 /**
- * Load recent alert titles from Redis (last 50, 2h TTL).
+ * Load recent alerts from Redis (last 50, 2h TTL).
+ * Returns array of { title, entities } objects.
+ * Backward-compatible: handles old format (string[]) gracefully.
  */
-async function loadRecentAlertTitles(redisUrl, redisToken) {
+async function loadRecentAlerts(redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return [];
   try {
     const resp = await fetch(`${redisUrl}/get/${RECENT_ALERTS_KEY}`, {
@@ -768,24 +789,28 @@ async function loadRecentAlertTitles(redisUrl, redisToken) {
     if (!resp.ok) return [];
     const data = await resp.json();
     if (!data.result) return [];
-    const titles = JSON.parse(data.result);
-    return Array.isArray(titles) ? titles : [];
+    const parsed = JSON.parse(data.result);
+    if (!Array.isArray(parsed)) return [];
+    // Handle old format (string[]) — convert to { title, entities }
+    return parsed.map(item =>
+      typeof item === 'string' ? { title: item, entities: [] } : item
+    );
   } catch {
     return [];
   }
 }
 
 /**
- * Save a new alert title to the recent alerts list.
+ * Save a new alert to the recent alerts list with title + entities.
  */
-async function saveRecentAlertTitle(redisUrl, redisToken, title) {
+async function saveRecentAlert(redisUrl, redisToken, title, entities) {
   if (!redisUrl || !redisToken) return;
   try {
-    const existing = await loadRecentAlertTitles(redisUrl, redisToken);
-    const updated = [...existing, title].slice(-MAX_RECENT_ALERTS);
+    const existing = await loadRecentAlerts(redisUrl, redisToken);
+    const updated = [...existing, { title, entities: entities || [] }].slice(-MAX_RECENT_ALERTS);
     await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), RECENT_ALERTS_TTL);
   } catch (err) {
-    console.error('[monitor-check] Failed to save recent alert title:', err.message);
+    console.error('[monitor-check] Failed to save recent alert:', err.message);
   }
 }
 
