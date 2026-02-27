@@ -1,3 +1,5 @@
+import { applyWarningLists } from './warning-lists.js';
+
 /**
  * Entity Dictionary — lightweight regex + dictionary entity extraction.
  *
@@ -108,12 +110,10 @@ export function extractEntities(text) {
     if (pattern.test(text)) orgs.add(canonical);
   }
 
-  const all = [...countries, ...actors, ...orgs];
-
-  return {
+  return applyWarningLists(text, {
     countries: [...countries],
     actors: [...actors],
     orgs: [...orgs],
-    all,
-  };
+    all: [...countries, ...actors, ...orgs],
+  });
 }

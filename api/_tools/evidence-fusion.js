@@ -10,6 +10,7 @@
 
 import { getReliability } from './source-reliability.js';
 import { extractEntities } from './entity-dictionary.js';
+import { filterValidRecords, validateCandidate } from './schema-validator.js';
 
 // ---------------------------------------------------------------------------
 // Step 1: NORMALIZE — convert raw source data into CanonicalRecords
@@ -119,7 +120,12 @@ export function normalize(collectResults) {
     }
   }
 
-  return records;
+  // Validate records at the boundary where external data enters
+  const { valid, dropped } = filterValidRecords(records);
+  if (dropped.length > 0) {
+    console.warn(`[schema] Dropped ${dropped.length} invalid records:`, dropped.map(d => d.reason));
+  }
+  return valid;
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +333,14 @@ export function runFusion(collectResults, previousRecordIds, watchlistTerms) {
   });
 
   const promoted = promote(tagged);
+
+  // Validate candidates (log-only — invalid means our code has a bug)
+  for (const candidate of promoted) {
+    const check = validateCandidate(candidate);
+    if (!check.valid) {
+      console.warn(`[schema] Invalid candidate "${candidate.clusterId}": ${check.reason}`);
+    }
+  }
 
   // Sort by confidence descending — most important first
   const sorted = [...promoted].sort((a, b) => b.confidence - a.confidence);

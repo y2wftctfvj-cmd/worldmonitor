@@ -43,7 +43,8 @@ import {
   storeRecordIds,
 } from './_tools/redis-helpers.js';
 
-import { runFusion } from './_tools/evidence-fusion.js';
+import { normalize, cluster, score, promote } from './_tools/evidence-fusion.js';
+import { createCycleTelemetry, storeTelemetry } from './_tools/telemetry.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -98,33 +99,36 @@ export default async function handler(request) {
 
   try {
     // -----------------------------------------------------------------------
-    // 1. COLLECT — fetch all data sources in parallel (15s max for entire phase)
+    // 1. COLLECT — fetch all data sources in parallel, timed
     // -----------------------------------------------------------------------
-    // Each fetch has its own AbortSignal.timeout (5-8s), so allSettled
-    // finishes within ~8s. No outer timeout needed — it would discard ALL
-    // partial results on timeout (allSettled returns nothing until done).
-    const [
-      headlines, markets, telegram, reddit, predictions,
-      earthquakes, outages, military, govFeeds,
-    ] = await Promise.allSettled([
-      fetchGoogleNewsHeadlines(),
-      fetchMarketQuotes(),
-      fetchAllTelegramChannels(),
-      fetchAllRedditPosts(),
-      fetchGeopoliticalMarkets(),
-      fetchEarthquakes(),
-      fetchInternetOutages(cloudflareToken),
-      fetchMilitaryNews(),
-      fetchGovFeeds(),
-    ]);
+    const telem = createCycleTelemetry();
+
+    const collectResults = await telem.stage('collect', async () => {
+      const results = await Promise.allSettled([
+        fetchGoogleNewsHeadlines(),
+        fetchMarketQuotes(),
+        fetchAllTelegramChannels(),
+        fetchAllRedditPosts(),
+        fetchGeopoliticalMarkets(),
+        fetchEarthquakes(),
+        fetchInternetOutages(cloudflareToken),
+        fetchMilitaryNews(),
+        fetchGovFeeds(),
+      ]);
+      const [
+        headlines, markets, telegram, reddit, predictions,
+        earthquakes, outages, military, govFeeds,
+      ] = results;
+      const succeeded = results.filter(r => r.status === 'fulfilled').length;
+      return {
+        _meta: { succeeded, failed: 9 - succeeded },
+        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds },
+      };
+    });
 
     // -----------------------------------------------------------------------
-    // 2. EVIDENCE FUSION — normalize, cluster, score, promote
+    // 2. EVIDENCE FUSION — normalize, cluster, score, promote (individually timed)
     // -----------------------------------------------------------------------
-    const collectResults = {
-      headlines, markets, telegram, reddit, predictions,
-      earthquakes, outages, military, govFeeds,
-    };
 
     // Load watchlists and previous record IDs in parallel
     const [watchlists, previousRecordIds, developingItems] = await Promise.all([
@@ -134,10 +138,36 @@ export default async function handler(request) {
     ]);
     const watchlistTerms = watchlists.flatMap(w => w.terms);
 
-    // Run the fusion pipeline: normalize -> cluster -> score -> promote
-    const { allCandidates, records } = runFusion(collectResults, previousRecordIds, watchlistTerms);
-    const promotedCandidates = allCandidates.filter(c => c.severity !== 'routine');
+    const records = await telem.stage('normalize', () => {
+      const r = normalize(collectResults);
+      return { _meta: { recordCount: r.length }, _value: r };
+    });
 
+    const candidates = await telem.stage('cluster', () => {
+      const c = cluster(records);
+      return { _meta: { clusterCount: c.length }, _value: c };
+    });
+
+    const scored = await telem.stage('score', () => {
+      return { _value: score(candidates, previousRecordIds) };
+    });
+
+    // Tag watchlist matches before promotion
+    const tagged = scored.map(candidate => {
+      const match = (watchlistTerms || []).find(term =>
+        candidate.entities.some(e => e.toLowerCase().includes(term.toLowerCase()))
+      );
+      return { ...candidate, watchlistMatch: match || null };
+    });
+
+    const allCandidates = await telem.stage('promote', () => {
+      const promoted = promote(tagged);
+      const sorted = [...promoted].sort((a, b) => b.confidence - a.confidence);
+      const promotedCount = sorted.filter(c => c.severity !== 'routine').length;
+      return { _meta: { promoted: promotedCount }, _value: sorted };
+    });
+
+    const promotedCandidates = allCandidates.filter(c => c.severity !== 'routine');
     console.log(`[monitor-check] Fusion: ${records.length} records -> ${allCandidates.length} clusters -> ${promotedCandidates.length} promoted`);
 
     // -----------------------------------------------------------------------
@@ -145,88 +175,97 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     let findings = [];
     if (promotedCandidates.length > 0) {
-      // Ask LLM to write analysis + watch_next for each promoted candidate
-      const llmResult = await summarizeCandidates(
-        promotedCandidates,
-        developingItems,
-        openRouterKey,
-        groqKey
-      );
+      findings = await telem.stage('summarize', async () => {
+        const llmResult = await summarizeCandidates(
+          promotedCandidates,
+          developingItems,
+          openRouterKey,
+          groqKey
+        );
 
-      if (llmResult && Array.isArray(llmResult.findings)) {
-        findings = llmResult.findings;
-      } else {
+        if (llmResult && Array.isArray(llmResult.findings)) {
+          return { _value: llmResult.findings };
+        }
         // LLM failed — use fusion data directly (no analysis text, but scores are valid)
-        findings = promotedCandidates.map(c => ({
-          severity: c.severity,
-          title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
-          analysis: `Confidence ${c.confidence}: ${c.records.length} records from ${new Set(c.records.map(r => r.sourceId)).size} sources.`,
-          sources: [...new Set(c.records.map(r => r.sourceId))],
-          watchlist_match: c.watchlistMatch,
-          watch_next: ['Monitor source volume', 'Check for mainstream pickup'],
-          _confidence: c.confidence,
-          _scoreBreakdown: c.scoreBreakdown,
-        }));
-      }
+        return {
+          _value: promotedCandidates.map(c => ({
+            severity: c.severity,
+            title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
+            analysis: `Confidence ${c.confidence}: ${c.records.length} records from ${new Set(c.records.map(r => r.sourceId)).size} sources.`,
+            sources: [...new Set(c.records.map(r => r.sourceId))],
+            watchlist_match: c.watchlistMatch,
+            watch_next: ['Monitor source volume', 'Check for mainstream pickup'],
+            _confidence: c.confidence,
+            _scoreBreakdown: c.scoreBreakdown,
+          })),
+        };
+      });
     }
 
     // -----------------------------------------------------------------------
     // 4. ALERT — send notable/urgent findings to Telegram
     // -----------------------------------------------------------------------
-    let alertsSent = 0;
-    let skippedDeveloping = 0;
-    let skippedDuplicate = 0;
+    const alertResult = await telem.stage('alert', async () => {
+      let alertsSent = 0;
+      let skippedDeveloping = 0;
+      let skippedDuplicate = 0;
 
-    if (findings.length > 0) {
-      const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
+      if (findings.length > 0) {
+        const recentTitles = await loadRecentAlertTitles(redisUrl, redisToken);
 
-      for (const finding of findings) {
-        if (!finding || typeof finding !== 'object') continue;
-        if (typeof finding.severity !== 'string') continue;
-        if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
+        for (const finding of findings) {
+          if (!finding || typeof finding !== 'object') continue;
+          if (typeof finding.severity !== 'string') continue;
+          if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
 
-        if (finding.severity === 'routine') continue;
+          if (finding.severity === 'routine') continue;
 
-        // Telegram-only source check — create new object instead of mutating
-        const sources = Array.isArray(finding.sources)
-          ? finding.sources.filter(s => typeof s === 'string')
-          : [];
-        const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
-        const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
-        let alertFinding = finding;
-        if (isTelegramOnly && finding.severity !== 'developing') {
-          alertFinding = {
-            ...finding,
-            severity: 'developing',
-            title: finding.title.startsWith('UNVERIFIED')
-              ? finding.title
-              : `UNVERIFIED: ${finding.title}`,
-          };
+          // Telegram-only source check — create new object instead of mutating
+          const sources = Array.isArray(finding.sources)
+            ? finding.sources.filter(s => typeof s === 'string')
+            : [];
+          const sourceTypes = new Set(sources.map(s => s.split(':')[0]));
+          const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
+          let alertFinding = finding;
+          if (isTelegramOnly && finding.severity !== 'developing') {
+            alertFinding = {
+              ...finding,
+              severity: 'developing',
+              title: finding.title.startsWith('UNVERIFIED')
+                ? finding.title
+                : `UNVERIFIED: ${finding.title}`,
+            };
+          }
+
+          if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
+
+          // Similarity dedup
+          const isDuplicate = recentTitles.some(
+            recent => jaccardSimilarity(finding.title, recent) > 0.4
+          );
+          if (isDuplicate) { skippedDuplicate++; continue; }
+
+          // Add fusion metadata to the alert
+          await sendIntelAlert(botToken, chatId, alertFinding);
+          await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
+          alertsSent++;
         }
 
-        if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
-
-        // Similarity dedup
-        const isDuplicate = recentTitles.some(
-          recent => jaccardSimilarity(finding.title, recent) > 0.4
-        );
-        if (isDuplicate) { skippedDuplicate++; continue; }
-
-        // Add fusion metadata to the alert
-        await sendIntelAlert(botToken, chatId, alertFinding);
-        await saveRecentAlertTitle(redisUrl, redisToken, finding.title);
-        alertsSent++;
+        // Track developing items from LLM findings
+        await updateDevelopingItems(findings, redisUrl, redisToken);
       }
 
-      // Track developing items from LLM findings
-      await updateDevelopingItems(findings, redisUrl, redisToken);
-    }
+      // Check developing items that have hit the threshold
+      await checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken);
 
-    // Check developing items that have hit the threshold
-    await checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken);
+      return {
+        _meta: { sent: alertsSent },
+        _value: { alertsSent, skippedDeveloping, skippedDuplicate },
+      };
+    });
 
     // -----------------------------------------------------------------------
-    // 5. STORE — save record IDs for next-cycle delta detection
+    // 5. STORE — save record IDs + telemetry + snapshot for next cycle
     // -----------------------------------------------------------------------
     const currentRecordIds = records.map(r => r.id);
     await storeRecordIds(redisUrl, redisToken, currentRecordIds);
@@ -237,15 +276,20 @@ export default async function handler(request) {
       await storeSnapshot(redisUrl, redisToken, currentSnapshot);
     }
 
+    // Finalize and store telemetry
+    const telemetry = telem.finish();
+    await storeTelemetry(redisUrl, redisToken, telemetry);
+
     await releaseLock(redisUrl, redisToken);
     return jsonResponse(200, {
       ok: true,
-      alertsSent,
+      alertsSent: alertResult.alertsSent,
       fusionClusters: allCandidates.length,
       promoted: promotedCandidates.length,
       findings: findings.length,
-      skippedDeveloping,
-      skippedDuplicate,
+      skippedDeveloping: alertResult.skippedDeveloping,
+      skippedDuplicate: alertResult.skippedDuplicate,
+      telemetry,
     });
   } catch (err) {
     await releaseLock(redisUrl, redisToken);
