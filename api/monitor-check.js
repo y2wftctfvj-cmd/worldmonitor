@@ -47,10 +47,91 @@ import { normalize, cluster, score, promote } from './_tools/evidence-fusion.js'
 import { createCycleTelemetry, storeTelemetry } from './_tools/telemetry.js';
 
 // ---------------------------------------------------------------------------
+// Human-readable source display names
+// ---------------------------------------------------------------------------
+const SOURCE_DISPLAY_NAMES = {
+  // System sources
+  'headlines': 'Google News',
+  'govFeeds': 'Wire Services',
+  'earthquakes': 'USGS',
+  'outages': 'Cloudflare Radar',
+  'markets': 'Yahoo Finance',
+  'predictions': 'Polymarket',
+  'military': 'GDELT Military',
+  // Telegram — conflict/geopolitical
+  'telegram:intelslava': '@IntelSlava',
+  'telegram:militarysummary': '@MilitarySummary',
+  'telegram:breakingmash': '@BreakingMash',
+  'telegram:legitimniy': '@Legitimniy',
+  'telegram:iranintl_en': '@IranIntl',
+  'telegram:CIG_telegram': '@CIG',
+  'telegram:IntelRepublic': '@IntelRepublic',
+  'telegram:combatftg': '@CombatFootage',
+  'telegram:osintdefender': '@OSINTDefender',
+  'telegram:BellumActaNews': '@BellumActa',
+  'telegram:OsintTv': '@OsintTv',
+  'telegram:GeneralMCNews': '@GeneralMCNews',
+  'telegram:rnintelligence': '@RNIntelligence',
+  'telegram:RVvoenkor': '@RVvoenkor',
+  'telegram:usaperiodical': '@USAPeriodical',
+  // Telegram — mainstream news
+  'telegram:Bloomberg': '@Bloomberg',
+  'telegram:guardian': '@Guardian',
+  'telegram:cnbci': '@CNBC',
+  'telegram:AJENews_Official': '@AlJazeeraEN',
+  'telegram:ajanews': '@AlJazeeraAR',
+  // Telegram — Ukraine/Russia
+  'telegram:KyivIndependent_official': '@KyivIndependent',
+  'telegram:ukrainenowenglish': '@UkraineNow',
+  // Telegram — Israel/Middle East
+  'telegram:idfofficial': '@IDF',
+  'telegram:ILTVNews': '@ILTV',
+  'telegram:TheTimesOfIsrael2022': '@TimesOfIsrael',
+  'telegram:barakravid1': '@BarakRavid',
+  // Reddit — geopolitics
+  'reddit:worldnews': 'r/worldnews',
+  'reddit:geopolitics': 'r/geopolitics',
+  'reddit:osint': 'r/osint',
+  'reddit:CredibleDefense': 'r/CredibleDefense',
+  'reddit:internationalsecurity': 'r/internationalsecurity',
+  'reddit:middleeastwar': 'r/middleeastwar',
+  'reddit:iranpolitics': 'r/iranpolitics',
+  // Reddit — military/defense
+  'reddit:CombatFootage': 'r/CombatFootage',
+  'reddit:WarCollege': 'r/WarCollege',
+  // Reddit — cyber
+  'reddit:netsec': 'r/netsec',
+  'reddit:cybersecurity': 'r/cybersecurity',
+  // Reddit — markets
+  'reddit:wallstreetbets': 'r/wallstreetbets',
+};
+
+/**
+ * Convert a raw sourceId like "telegram:Bloomberg" to a human-readable name.
+ * Falls back to @channel or r/sub format for unknown IDs.
+ */
+function formatSourceName(sourceId) {
+  if (SOURCE_DISPLAY_NAMES[sourceId]) return SOURCE_DISPLAY_NAMES[sourceId];
+  if (sourceId.startsWith('telegram:')) return `@${sourceId.split(':')[1]}`;
+  if (sourceId.startsWith('reddit:')) return `r/${sourceId.split(':')[1]}`;
+  return sourceId;
+}
+
+/**
+ * Convert a numeric confidence score to a qualitative label.
+ */
+function getConfidenceLabel(confidence) {
+  if (confidence >= 80) return 'High confidence';
+  if (confidence >= 55) return 'Moderate confidence';
+  if (confidence >= 35) return 'Low confidence';
+  return 'Unconfirmed';
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const LLM_TIMEOUT_MS = 10000; // Edge = 25s total. Budget: collect 8s + LLM 10s + overhead 5s
-const MAX_TOKENS = 1500;  // Shorter output = faster response
+const LLM_TIMEOUT_MS = 12000; // Edge = 25s total. Budget: collect 8s + LLM 12s + overhead 5s
+const MAX_TOKENS = 2500;  // ~600 words per finding — room for real analysis
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
 const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
@@ -193,7 +274,7 @@ export default async function handler(request) {
             // Use actual record text as the analysis — truncate each to 200 chars
             const sampleTexts = c.records
               .slice(0, 3)
-              .map(r => `[${r.sourceId}] ${r.text.substring(0, 200)}`)
+              .map(r => `[${formatSourceName(r.sourceId)}] ${r.text.substring(0, 200)}`)
               .join('\n');
             return {
               severity: c.severity,
@@ -437,8 +518,11 @@ async function summarizeCandidates(promotedCandidates, developingItems, openRout
 
   // Build compact candidate summaries for the LLM
   const candidateSummaries = promotedCandidates.map((c, i) => {
-    const sources = [...new Set(c.records.map(r => r.sourceId))];
-    const sampleTexts = c.records.slice(0, 5).map(r => `  - [${r.sourceId}] ${r.text.substring(0, 150)}`).join('\n');
+    const sources = [...new Set(c.records.map(r => formatSourceName(r.sourceId)))];
+    const sampleTexts = c.records.slice(0, 8).map(r => {
+      const timeLabel = r.timestamp ? new Date(r.timestamp).toISOString().slice(11, 16) + ' UTC' : '';
+      return `  - [${formatSourceName(r.sourceId)}] ${timeLabel ? `[${timeLabel}] ` : ''}${r.text.substring(0, 350)}`;
+    }).join('\n');
     return `EVENT ${i + 1} (severity: ${c.severity}, confidence: ${c.confidence}, entities: ${c.entities.join(', ')}):
 Sources: ${sources.join(', ')}
 Score breakdown: reliability=${c.scoreBreakdown.reliability}, corroboration=${c.scoreBreakdown.corroboration}, recency=${c.scoreBreakdown.recency}, cross_domain=${c.scoreBreakdown.crossDomain}, novelty=${c.scoreBreakdown.novelty}, contradiction=${c.scoreBreakdown.contradiction}
@@ -449,10 +533,11 @@ ${sampleTexts}`;
 
   const analysisPrompt = `These events have been pre-scored by the evidence fusion system.
 For each event, write:
-1. A short headline title (5-10 words)
-2. A 2-3 sentence analysis explaining what is happening and why it matters
-3. 2-3 specific indicators to watch next
+1. A short headline title (5-10 words) — specific actors and actions, not vague topics
+2. A 3-5 sentence analysis structured as: WHAT happened (cite specific facts from records) -> WHY it matters (context) -> SO WHAT (implications)
+3. 2-3 specific, measurable indicators to watch next
 
+Reference specific details from source records — names, numbers, locations, times.
 Do NOT change the severity — it has been set by the scoring system.
 ${developingSection}
 
@@ -463,9 +548,9 @@ OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
 {
   "findings": [
     {
-      "title": "Short headline",
-      "analysis": "2-3 sentences explaining what is happening and why it matters",
-      "watch_next": ["indicator 1", "indicator 2"]
+      "title": "Short headline with specific actors/actions",
+      "analysis": "3-5 sentences: WHAT (specific facts from records) -> WHY it matters -> SO WHAT (implications)",
+      "watch_next": ["specific measurable indicator", "concrete trigger to monitor"]
     }
   ]
 }
@@ -474,10 +559,22 @@ RULES:
 - Output exactly ${promotedCandidates.length} findings, one per event, in the same order.
 - Keep titles consistent across cycles. Use consistent topic-level names.
 - Telegram-only claims should note "UNVERIFIED" in analysis.
-- Be concise. The scoring system already determined importance.`;
+- watch_next must be specific and observable. BAD: "further developments", "situation escalation". GOOD: "IAEA Board emergency session", "Brent crude above $92/bbl".
+- Never use these phrases: "situation developing", "remains to be seen", "could potentially escalate", "bears watching".`;
 
   const messages = [
-    { role: 'system', content: 'You are an intelligence analysis system. Output ONLY valid JSON. No explanatory text.' },
+    { role: 'system', content: `You are Monitor, a senior intelligence analyst writing alerts for a geopolitical dashboard.
+
+Your job: turn raw multi-source intelligence into concise, actionable analysis.
+
+Writing style:
+- Lead with specific facts, not vague summaries
+- Name specific actors, locations, numbers, dates from the source data
+- Structure: WHAT is happening -> WHY it matters -> SO WHAT (implications)
+- If sources disagree or only one domain reports, say so explicitly
+- Never use filler: "situation developing", "remains to be seen", "could escalate"
+
+Output ONLY valid JSON. No markdown fences.` },
     { role: 'user', content: analysisPrompt },
   ];
 
@@ -571,10 +668,18 @@ async function sendIntelAlert(botToken, chatId, finding) {
   };
 
   const emoji = severityEmoji[finding.severity] || '\u{1F7E1}';
-  const severityLabel = finding.severity.toUpperCase();
+  const confidenceLabel = finding._confidence != null
+    ? getConfidenceLabel(finding._confidence)
+    : finding.severity.toUpperCase();
+
+  // Clean source names for display
+  const displaySources = Array.isArray(finding.sources)
+    ? [...new Set(finding.sources.map(s => formatSourceName(s)))]
+    : [];
 
   const parts = [
-    `${emoji} *${severityLabel}* \\- ${escapeMarkdown(finding.title)}`,
+    `${emoji} *${escapeMarkdown(finding.severity.toUpperCase())}* \\| ${escapeMarkdown(confidenceLabel)}`,
+    `*${escapeMarkdown(finding.title)}*`,
     '',
   ];
 
@@ -583,34 +688,21 @@ async function sendIntelAlert(botToken, chatId, finding) {
     parts.push('');
   }
 
-  if (finding.sources && finding.sources.length > 0) {
-    parts.push(`_Sources: ${escapeMarkdown(finding.sources.join(', '))}_`);
+  if (displaySources.length > 0) {
+    parts.push(`_${escapeMarkdown(displaySources.join(' \u00b7 '))}_`);
   }
 
   if (finding.watchlist_match) {
-    parts.push(`_Watchlist match: "${escapeMarkdown(finding.watchlist_match)}"_`);
+    parts.push(`\u{1F50D} _Watchlist: "${escapeMarkdown(finding.watchlist_match)}"_`);
   }
 
   if (finding.watch_next && finding.watch_next.length > 0) {
     parts.push('');
-    parts.push('*Watch for:*');
+    parts.push('*Next indicators:*');
     for (const indicator of finding.watch_next) {
-      parts.push(`\\- ${escapeMarkdown(indicator)}`);
+      parts.push(`  \\> ${escapeMarkdown(indicator)}`);
     }
   }
-
-  // Fusion metadata — show confidence score and source count
-  if (finding._confidence != null) {
-    const sourceCount = Array.isArray(finding.sources) ? finding.sources.length : 0;
-    const breakdown = finding._scoreBreakdown || {};
-    const metaParts = [`conf: ${finding._confidence}`];
-    if (sourceCount > 0) metaParts.push(`${sourceCount} sources`);
-    if (breakdown.crossDomain > 5) metaParts.push(`cross\\-domain`);
-    parts.push(`_${metaParts.join(' \\| ')}_`);
-  }
-
-  parts.push('');
-  parts.push('_5\\-min cycle \\| evidence fusion_');
 
   const text = parts.join('\n');
 
@@ -631,8 +723,9 @@ async function sendIntelAlert(botToken, chatId, finding) {
     // Retry without markdown on parse failure
     const errBody = await resp.text();
     if (resp.status === 400 && errBody.includes("can't parse")) {
-      const confStr = finding._confidence != null ? `\n\nConfidence: ${finding._confidence}` : '';
-      const plainText = `${finding.severity.toUpperCase()} — ${finding.title}\n\n${finding.analysis || ''}\n\nSources: ${(finding.sources || []).join(', ')}${confStr}`;
+      const plainSources = (finding.sources || []).map(s => formatSourceName(s)).join(' \u00b7 ');
+      const confLabel = finding._confidence != null ? `\n\n${getConfidenceLabel(finding._confidence)}` : '';
+      const plainText = `${finding.severity.toUpperCase()} — ${finding.title}\n\n${finding.analysis || ''}\n\n${plainSources}${confLabel}`;
       await fetch(telegramUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -720,7 +813,10 @@ async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
         analysis: `This has been building for ${item.count * 5} minutes across ${item.count} analysis cycles. No mainstream trigger yet, but the pattern is consistent.`,
         sources: ['multi-cycle analysis'],
         watchlist_match: null,
-        watch_next: ['Escalation in source volume', 'Mainstream media pickup', 'Market reaction'],
+        watch_next: [
+          'Confirmation from wire services or mainstream media',
+          `Increase beyond ${item.count} consecutive detection cycles`,
+        ],
       });
 
       await saveRecentAlert(redisUrl, redisToken, item.topic, []);
