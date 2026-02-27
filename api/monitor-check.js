@@ -131,7 +131,7 @@ function getConfidenceLabel(confidence) {
 // Constants
 // ---------------------------------------------------------------------------
 const LLM_TIMEOUT_MS = 15000; // Edge = 25s total. Budget: collect 6s + LLM 15s + overhead 4s
-const MAX_TOKENS = 2500;  // ~600 words per finding — room for real analysis
+const MAX_TOKENS = 1800;  // ~360 words per finding for top 5 candidates
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
 const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
@@ -257,37 +257,47 @@ export default async function handler(request) {
     let findings = [];
     if (promotedCandidates.length > 0) {
       findings = await telem.stage('summarize', async () => {
+        // Cap LLM input to top 5 by confidence — avoids prompt bloat that causes timeouts
+        const LLM_CANDIDATE_LIMIT = 5;
+        const llmCandidates = promotedCandidates.slice(0, LLM_CANDIDATE_LIMIT);
+        const overflowCandidates = promotedCandidates.slice(LLM_CANDIDATE_LIMIT);
+
         const llmResult = await summarizeCandidates(
-          promotedCandidates,
+          llmCandidates,
           developingItems,
           openRouterKey,
           groqKey
         );
 
+        // Build fallback findings for overflow candidates (or all if LLM failed)
+        const buildFallback = (c) => {
+          const sourceNames = [...new Set(c.records.map(r => r.sourceId))];
+          const sampleTexts = c.records
+            .slice(0, 3)
+            .map(r => `[${formatSourceName(r.sourceId)}] ${r.text.substring(0, 200)}`)
+            .join('\n');
+          return {
+            severity: c.severity,
+            title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
+            analysis: sampleTexts,
+            sources: sourceNames,
+            watchlist_match: c.watchlistMatch,
+            watch_next: [`${c.records.length} record(s) from ${sourceNames.length} source(s)`, `Score: ${c.confidence}`],
+            _confidence: c.confidence,
+            _scoreBreakdown: c.scoreBreakdown,
+            _entities: c.entities,
+          };
+        };
+
+        const overflowFindings = overflowCandidates.map(buildFallback);
+
         if (llmResult && Array.isArray(llmResult.findings)) {
-          return { _value: llmResult.findings };
+          return { _meta: { llmProvider: llmResult.provider }, _value: [...llmResult.findings, ...overflowFindings] };
         }
-        // LLM failed — build alerts from raw record text so there's real content
+        // LLM failed entirely — fallback for all candidates
         return {
-          _value: promotedCandidates.map(c => {
-            const sourceNames = [...new Set(c.records.map(r => r.sourceId))];
-            // Use actual record text as the analysis — truncate each to 200 chars
-            const sampleTexts = c.records
-              .slice(0, 3)
-              .map(r => `[${formatSourceName(r.sourceId)}] ${r.text.substring(0, 200)}`)
-              .join('\n');
-            return {
-              severity: c.severity,
-              title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
-              analysis: sampleTexts,
-              sources: sourceNames,
-              watchlist_match: c.watchlistMatch,
-              watch_next: [`${c.records.length} record(s) from ${sourceNames.length} source(s)`, `Score: ${c.confidence}`],
-              _confidence: c.confidence,
-              _scoreBreakdown: c.scoreBreakdown,
-              _entities: c.entities,
-            };
-          }),
+          _meta: { llmErrors: llmResult?.errors || ['unknown failure'] },
+          _value: promotedCandidates.map(buildFallback),
         };
       });
     }
@@ -380,6 +390,7 @@ export default async function handler(request) {
     await storeTelemetry(redisUrl, redisToken, telemetry);
 
     await releaseLock(redisUrl, redisToken);
+
     return jsonResponse(200, {
       ok: true,
       alertsSent: alertResult.alertsSent,
@@ -519,7 +530,7 @@ async function summarizeCandidates(promotedCandidates, developingItems, openRout
   // Build compact candidate summaries for the LLM
   const candidateSummaries = promotedCandidates.map((c, i) => {
     const sources = [...new Set(c.records.map(r => formatSourceName(r.sourceId)))];
-    const sampleTexts = c.records.slice(0, 8).map(r => {
+    const sampleTexts = c.records.slice(0, 5).map(r => {
       const timeLabel = r.timestamp ? new Date(r.timestamp).toISOString().slice(11, 16) + ' UTC' : '';
       return `  - [${formatSourceName(r.sourceId)}] ${timeLabel ? `[${timeLabel}] ` : ''}${r.text.substring(0, 350)}`;
     }).join('\n');
@@ -579,6 +590,7 @@ Output ONLY valid JSON. No markdown fences.` },
   ];
 
   // Call LLM — same provider cascade as before
+  const llmErrors = [];
   const providers = [];
   if (groqKey) {
     providers.push({
@@ -599,6 +611,7 @@ Output ONLY valid JSON. No markdown fences.` },
 
   for (const provider of providers) {
     try {
+      const fetchStart = Date.now();
       const resp = await fetch(provider.url, {
         method: 'POST',
         headers: {
@@ -614,10 +627,11 @@ Output ONLY valid JSON. No markdown fences.` },
         }),
         signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
       });
+      console.log(`[monitor-check] ${provider.name} responded in ${Date.now() - fetchStart}ms (status: ${resp.status})`);
 
       if (!resp.ok) {
         const errBody = await resp.text();
-        throw new Error(`${provider.name} returned ${resp.status}: ${errBody}`);
+        throw new Error(`${provider.name} returned ${resp.status}: ${errBody.substring(0, 300)}`);
       }
 
       const data = await resp.json();
@@ -651,14 +665,16 @@ Output ONLY valid JSON. No markdown fences.` },
         console.log(`[monitor-check] Sample finding: "${sample.title}" | analysis: ${(sample.analysis || '').substring(0, 200)} | watch_next: ${JSON.stringify(sample.watch_next)}`);
       }
       console.log(`[monitor-check] ${provider.name} summarized ${mergedFindings.length} candidates`);
-      return { findings: mergedFindings };
+      return { findings: mergedFindings, provider: provider.name };
     } catch (err) {
-      console.error(`[monitor-check] ${provider.name} failed:`, err.message || err);
+      const errMsg = `${provider.name}: ${(err.message || String(err)).substring(0, 200)}`;
+      console.error(`[monitor-check] ${errMsg}`);
+      llmErrors.push(errMsg);
     }
   }
 
   console.error('[monitor-check] All LLM providers failed for summarization');
-  return null;
+  return { findings: null, errors: llmErrors };
 }
 
 // ---------------------------------------------------------------------------
