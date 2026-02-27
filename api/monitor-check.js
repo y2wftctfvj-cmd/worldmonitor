@@ -589,22 +589,28 @@ Output ONLY valid JSON. No markdown fences.` },
     { role: 'user', content: analysisPrompt },
   ];
 
-  // Call LLM — same provider cascade as before
+  // Call LLM — provider cascade: Groq 70B (fast, best) → Groq 8B (fastest, good enough) → OpenRouter
   const llmErrors = [];
   const providers = [];
   if (groqKey) {
     providers.push({
-      name: 'Groq',
+      name: 'Groq-70B',
       url: 'https://api.groq.com/openai/v1/chat/completions',
       model: 'llama-3.3-70b-versatile',
+      apiKey: groqKey,
+    });
+    providers.push({
+      name: 'Groq-8B',
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      model: 'llama-3.1-8b-instant',
       apiKey: groqKey,
     });
   }
   if (openRouterKey) {
     providers.push({
-      name: 'DeepSeek',
+      name: 'Llama-OpenRouter',
       url: 'https://openrouter.ai/api/v1/chat/completions',
-      model: 'deepseek/deepseek-v3.2',
+      model: 'meta-llama/llama-3.3-70b-instruct',
       apiKey: openRouterKey,
     });
   }
@@ -789,20 +795,45 @@ async function updateDevelopingItems(findings, redisUrl, redisToken) {
   const existing = await loadDevelopingItems(redisUrl, redisToken);
   const now = Date.now();
 
-  // Build updated list immutably — increment existing, add new
+  // Build updated list — use fuzzy matching (Jaccard OR entity overlap) instead of exact title
   const developingFindings = findings.filter(f => f.severity === 'developing');
+  const matchedFindingIndices = new Set();
+
   let updated = existing.map(d => {
-    const match = developingFindings.find(f => f.title.toLowerCase() === d.topic.toLowerCase());
-    if (match) return { ...d, count: d.count + 1, lastSeen: now };
+    const dEntities = d.entities || [];
+    const matchIdx = developingFindings.findIndex((f, i) => {
+      if (matchedFindingIndices.has(i)) return false;
+      // Fuzzy title match
+      if (jaccardSimilarity(f.title, d.topic) > 0.35) return true;
+      // Entity overlap match — same entities = same story
+      const fEntities = f._entities || [];
+      if (fEntities.length === 0 || dEntities.length === 0) return false;
+      const overlap = fEntities.filter(e => dEntities.includes(e)).length;
+      const minLen = Math.min(fEntities.length, dEntities.length);
+      return minLen > 0 && (overlap / minLen) > 0.5;
+    });
+
+    if (matchIdx >= 0) {
+      matchedFindingIndices.add(matchIdx);
+      const match = developingFindings[matchIdx];
+      // Merge entities from the new finding
+      const mergedEntities = [...new Set([...dEntities, ...(match._entities || [])])];
+      return { ...d, count: d.count + 1, lastSeen: now, entities: mergedEntities };
+    }
     return d;
   });
 
   // Add new developing items not already tracked
-  for (const finding of developingFindings) {
-    const alreadyTracked = updated.some(d => d.topic.toLowerCase() === finding.title.toLowerCase());
-    if (!alreadyTracked) {
-      updated = [...updated, { topic: finding.title, count: 1, lastSeen: now }];
-    }
+  for (let i = 0; i < developingFindings.length; i++) {
+    if (matchedFindingIndices.has(i)) continue;
+    const finding = developingFindings[i];
+    updated = [...updated, {
+      topic: finding.title,
+      count: 1,
+      lastSeen: now,
+      entities: finding._entities || [],
+      alerted: false,
+    }];
   }
 
   // Remove items not seen in last 30 min (6 cycles)
@@ -819,28 +850,54 @@ async function updateDevelopingItems(findings, redisUrl, redisToken) {
 async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
   const developing = await loadDevelopingItems(redisUrl, redisToken);
   const recentAlerts = await loadRecentAlerts(redisUrl, redisToken);
+  let anyAlerted = false;
 
   for (const item of developing) {
-    if (item.count >= DEVELOPING_THRESHOLD) {
-      // Similarity dedup for developing alerts too
-      const isDuplicate = recentAlerts.some(
-        recent => jaccardSimilarity(item.topic, recent.title) > 0.4
-      );
-      if (isDuplicate) continue;
+    // Skip items already alerted — never re-trigger
+    if (item.alerted) continue;
+    if (item.count < DEVELOPING_THRESHOLD) continue;
 
-      await sendIntelAlert(botToken, chatId, {
-        severity: 'developing',
-        title: item.topic,
-        analysis: `This has been building for ${item.count * 5} minutes across ${item.count} analysis cycles. No mainstream trigger yet, but the pattern is consistent.`,
-        sources: ['multi-cycle analysis'],
-        watchlist_match: null,
-        watch_next: [
-          'Confirmation from wire services or mainstream media',
-          `Increase beyond ${item.count} consecutive detection cycles`,
-        ],
-      });
+    // Dedup: Jaccard on title OR entity overlap (same as main alert path)
+    const itemEntities = item.entities || [];
+    const isDuplicate = recentAlerts.some(recent => {
+      const titleMatch = jaccardSimilarity(item.topic, recent.title) > 0.4;
+      const recentEntities = recent.entities || [];
+      if (recentEntities.length === 0 || itemEntities.length === 0) return titleMatch;
+      const overlap = itemEntities.filter(e => recentEntities.includes(e)).length;
+      const minLen = Math.min(itemEntities.length, recentEntities.length);
+      const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
+      return titleMatch || entityMatch;
+    });
+    if (isDuplicate) {
+      // Mark as alerted so we don't re-check every cycle
+      item.alerted = true;
+      anyAlerted = true;
+      continue;
+    }
 
-      await saveRecentAlert(redisUrl, redisToken, item.topic, []);
+    await sendIntelAlert(botToken, chatId, {
+      severity: 'developing',
+      title: item.topic,
+      analysis: `This has been building for ${item.count * 5} minutes across ${item.count} analysis cycles. No mainstream trigger yet, but the pattern is consistent.`,
+      sources: ['multi-cycle analysis'],
+      watchlist_match: null,
+      watch_next: [
+        'Confirmation from wire services or mainstream media',
+        `Increase beyond ${item.count} consecutive detection cycles`,
+      ],
+    });
+
+    await saveRecentAlert(redisUrl, redisToken, item.topic, itemEntities);
+    item.alerted = true;
+    anyAlerted = true;
+  }
+
+  // Persist alerted flags back to Redis
+  if (anyAlerted) {
+    try {
+      await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(developing), 3600);
+    } catch (err) {
+      console.error('[monitor-check] Failed to save developing alerted flags:', err.message);
     }
   }
 }
@@ -869,8 +926,8 @@ async function storeSnapshot(redisUrl, redisToken, snapshot) {
 // ---------------------------------------------------------------------------
 
 const RECENT_ALERTS_KEY = 'monitor:recent-alerts';
-const RECENT_ALERTS_TTL = 7200; // 2 hours
-const MAX_RECENT_ALERTS = 50;
+const RECENT_ALERTS_TTL = 21600; // 6 hours — stories persist longer than 2h
+const MAX_RECENT_ALERTS = 100;
 
 /**
  * Jaccard word similarity — compares word overlap between two strings.
