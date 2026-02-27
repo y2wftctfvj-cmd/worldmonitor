@@ -15,10 +15,21 @@ const RELIABILITY = {
   weak:            { score: 4,  label: 'Weak/Anon' },       // Single anonymous source
 };
 
-// Telegram channels considered "verified" aggregators (larger, established OSINT accounts)
+// Telegram channels considered "verified" — established OSINT accounts, news orgs, official sources
 const VERIFIED_TELEGRAM_CHANNELS = new Set([
+  // OSINT aggregators
   'intelslava', 'osintdefender', 'BellumActaNews', 'IntelRepublic',
   'militarysummary', 'CIG_telegram', 'iranintl_en', 'rnintelligence',
+  // Mainstream news organizations
+  'Bloomberg', 'guardian', 'cnbci', 'AJENews_Official', 'ajanews',
+  // Ukraine/Russia frontline sources
+  'KyivIndependent_official', 'ukrainenowenglish',
+  // Official government/military
+  'idfofficial',
+  // Israel/Middle East news organizations
+  'ILTVNews', 'TheTimesOfIsrael2022',
+  // Verified journalists
+  'barakravid1',
 ]);
 
 // Map source identifiers to their reliability tier key

@@ -18,7 +18,7 @@ import {
 // Constants — channel and subreddit lists
 // ---------------------------------------------------------------------------
 
-/** 15+ public Telegram OSINT channels (verified via t.me/s/{channel}) */
+/** 25+ public Telegram channels (verified via t.me/s/{channel}) */
 export const TELEGRAM_CHANNELS = [
   // Conflict/geopolitical aggregators
   'intelslava', 'militarysummary', 'breakingmash', 'legitimniy',
@@ -31,6 +31,18 @@ export const TELEGRAM_CHANNELS = [
   'GeneralMCNews', 'rnintelligence',
   // Regional
   'RVvoenkor', 'usaperiodical',
+  // Mainstream news organizations
+  'Bloomberg', 'guardian', 'cnbci',
+  // Al Jazeera (English + Arabic for cross-language corroboration)
+  'AJENews_Official', 'ajanews',
+  // Ukraine/Russia conflict — direct from the front
+  'KyivIndependent_official', 'ukrainenowenglish',
+  // Official government/military
+  'idfofficial',
+  // Israel/Middle East news organizations
+  'ILTVNews', 'TheTimesOfIsrael2022',
+  // Journalist channels (individual reporters with direct-source intel)
+  'barakravid1',
 ];
 
 /** 12+ geopolitical/OSINT subreddits */
