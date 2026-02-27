@@ -130,7 +130,7 @@ function getConfidenceLabel(confidence) {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const LLM_TIMEOUT_MS = 12000; // Edge = 25s total. Budget: collect 8s + LLM 12s + overhead 5s
+const LLM_TIMEOUT_MS = 15000; // Edge = 25s total. Budget: collect 6s + LLM 15s + overhead 4s
 const MAX_TOKENS = 2500;  // ~600 words per finding — room for real analysis
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
@@ -645,6 +645,11 @@ Output ONLY valid JSON. No markdown fences.` },
         };
       });
 
+      // Log first finding so we can verify LLM output quality in Vercel logs
+      if (mergedFindings.length > 0) {
+        const sample = mergedFindings[0];
+        console.log(`[monitor-check] Sample finding: "${sample.title}" | analysis: ${(sample.analysis || '').substring(0, 200)} | watch_next: ${JSON.stringify(sample.watch_next)}`);
+      }
       console.log(`[monitor-check] ${provider.name} summarized ${mergedFindings.length} candidates`);
       return { findings: mergedFindings };
     } catch (err) {
