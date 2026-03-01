@@ -36,6 +36,11 @@ import {
   fetchGovFeeds,
   fetchTwitterOsint,
   fetchBlueskyOsint,
+  fetchCISAAlerts,
+  fetchTravelAdvisories,
+  fetchGPSJamming,
+  fetchOFACSanctions,
+  fetchGDACSAlerts,
 } from './_tools/monitor-tools.js';
 
 import {
@@ -121,6 +126,12 @@ const SOURCE_DISPLAY_NAMES = {
   'bluesky:baboratorium': '@baboratorium',
   'bluesky:osinttechnical': '@osinttechnical',
   'bluesky:julianroepcke': '@julianroepcke',
+  // New intelligence sources
+  'cisa': 'CISA Cyber',
+  'travelAdvisory': 'Travel Advisory',
+  'gpsJamming': 'GPS Jamming',
+  'sanctions': 'OFAC Sanctions',
+  'gdacsEnhanced': 'GDACS Alerts',
 };
 
 /**
@@ -137,13 +148,37 @@ function formatSourceName(sourceId) {
 }
 
 /**
- * Convert a numeric confidence score to a qualitative label.
+ * Convert a numeric confidence score + severity into a specific label.
+ * Includes source count and type info for transparency.
+ *
+ * @param {number} confidence - Fusion confidence score (0-100)
+ * @param {string} severity - Event severity level
+ * @param {Object} scoreBreakdown - Score component breakdown
+ * @param {string[]} sources - Source IDs contributing to this event
+ * @returns {string} Human-readable confidence label
  */
-function getConfidenceLabel(confidence) {
-  if (confidence >= 80) return 'High confidence';
-  if (confidence >= 55) return 'Moderate confidence';
-  if (confidence >= 35) return 'Low confidence';
-  return 'Unconfirmed';
+function getConfidenceLabel(confidence, severity, scoreBreakdown, sources) {
+  const sourceCount = sources ? new Set(sources).size : 0;
+  const sourceTypes = sources ? new Set(sources.map(s => s.split(':')[0])).size : 0;
+
+  if (confidence >= 65) {
+    return `HIGH CONFIDENCE | ${sourceCount} sources, ${sourceTypes} types`;
+  }
+  if (confidence >= 55) {
+    return `BREAKING | ${sourceCount} sources corroborate`;
+  }
+  if (confidence >= 45) {
+    return `MODERATE | ${sourceCount} sources`;
+  }
+  return `LOW | ${sourceCount} sources`;
+}
+
+/**
+ * Build compact score breakdown string for alert transparency.
+ */
+function formatScoreBreakdown(scoreBreakdown, confidence) {
+  if (!scoreBreakdown) return '';
+  return `Score: rel=${scoreBreakdown.reliability} corr=${scoreBreakdown.corroboration} rec=${scoreBreakdown.recency} xdom=${scoreBreakdown.crossDomain} | ${confidence}/100`;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,17 +255,49 @@ export default async function handler(request) {
         fetchGovFeeds(),
         fetchTwitterOsint(),
         fetchBlueskyOsint(),
+        // New sources (SitDeck-inspired upgrade)
+        fetchCISAAlerts(),
+        fetchTravelAdvisories(),
+        fetchGPSJamming(),
+        fetchOFACSanctions(redisUrl, redisToken),
+        fetchGDACSAlerts(),
       ]);
       const [
         headlines, markets, telegram, reddit, predictions,
         earthquakes, outages, military, govFeeds, twitter, bluesky,
+        cisaAlerts, travelAdvisories, gpsJamming, sanctions, gdacsEnhanced,
       ] = results;
+      const totalSources = results.length;
       const succeeded = results.filter(r => r.status === 'fulfilled').length;
       return {
-        _meta: { succeeded, failed: 11 - succeeded },
-        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds, twitter, bluesky },
+        _meta: { succeeded, failed: totalSources - succeeded, totalSources },
+        _value: {
+          headlines, markets, telegram, reddit, predictions,
+          earthquakes, outages, military, govFeeds, twitter, bluesky,
+          cisaAlerts, travelAdvisories, gpsJamming, sanctions, gdacsEnhanced,
+        },
       };
     });
+
+    // -----------------------------------------------------------------------
+    // 1b. SOURCE HEALTH — track which sources succeeded/failed
+    // -----------------------------------------------------------------------
+    const sourceNames = [
+      'headlines', 'markets', 'telegram', 'reddit', 'predictions',
+      'earthquakes', 'outages', 'military', 'govFeeds', 'twitter', 'bluesky',
+      'cisaAlerts', 'travelAdvisories', 'gpsJamming', 'sanctions', 'gdacsEnhanced',
+    ];
+    const sourceHealth = { succeeded: [], failed: [], degraded: [] };
+    for (const name of sourceNames) {
+      if (collectResults[name]?.status === 'fulfilled') {
+        sourceHealth.succeeded.push(name);
+      } else {
+        sourceHealth.failed.push(name);
+      }
+    }
+
+    // Store source health in Redis for daily digest and gap reporting
+    await updateSourceHealth(redisUrl, redisToken, sourceHealth);
 
     // -----------------------------------------------------------------------
     // 2. EVIDENCE FUSION — normalize, cluster, score, promote (individually timed)
@@ -460,6 +527,7 @@ export default async function handler(request) {
       findings: findings.length,
       skippedDeveloping: alertResult.skippedDeveloping,
       skippedDuplicate: alertResult.skippedDuplicate,
+      sourceHealth,
       telemetry,
     });
   } catch (err) {
@@ -834,7 +902,7 @@ async function sendIntelAlert(botToken, chatId, finding) {
 
   const emoji = severityEmoji[finding.severity] || '\u{1F7E1}';
   const confidenceLabel = finding._confidence != null
-    ? (finding.severity === 'breaking' ? 'Breaking \u2014 multiple sources' : getConfidenceLabel(finding._confidence))
+    ? getConfidenceLabel(finding._confidence, finding.severity, finding._scoreBreakdown, finding.sources)
     : finding.severity.toUpperCase();
 
   // Clean source names for display
@@ -867,6 +935,12 @@ async function sendIntelAlert(botToken, chatId, finding) {
     for (const indicator of finding.watch_next) {
       parts.push(`  \\> ${escapeMarkdown(indicator)}`);
     }
+  }
+
+  // Score transparency — compact breakdown so user understands WHY this rating
+  if (finding._scoreBreakdown && finding._confidence != null) {
+    parts.push('');
+    parts.push(`_${escapeMarkdown(formatScoreBreakdown(finding._scoreBreakdown, finding._confidence))}_`);
   }
 
   const text = parts.join('\n');
@@ -1125,6 +1199,58 @@ async function saveRecentAlert(redisUrl, redisToken, title, entities, severity) 
     await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), ttl);
   } catch (err) {
     console.error('[monitor-check] Failed to save recent alert:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Source health tracking — intelligence gap reporting
+// ---------------------------------------------------------------------------
+
+/**
+ * Track per-source health across cycles in Redis.
+ * Stores a hash map: sourceId -> { status, lastSuccess, consecutiveFailures }.
+ * TTL: 24 hours (for daily digest).
+ */
+async function updateSourceHealth(redisUrl, redisToken, sourceHealth) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    // Load existing health data
+    const resp = await fetch(`${redisUrl}/get/monitor:source-health`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    let existing = {};
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.result) existing = JSON.parse(data.result);
+    }
+
+    const now = Date.now();
+
+    // Update health for succeeded sources
+    for (const name of sourceHealth.succeeded) {
+      existing[name] = {
+        status: 'ok',
+        lastSuccess: now,
+        consecutiveFailures: 0,
+      };
+    }
+
+    // Update health for failed sources
+    for (const name of sourceHealth.failed) {
+      const prev = existing[name] || {};
+      existing[name] = {
+        status: 'failed',
+        lastSuccess: prev.lastSuccess || 0,
+        consecutiveFailures: (prev.consecutiveFailures || 0) + 1,
+      };
+    }
+
+    // Store with 24h TTL
+    await redisSet(redisUrl, redisToken, 'monitor:source-health', JSON.stringify(existing), 86400);
+  } catch {
+    // Non-critical — don't block the cycle
   }
 }
 

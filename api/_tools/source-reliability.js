@@ -51,6 +51,14 @@ const SOURCE_MAP = {
 
   // Bluesky OSINT accounts — verified analysts (AT Protocol, free API)
   bluesky:    'osint_verified',
+
+  // New intelligence sources (SitDeck-inspired upgrade)
+  cisa:            'wire',           // CISA cybersecurity advisories — US government
+  travelAdvisory:  'wire',           // State Dept + UK FCDO travel advisories
+  nasaFirms:       'wire',           // NASA satellite fire detection
+  gpsJamming:      'domain',         // gpsjam.org — derived data, not primary source
+  sanctions:       'wire',           // OFAC SDN list — US Treasury
+  gdacsEnhanced:   'wire',           // GDACS with alert level metadata
 };
 
 /**

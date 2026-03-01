@@ -147,6 +147,59 @@ export function normalize(collectResults) {
     }
   }
 
+  // CISA cyber alerts (array of { source, title, link, date })
+  if (collectResults.cisaAlerts?.status === 'fulfilled' && Array.isArray(collectResults.cisaAlerts.value)) {
+    for (const alert of collectResults.cisaAlerts.value) {
+      if (!alert.title || alert.title.length < 10) continue;
+      const { tier } = getReliability('cisa');
+      records.push(makeRecord('cisa', tier, `[CISA] ${alert.title}`, now, { link: alert.link }));
+    }
+  }
+
+  // Travel advisories (array of { source, title, level })
+  if (collectResults.travelAdvisories?.status === 'fulfilled' && Array.isArray(collectResults.travelAdvisories.value)) {
+    for (const advisory of collectResults.travelAdvisories.value) {
+      if (!advisory.title || advisory.title.length < 10) continue;
+      const { tier } = getReliability('travelAdvisory');
+      records.push(makeRecord('travelAdvisory', tier, `[${advisory.source}] ${advisory.title}`, now, { level: advisory.level }));
+    }
+  }
+
+  // GPS jamming (array of { region, pctAffected })
+  if (collectResults.gpsJamming?.status === 'fulfilled' && Array.isArray(collectResults.gpsJamming.value)) {
+    for (const hotspot of collectResults.gpsJamming.value) {
+      if (!hotspot.region) continue;
+      const text = `GPS jamming detected: ${hotspot.region} — ${hotspot.pctAffected}% of aircraft affected`;
+      const { tier } = getReliability('gpsJamming');
+      records.push(makeRecord('gpsJamming', tier, text, now, { pctAffected: hotspot.pctAffected }));
+    }
+  }
+
+  // OFAC sanctions changes (array of { name, type, program })
+  if (collectResults.sanctions?.status === 'fulfilled' && Array.isArray(collectResults.sanctions.value)) {
+    for (const entry of collectResults.sanctions.value) {
+      if (!entry.name) continue;
+      const text = `OFAC sanctions: ${entry.name} (${entry.type}) — ${entry.program}`;
+      const { tier } = getReliability('sanctions');
+      records.push(makeRecord('sanctions', tier, text, now, { program: entry.program }));
+    }
+  }
+
+  // Enhanced GDACS alerts (array of { title, alertLevel, eventType, severity, lat, lon })
+  if (collectResults.gdacsEnhanced?.status === 'fulfilled' && Array.isArray(collectResults.gdacsEnhanced.value)) {
+    for (const alert of collectResults.gdacsEnhanced.value) {
+      if (!alert.title || alert.title.length < 10) continue;
+      const text = `[GDACS ${alert.alertLevel}] ${alert.title}${alert.severity ? ` (${alert.severity})` : ''}`;
+      const { tier } = getReliability('gdacsEnhanced');
+      records.push(makeRecord('gdacsEnhanced', tier, text, now, {
+        alertLevel: alert.alertLevel,
+        eventType: alert.eventType,
+        lat: alert.lat,
+        lon: alert.lon,
+      }));
+    }
+  }
+
   // Validate records at the boundary where external data enters
   const { valid, dropped } = filterValidRecords(records);
   if (dropped.length > 0) {
