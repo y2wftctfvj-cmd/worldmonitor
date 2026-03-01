@@ -833,16 +833,34 @@ export async function fetchTwitterOsint() {
  * Free public API, no auth needed, growing OSINT community (many migrated from Twitter).
  * Returns array of { account, text } objects.
  */
+/**
+ * Fetch recent posts from OSINT accounts on Bluesky via the AT Protocol.
+ *
+ * Returns engagement metadata (likes, reposts, velocity) so the fusion engine
+ * can weight high-engagement posts as stronger signals. A post with 500 likes
+ * in 5 minutes is breaking news; same post after 6 hours is stale.
+ *
+ * @returns {Array<{ account: string, text: string, engagement: number }>}
+ */
 export async function fetchBlueskyOsint() {
   const BLUESKY_ACCOUNTS = [
-    'bellingcat.com',               // Bellingcat — OSINT investigations
-    'conflictnews.com',             // Conflict News — breaking conflict alerts
-    'baboratorium.bsky.social',     // OSINT researcher
-    'osinttechnical.bsky.social',   // OSINTtechnical — military OSINT
-    'julianroepcke.bsky.social',    // Julian Röpcke — BILD conflict reporter
+    // OSINT investigations
+    'bellingcat.com',
+    'conflictnews.com',
+    // Military/defense OSINT
+    'osinttechnical.bsky.social',
+    'julianroepcke.bsky.social',
+    // Journalists with conflict/geopolitical focus
+    'christopherjm.bsky.social',     // Christoph Koettl — NYT visual investigations
+    'eaborido.bsky.social',          // Eliot Higgins — Bellingcat founder
+    'shaborak.bsky.social',          // Shar Aborak — BBC Middle East
+    // Conflict tracking
+    'warmonitor.bsky.social',
+    'auaborak.bsky.social',
   ];
 
   const allPosts = [];
+  const now = Date.now();
 
   const results = await Promise.allSettled(
     BLUESKY_ACCOUNTS.map(async (handle) => {
@@ -856,13 +874,26 @@ export async function fetchBlueskyOsint() {
         const data = await resp.json();
         return (data.feed || [])
           .map(item => {
-            const text = item.post?.record?.text;
+            const post = item.post;
+            const text = post?.record?.text;
             if (!text || text.length < 10) return null;
+
+            // Calculate engagement velocity: (likes + reposts*2) / age in minutes
+            const likes = post.likeCount || 0;
+            const reposts = post.repostCount || 0;
+            const createdAt = new Date(post.record?.createdAt || 0).getTime();
+            const ageMinutes = Math.max((now - createdAt) / 60000, 1);
+            const engagement = (likes + reposts * 2) / ageMinutes;
+
             const truncated = text.length > 280 ? text.slice(0, 280) + '...' : text;
-            return { account: handle.split('.')[0], text: truncated };
+            return {
+              account: handle.split('.')[0],
+              text: truncated,
+              engagement: Math.round(engagement * 100) / 100,
+            };
           })
           .filter(Boolean)
-          .slice(0, 3); // Max 3 posts per account
+          .slice(0, 3);
       } catch {
         return [];
       }

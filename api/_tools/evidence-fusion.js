@@ -70,13 +70,20 @@ export function normalize(collectResults) {
     }
   }
 
-  // Bluesky (array of { account, text })
+  // Bluesky (array of { account, text, engagement })
+  // Engagement velocity determines reliability tier:
+  //   engagement >= 5.0 → osint_verified (viral post, likely breaking news)
+  //   engagement >= 1.0 → social_verified (getting traction)
+  //   below → social_raw (normal post)
   if (collectResults.bluesky?.status === 'fulfilled' && Array.isArray(collectResults.bluesky.value)) {
     for (const post of collectResults.bluesky.value) {
       if (!post.text || post.text.length < 10) continue;
       const sourceId = `bluesky:${post.account}`;
-      const { tier } = getReliability('bluesky');
-      records.push(makeRecord(sourceId, tier, post.text, now, { account: post.account }));
+      const engagement = post.engagement || 0;
+      let tier = 'social_raw';
+      if (engagement >= 5.0) tier = 'osint_verified';
+      else if (engagement >= 1.0) tier = 'social_verified';
+      records.push(makeRecord(sourceId, tier, post.text, now, { account: post.account, engagement }));
     }
   }
 

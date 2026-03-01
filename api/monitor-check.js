@@ -417,10 +417,11 @@ export default async function handler(request) {
           await saveRecentAlert(redisUrl, redisToken, finding.title, finding._entities, alertFinding.severity);
           alertsSent++;
 
-          // Schedule rapid re-check for breaking/urgent alerts
-          if (alertFinding.severity === 'breaking' || alertFinding.severity === 'urgent') {
-            await scheduleRecheck(redisUrl, redisToken);
-          }
+          // Rapid re-check disabled — QStash cascade caused alert floods.
+          // TODO: Re-enable with proper rate limiting (e.g., 1 re-check per cluster, not per alert)
+          // if (alertFinding.severity === 'breaking' || alertFinding.severity === 'urgent') {
+          //   await scheduleRecheck(redisUrl, redisToken);
+          // }
         }
 
         // Track developing items from LLM findings
