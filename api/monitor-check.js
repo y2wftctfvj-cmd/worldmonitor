@@ -6,7 +6,7 @@
  * LLM now only summarizes pre-scored candidates — it doesn't decide what to alert on.
  *
  * The cycle:
- *   1. COLLECT   — fetch all 9 data sources in parallel
+ *   1. COLLECT   — fetch all 10 data sources in parallel
  *   2. FUSE      — normalize records, cluster by entity, score additively, promote by threshold
  *   3. SUMMARIZE — LLM writes analysis + watch_next for promoted candidates only
  *   4. ALERT     — send notable/urgent findings to Telegram with confidence metadata
@@ -34,6 +34,7 @@ import {
   fetchInternetOutages,
   fetchMilitaryNews,
   fetchGovFeeds,
+  fetchTwitterOsint,
 } from './_tools/monitor-tools.js';
 
 import {
@@ -44,6 +45,7 @@ import {
 } from './_tools/redis-helpers.js';
 
 import { normalize, cluster, score, promote } from './_tools/evidence-fusion.js';
+import { TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED } from './_tools/source-reliability.js';
 import { createCycleTelemetry, storeTelemetry } from './_tools/telemetry.js';
 
 // ---------------------------------------------------------------------------
@@ -104,6 +106,14 @@ const SOURCE_DISPLAY_NAMES = {
   'reddit:cybersecurity': 'r/cybersecurity',
   // Reddit — markets
   'reddit:wallstreetbets': 'r/wallstreetbets',
+  // Twitter/X OSINT
+  'twitter:IntelDoge': '@IntelDoge',
+  'twitter:sentdefender': '@sentdefender',
+  'twitter:Global_Mil_Info': '@Global_Mil_Info',
+  'twitter:NotWoofers': '@NotWoofers',
+  'twitter:RALee85': '@RALee85',
+  'twitter:Flash_news_ua': '@Flash_news_ua',
+  'twitter:Faytuks': '@Faytuks',
 };
 
 /**
@@ -114,6 +124,7 @@ function formatSourceName(sourceId) {
   if (SOURCE_DISPLAY_NAMES[sourceId]) return SOURCE_DISPLAY_NAMES[sourceId];
   if (sourceId.startsWith('telegram:')) return `@${sourceId.split(':')[1]}`;
   if (sourceId.startsWith('reddit:')) return `r/${sourceId.split(':')[1]}`;
+  if (sourceId.startsWith('twitter:')) return `@${sourceId.split(':')[1]}`;
   return sourceId;
 }
 
@@ -136,6 +147,9 @@ const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
 const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
 const CYCLE_LOCK_TTL = 30; // seconds — auto-expires if handler crashes
+const RECHECK_KEY = 'monitor:recheck-count';  // Track rapid re-check count per event
+const MAX_RAPID_RECHECKS = 3;                  // Max rapid re-checks before returning to normal cycle
+const RECHECK_DELAY_MS = 60000;                // 60 seconds between rapid re-checks
 
 // ---------------------------------------------------------------------------
 // Main handler
@@ -195,15 +209,16 @@ export default async function handler(request) {
         fetchInternetOutages(cloudflareToken),
         fetchMilitaryNews(),
         fetchGovFeeds(),
+        fetchTwitterOsint(),
       ]);
       const [
         headlines, markets, telegram, reddit, predictions,
-        earthquakes, outages, military, govFeeds,
+        earthquakes, outages, military, govFeeds, twitter,
       ] = results;
       const succeeded = results.filter(r => r.status === 'fulfilled').length;
       return {
-        _meta: { succeeded, failed: 9 - succeeded },
-        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds },
+        _meta: { succeeded, failed: 10 - succeeded },
+        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds, twitter },
       };
     });
 
@@ -320,7 +335,7 @@ export default async function handler(request) {
 
           if (finding.severity === 'routine') continue;
 
-          // Telegram-only source check — create new object instead of mutating
+          // Tier-aware Telegram source check — don't blanket-suppress verified OSINT
           const sources = Array.isArray(finding.sources)
             ? finding.sources.filter(s => typeof s === 'string')
             : [];
@@ -328,36 +343,71 @@ export default async function handler(request) {
           const isTelegramOnly = sourceTypes.size === 1 && sourceTypes.has('telegram');
           let alertFinding = finding;
           if (isTelegramOnly && finding.severity !== 'developing') {
-            alertFinding = {
-              ...finding,
-              severity: 'developing',
-              title: finding.title.startsWith('UNVERIFIED')
-                ? finding.title
-                : `UNVERIFIED: ${finding.title}`,
-            };
+            // Count how many sources are mainstream or OSINT-verified
+            const verifiedCount = sources.filter(s => {
+              const channel = s.startsWith('telegram:') ? s.split(':')[1] : '';
+              return TELEGRAM_MAINSTREAM.has(channel) || TELEGRAM_OSINT_VERIFIED.has(channel);
+            }).length;
+
+            if (verifiedCount >= 2) {
+              // 2+ verified/OSINT sources — keep original severity
+              alertFinding = finding;
+            } else if (verifiedCount === 1) {
+              // 1 verified source — cap at notable (don't suppress to developing)
+              const cappedSeverity = finding.severity === 'urgent' || finding.severity === 'breaking'
+                ? 'notable' : finding.severity;
+              alertFinding = { ...finding, severity: cappedSeverity };
+            } else {
+              // 0 verified sources — downgrade to developing
+              alertFinding = {
+                ...finding,
+                severity: 'developing',
+                title: finding.title.startsWith('UNVERIFIED')
+                  ? finding.title
+                  : `UNVERIFIED: ${finding.title}`,
+              };
+            }
           }
 
           if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
 
-          // Similarity dedup — check title similarity AND entity overlap
+          // Escalation-aware dedup — AND logic (title AND entity), escalation bypasses
           const findingEntities = finding._entities || [];
+          const ESCALATION_KEYWORDS = ['war', 'strike', 'attack', 'invasion', 'nuclear', 'ceasefire'];
+          const hasEscalationKeyword = ESCALATION_KEYWORDS.some(kw =>
+            finding.title.toLowerCase().includes(kw) || (finding.analysis || '').toLowerCase().includes(kw)
+          );
           const isDuplicate = recentAlerts.some(recent => {
             // Title word overlap
             const titleMatch = jaccardSimilarity(finding.title, recent.title) > 0.4;
-            // Entity set overlap — same entities = same story regardless of wording
+            // Entity set overlap
             const recentEntities = recent.entities || [];
             if (recentEntities.length === 0 || findingEntities.length === 0) return titleMatch;
             const overlap = findingEntities.filter(e => recentEntities.includes(e)).length;
             const minLen = Math.min(findingEntities.length, recentEntities.length);
             const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
-            return titleMatch || entityMatch;
+            // AND logic — must match BOTH title and entities to be a duplicate
+            const isBaseDuplicate = titleMatch && entityMatch;
+            // Escalation detection: if new severity is higher, let it through
+            const SEVERITY_RANK = { routine: 0, developing: 1, notable: 2, breaking: 3, urgent: 4 };
+            const newRank = SEVERITY_RANK[finding.severity] || 0;
+            const oldRank = SEVERITY_RANK[recent.severity] || 0;
+            const isEscalation = newRank > oldRank;
+            // Escalation keywords also bypass dedup
+            if (isEscalation || hasEscalationKeyword) return false;
+            return isBaseDuplicate;
           });
           if (isDuplicate) { skippedDuplicate++; continue; }
 
           // Add fusion metadata to the alert
           await sendIntelAlert(botToken, chatId, alertFinding);
-          await saveRecentAlert(redisUrl, redisToken, finding.title, finding._entities);
+          await saveRecentAlert(redisUrl, redisToken, finding.title, finding._entities, alertFinding.severity);
           alertsSent++;
+
+          // Schedule rapid re-check for breaking/urgent alerts
+          if (alertFinding.severity === 'breaking' || alertFinding.severity === 'urgent') {
+            await scheduleRecheck(redisUrl, redisToken);
+          }
         }
 
         // Track developing items from LLM findings
@@ -447,6 +497,82 @@ async function releaseLock(redisUrl, redisToken) {
     });
   } catch {
     // Lock will auto-expire via TTL
+  }
+}
+
+/**
+ * Schedule a rapid re-check via QStash if a breaking/urgent alert was sent.
+ * Re-runs the same pipeline 60s later to catch follow-up reports and escalation.
+ * Max 3 rapid re-checks per event burst, then back to normal 5-min cycle.
+ */
+async function scheduleRecheck(redisUrl, redisToken) {
+  const qstashToken = process.env.QSTASH_TOKEN;
+  const cronSecret = process.env.CRON_SECRET;
+  const vercelUrl = process.env.VERCEL_URL;
+  if (!qstashToken || !cronSecret || !vercelUrl) return;
+
+  // Check if we've already hit the rapid re-check limit
+  const recheckCount = await getRecheckCount(redisUrl, redisToken);
+  if (recheckCount >= MAX_RAPID_RECHECKS) {
+    console.log(`[monitor-check] Skipping re-check: already at ${recheckCount}/${MAX_RAPID_RECHECKS} rapid re-checks`);
+    return;
+  }
+
+  try {
+    // Increment re-check counter (auto-expires in 10 min so it resets after the burst)
+    await incrementRecheckCount(redisUrl, redisToken);
+
+    // Schedule QStash callback with delay
+    const targetUrl = `https://${vercelUrl}/api/monitor-check`;
+    const resp = await fetch('https://qstash.upstash.io/v2/publish/' + encodeURIComponent(targetUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${qstashToken}`,
+        'Content-Type': 'application/json',
+        'Upstash-Delay': `${Math.round(RECHECK_DELAY_MS / 1000)}s`,
+        'Upstash-Forward-Authorization': `Bearer ${cronSecret}`,
+      },
+    });
+
+    if (resp.ok) {
+      console.log(`[monitor-check] Scheduled rapid re-check #${recheckCount + 1} in ${RECHECK_DELAY_MS / 1000}s`);
+    } else {
+      console.error(`[monitor-check] QStash re-check failed: ${resp.status}`);
+    }
+  } catch (err) {
+    console.error('[monitor-check] Failed to schedule re-check:', err.message);
+  }
+}
+
+async function getRecheckCount(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return 0;
+  try {
+    const resp = await fetch(`${redisUrl}/get/${RECHECK_KEY}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return 0;
+    const data = await resp.json();
+    return parseInt(data.result, 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function incrementRecheckCount(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return;
+  try {
+    // INCR + set TTL: counter auto-resets after 10 min (2 normal cycles)
+    await fetch(`${redisUrl}/incr/${RECHECK_KEY}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    await fetch(`${redisUrl}/expire/${RECHECK_KEY}/600`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch {
+    // Non-critical — if this fails, worst case we do extra re-checks
   }
 }
 
@@ -690,13 +816,14 @@ Output ONLY valid JSON. No markdown fences.` },
 async function sendIntelAlert(botToken, chatId, finding) {
   const severityEmoji = {
     urgent: '\u{1F534}',    // red circle
+    breaking: '\u{1F534}',  // red circle — breaking is nearly as serious as urgent
     notable: '\u{1F7E1}',   // yellow circle
     developing: '\u{1F4E1}', // satellite
   };
 
   const emoji = severityEmoji[finding.severity] || '\u{1F7E1}';
   const confidenceLabel = finding._confidence != null
-    ? getConfidenceLabel(finding._confidence)
+    ? (finding.severity === 'breaking' ? 'Breaking \u2014 multiple sources' : getConfidenceLabel(finding._confidence))
     : finding.severity.toUpperCase();
 
   // Clean source names for display
@@ -977,12 +1104,15 @@ async function loadRecentAlerts(redisUrl, redisToken) {
 /**
  * Save a new alert to the recent alerts list with title + entities.
  */
-async function saveRecentAlert(redisUrl, redisToken, title, entities) {
+async function saveRecentAlert(redisUrl, redisToken, title, entities, severity) {
   if (!redisUrl || !redisToken) return;
   try {
     const existing = await loadRecentAlerts(redisUrl, redisToken);
-    const updated = [...existing, { title, entities: entities || [] }].slice(-MAX_RECENT_ALERTS);
-    await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), RECENT_ALERTS_TTL);
+    // Tiered TTL: breaking/urgent expire faster so escalation alerts get through
+    const ttl = (severity === 'breaking' || severity === 'urgent') ? 3600
+      : severity === 'notable' ? 10800 : RECENT_ALERTS_TTL;
+    const updated = [...existing, { title, entities: entities || [], severity: severity || 'notable' }].slice(-MAX_RECENT_ALERTS);
+    await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), ttl);
   } catch (err) {
     console.error('[monitor-check] Failed to save recent alert:', err.message);
   }

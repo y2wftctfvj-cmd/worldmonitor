@@ -8,29 +8,30 @@
 // Reliability tiers — each tier has a numeric score and human-readable label
 const RELIABILITY = {
   wire:            { score: 40, label: 'Wire/Gov' },       // Reuters, State Dept, USGS, Cloudflare
-  mainstream:      { score: 32, label: 'Mainstream' },      // Google News headlines
+  mainstream:      { score: 32, label: 'Mainstream' },      // Google News, Bloomberg, Guardian, CNBC, Al Jazeera
+  osint_verified:  { score: 28, label: 'OSINT Verified' }, // Established OSINT accounts (IntelSlava, OSINTDefender, etc.)
   domain:          { score: 24, label: 'Domain Expert' },   // GDELT military, War on the Rocks, prediction markets
-  social_verified: { score: 16, label: 'Social OSINT' },    // Reddit high-score, Telegram verified channels
+  social_verified: { score: 16, label: 'Social OSINT' },    // Reddit high-score
   social_raw:      { score: 8,  label: 'Social Raw' },      // Reddit low-score, Telegram unverified
   weak:            { score: 4,  label: 'Weak/Anon' },       // Single anonymous source
 };
 
-// Telegram channels considered "verified" — established OSINT accounts, news orgs, official sources
-const VERIFIED_TELEGRAM_CHANNELS = new Set([
-  // OSINT aggregators
+// Telegram channels — split into 3 tiers for granular reliability scoring
+
+// Tier 1: Mainstream news orgs — same reliability as Google News headlines
+const TELEGRAM_MAINSTREAM = new Set([
+  'Bloomberg', 'guardian', 'cnbci', 'AJENews_Official', 'ajanews',
+  'KyivIndependent_official', 'ILTVNews', 'TheTimesOfIsrael2022',
+]);
+
+// Tier 2: OSINT verified — established analysts with track record, not raw social
+const TELEGRAM_OSINT_VERIFIED = new Set([
   'intelslava', 'osintdefender', 'BellumActaNews', 'IntelRepublic',
   'militarysummary', 'CIG_telegram', 'iranintl_en', 'rnintelligence',
-  // Mainstream news organizations
-  'Bloomberg', 'guardian', 'cnbci', 'AJENews_Official', 'ajanews',
-  // Ukraine/Russia frontline sources
-  'KyivIndependent_official', 'ukrainenowenglish',
-  // Official government/military
-  'idfofficial',
-  // Israel/Middle East news organizations
-  'ILTVNews', 'TheTimesOfIsrael2022',
-  // Verified journalists
-  'barakravid1',
+  'ukrainenowenglish', 'idfofficial', 'barakravid1',
 ]);
+
+// Everything else stays social_raw (score 8)
 
 // Map source identifiers to their reliability tier key
 const SOURCE_MAP = {
@@ -44,6 +45,9 @@ const SOURCE_MAP = {
   markets:     'domain',       // Yahoo Finance market data
   predictions: 'domain',       // Polymarket prediction markets
   military:    'domain',       // GDELT military news aggregation
+
+  // Twitter/X OSINT accounts — verified analysts
+  twitter:    'osint_verified',
 };
 
 /**
@@ -60,10 +64,12 @@ export function getReliability(sourceId, meta) {
     return { ...RELIABILITY[tier], tier };
   }
 
-  // Telegram channels — split by verified vs unverified
+  // Telegram channels — 3-tier: mainstream > osint_verified > social_raw
   if (sourceId.startsWith('telegram:')) {
     const channel = sourceId.split(':')[1];
-    const tier = VERIFIED_TELEGRAM_CHANNELS.has(channel) ? 'social_verified' : 'social_raw';
+    let tier = 'social_raw';
+    if (TELEGRAM_MAINSTREAM.has(channel)) tier = 'mainstream';
+    else if (TELEGRAM_OSINT_VERIFIED.has(channel)) tier = 'osint_verified';
     return { ...RELIABILITY[tier], tier };
   }
 
@@ -78,4 +84,4 @@ export function getReliability(sourceId, meta) {
   return { ...RELIABILITY.weak, tier: 'weak' };
 }
 
-export { RELIABILITY };
+export { RELIABILITY, TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED };

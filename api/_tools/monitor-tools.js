@@ -737,6 +737,85 @@ export async function fetchGovFeeds() {
     .flatMap(r => r.value);
 }
 
+
+/**
+ * Fetch recent tweets from OSINT accounts via Nitter RSS feeds.
+ * Nitter is a free Twitter frontend that exposes RSS — no API key needed.
+ * Returns array of { account, text } objects.
+ */
+export async function fetchTwitterOsint() {
+  const OSINT_ACCOUNTS = [
+    'IntelDoge', 'sentdefender', 'Global_Mil_Info', 'NotWoofers',
+    'RALee85', 'Flash_news_ua', 'Faytuks',
+  ];
+
+  // Multiple Nitter instances for redundancy — if one is down, try the next
+  const NITTER_INSTANCES = [
+    'nitter.privacydev.net',
+    'nitter.poast.org',
+  ];
+
+  const allTweets = [];
+
+  const results = await Promise.allSettled(
+    OSINT_ACCOUNTS.map(async (account) => {
+      // Try each Nitter instance until one works
+      for (const instance of NITTER_INSTANCES) {
+        try {
+          const rssUrl = `https://${instance}/${account}/rss`;
+          const resp = await fetch(rssUrl, {
+            headers: { 'User-Agent': 'WorldMonitor/2.7' },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!resp.ok) continue;
+
+          const xml = await resp.text();
+          const tweets = [];
+          const itemPattern = /<item>[\s\S]*?<\/item>/g;
+          const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
+          const descPattern = /<description><!\[CDATA\[(.*?)\]\]>|<description>(.*?)<\/description>/;
+          let itemMatch;
+          while ((itemMatch = itemPattern.exec(xml)) !== null && tweets.length < 3) {
+            // Prefer description (full tweet) over title (truncated)
+            const descMatch = itemMatch[0].match(descPattern);
+            const titleMatch = itemMatch[0].match(titlePattern);
+            const rawText = descMatch?.[1] || descMatch?.[2] || titleMatch?.[1] || titleMatch?.[2];
+            if (!rawText) continue;
+
+            // Strip HTML tags and clean up
+            const text = rawText
+              .replace(/<br\s*\/?>/gi, ' ')
+              .replace(/<[^>]+>/g, '')
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/\s+/g, ' ')
+              .trim();
+
+            if (text.length > 10) {
+              const truncated = text.length > 280 ? text.slice(0, 280) + '...' : text;
+              tweets.push({ account, text: truncated });
+            }
+          }
+
+          return tweets;
+        } catch {
+          continue; // Try next Nitter instance
+        }
+      }
+      return []; // All instances failed for this account
+    })
+  );
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') allTweets.push(...result.value);
+  }
+
+  return allTweets;
+}
+
 // Re-export prediction market functions
 export { fetchGeopoliticalMarkets, searchPredictionMarkets };
 

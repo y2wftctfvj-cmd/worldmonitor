@@ -13,10 +13,10 @@
  */
 
 const VALID_SOURCE_TYPES = new Set([
-  'wire', 'mainstream', 'domain', 'social_verified', 'social_raw', 'weak',
+  'wire', 'mainstream', 'osint_verified', 'domain', 'social_verified', 'social_raw', 'weak',
 ]);
 
-const VALID_SEVERITIES = new Set(['routine', 'notable', 'urgent']);
+const VALID_SEVERITIES = new Set(['routine', 'notable', 'breaking', 'urgent']);
 
 /**
  * Validate a single CanonicalRecord.

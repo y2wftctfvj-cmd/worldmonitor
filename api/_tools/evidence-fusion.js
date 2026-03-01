@@ -60,6 +60,16 @@ export function normalize(collectResults) {
     }
   }
 
+  // Twitter/X (array of { account, text })
+  if (collectResults.twitter?.status === 'fulfilled' && Array.isArray(collectResults.twitter.value)) {
+    for (const tweet of collectResults.twitter.value) {
+      if (!tweet.text || tweet.text.length < 10) continue;
+      const sourceId = `twitter:${tweet.account}`;
+      const { tier } = getReliability('twitter');
+      records.push(makeRecord(sourceId, tier, tweet.text, now, { account: tweet.account }));
+    }
+  }
+
   // Markets (string with "- Symbol: price (change)" lines)
   if (collectResults.markets?.status === 'fulfilled' && collectResults.markets.value) {
     const lines = collectResults.markets.value.split('\n').filter(l => l.trim().startsWith('-'));
@@ -189,6 +199,7 @@ export function cluster(records) {
       corroboration: 0,
       recency: 0,
       crossDomain: 0,
+      surge: 0,
       contradiction: 0,
     },
     severity: 'routine',
@@ -250,13 +261,16 @@ export function score(candidates, previousRecordIds) {
     const newRecordCount = records.filter(r => !prevIds.has(r.id)).length;
     const novelty = newRecordCount > 0 ? Math.min(newRecordCount * 3, 10) : 0;
 
+    // Surge: bonus when many distinct sources report on the same cluster in one cycle
+    const surge = distinctSources >= 4 ? 10 : 0;
+
     // Contradiction: simple heuristic — if records mention opposing signals
     // (e.g., "ceasefire" + "attack"), apply penalty
     const contradiction = detectContradiction(records);
 
     // Final confidence: additive, clamped to 0-100
     const confidence = Math.max(0, Math.min(100,
-      reliability + corroboration + recency + crossDomain + novelty - contradiction
+      reliability + corroboration + recency + crossDomain + novelty + surge - contradiction
     ));
 
     return {
@@ -268,6 +282,7 @@ export function score(candidates, previousRecordIds) {
         recency,
         crossDomain,
         novelty,
+        surge,
         contradiction,
       },
     };
@@ -297,8 +312,12 @@ export function promote(candidates) {
 
     let severity = 'routine';
 
-    if (confidence >= 65 && scoreBreakdown.crossDomain >= 10) {
+    if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
+      // Urgent: high confidence + either cross-domain OR heavy corroboration
       severity = 'urgent';
+    } else if (confidence >= 55 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 28)) {
+      // Breaking: strong corroboration or verified OSINT sources, lower bar than urgent
+      severity = 'breaking';
     } else if (confidence >= 45 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 32)) {
       severity = 'notable';
     } else if (confidence >= 25 && watchlistMatch) {

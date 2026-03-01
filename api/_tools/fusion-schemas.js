@@ -32,8 +32,9 @@
  * @property {number} scoreBreakdown.recency - How recent the data is (0-15)
  * @property {number} scoreBreakdown.crossDomain - Source type diversity (0-15)
  * @property {number} scoreBreakdown.novelty - Bonus for records not seen last cycle (0-10)
+ * @property {number} scoreBreakdown.surge - Bonus for 4+ distinct sources in one cycle (0 or 10)
  * @property {number} scoreBreakdown.contradiction - Penalty for opposing signals (0-25)
- * @property {string} severity - "routine" | "notable" | "urgent" (set by promotion rules)
+ * @property {string} severity - "routine" | "notable" | "breaking" | "urgent" (set by promotion rules)
  * @property {string|null} watchlistMatch - Matched watchlist term, or null
  */
 
