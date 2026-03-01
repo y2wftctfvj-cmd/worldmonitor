@@ -202,8 +202,12 @@ export function cluster(records) {
     }
   }
 
-  // Deduplicate: merge clusters that share records
-  const merged = mergeOverlappingClusters(clusterMap);
+  // Pass 1: merge clusters that share >50% of records
+  const recordMerged = mergeOverlappingClusters(clusterMap);
+
+  // Pass 2: merge clusters that share entities (Jaccard >= 0.35)
+  // This catches "Iran+Khamenei" + "Iran+Israel" + "Iran+Netanyahu" = one event
+  const merged = mergeByEntityOverlap(recordMerged);
 
   // Convert to EventCandidate shape with empty scores
   return merged.map(({ clusterId, entities, records: clusterRecords }) => ({
@@ -325,33 +329,38 @@ export function score(candidates, previousRecordIds) {
  */
 export function promote(candidates) {
   return candidates.map(candidate => {
-    const { confidence, scoreBreakdown, watchlistMatch, entities, clusterId } = candidate;
+    const { confidence, scoreBreakdown, watchlistMatch, entities, clusterId, records } = candidate;
 
-    // Single-entity clusters ("Iran", "Trump") are topics, not events.
-    // They vacuum up unrelated records and inflate scores artificially.
-    // Only entity-pair clusters ("Iran+Nuclear", "Trump+Tariff") represent specific events.
+    // Hard gate: minimum 2 distinct sources required for ANY promotion.
+    // A single headline from one source is never "notable intelligence."
+    const distinctSources = new Set(records.map(r => r.sourceId)).size;
+    const hasMultipleSources = distinctSources >= 2;
+
+    // Entity-pair clusters ("Iran+Israel") represent specific events.
+    // Single-entity clusters ("Iran", "Trump") are broad topics — cap at notable.
     const isEntityPair = clusterId.includes('+');
-    const isBroadTopic = !isEntityPair && entities.length <= 1;
 
     let severity = 'routine';
 
-    if (isBroadTopic) {
-      // Broad single-entity topics can only reach notable (never urgent/breaking)
-      // and only with watchlist match — prevents "Iran" from being urgent
-      if (confidence >= 25 && watchlistMatch) {
+    if (!hasMultipleSources) {
+      // Single source = routine. No exceptions.
+      // One headline is never intelligence, even if it matches your watchlist.
+      severity = 'routine';
+    } else if (!isEntityPair) {
+      // Multi-source broad topic — cap at notable (never urgent/breaking)
+      // "Iran" trending across 6 sources is notable context, not an alert
+      if (confidence >= 50 && watchlistMatch) {
         severity = 'notable';
       }
     } else {
-      // Entity-pair clusters — normal promotion rules
+      // Entity-pair clusters with 2+ sources — full promotion rules
       if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
         severity = 'urgent';
       } else if (confidence >= 55 && scoreBreakdown.corroboration >= 16 && scoreBreakdown.reliability >= 28) {
         severity = 'breaking';
       } else if (confidence >= 45 && scoreBreakdown.corroboration >= 16) {
         severity = 'notable';
-      } else if (confidence >= 45 && scoreBreakdown.reliability >= 32 && scoreBreakdown.corroboration >= 8) {
-        severity = 'notable';
-      } else if (confidence >= 25 && watchlistMatch) {
+      } else if (confidence >= 45 && watchlistMatch) {
         severity = 'notable';
       }
     }
@@ -498,6 +507,74 @@ function mergeOverlappingClusters(clusterMap) {
         }
         current = {
           clusterId: current.clusterId,
+          entities: [...new Set([...current.entities, ...other.entities])],
+          records: allRecords,
+        };
+        consumed.add(j);
+      }
+    }
+
+    merged.push(current);
+  }
+
+  return merged;
+}
+
+/**
+ * Merge clusters whose entity sets overlap significantly (Jaccard >= 0.35).
+ *
+ * Solves the "same event, different clusters" problem:
+ *   Iran+Khamenei, Iran+Israel, Iran+Netanyahu → all about the same crisis.
+ *   They share "Iran" — Jaccard("Iran,Khamenei", "Iran,Israel") = 1/3 ≈ 0.33
+ *   but with 3+ entity overlap it's clearly the same story.
+ *
+ * Uses a greedy merge: largest clusters absorb smaller ones first.
+ */
+function mergeByEntityOverlap(clusters) {
+  if (clusters.length <= 1) return clusters;
+
+  // Sort by record count descending — biggest clusters absorb smaller ones
+  const sorted = [...clusters].sort((a, b) => b.records.length - a.records.length);
+  const merged = [];
+  const consumed = new Set();
+
+  for (let i = 0; i < sorted.length; i++) {
+    if (consumed.has(i)) continue;
+
+    let current = sorted[i];
+    consumed.add(i);
+
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (consumed.has(j)) continue;
+
+      const other = sorted[j];
+      const currentSet = new Set(current.entities.map(e => e.toLowerCase()));
+      const otherSet = new Set(other.entities.map(e => e.toLowerCase()));
+
+      // Jaccard similarity on entity sets
+      const intersection = [...otherSet].filter(e => currentSet.has(e)).length;
+      const union = new Set([...currentSet, ...otherSet]).size;
+      const jaccard = union > 0 ? intersection / union : 0;
+
+      // Merge if entities overlap enough. Two thresholds:
+      //   Standard: Jaccard >= 0.35
+      //   Absorption: small cluster shares an entity with a cluster 5x bigger
+      const sizeRatio = current.records.length / Math.max(other.records.length, 1);
+      const sharesEntity = intersection > 0;
+      const shouldMerge = jaccard >= 0.35 || (sharesEntity && sizeRatio >= 5);
+
+      if (shouldMerge) {
+        // Merge: combine records (dedup by ID) and entities
+        const allRecordIds = new Set();
+        const allRecords = [];
+        for (const r of [...current.records, ...other.records]) {
+          if (!allRecordIds.has(r.id)) {
+            allRecordIds.add(r.id);
+            allRecords.push(r);
+          }
+        }
+        current = {
+          clusterId: current.clusterId, // Keep the bigger cluster's ID
           entities: [...new Set([...current.entities, ...other.entities])],
           records: allRecords,
         };
