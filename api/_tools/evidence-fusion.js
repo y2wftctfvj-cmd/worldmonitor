@@ -315,8 +315,9 @@ export function promote(candidates) {
     if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
       // Urgent: high confidence + either cross-domain OR heavy corroboration
       severity = 'urgent';
-    } else if (confidence >= 55 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 28)) {
-      // Breaking: strong corroboration or verified OSINT sources, lower bar than urgent
+    } else if (confidence >= 55 && scoreBreakdown.corroboration >= 16 && scoreBreakdown.reliability >= 28) {
+      // Breaking: requires BOTH multi-source corroboration AND verified sources
+      // Single-source posts can't reach breaking no matter how reliable
       severity = 'breaking';
     } else if (confidence >= 45 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 32)) {
       severity = 'notable';

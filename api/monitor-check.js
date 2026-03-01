@@ -145,6 +145,7 @@ const LLM_TIMEOUT_MS = 15000; // Edge = 25s total. Budget: collect 6s + LLM 15s 
 const MAX_TOKENS = 1800;  // ~360 words per finding for top 5 candidates
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
+const MAX_ALERTS_PER_CYCLE = 5; // Cap alerts per cycle — prevents notification floods
 const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
 const CYCLE_LOCK_TTL = 30; // seconds — auto-expires if handler crashes
 const RECHECK_KEY = 'monitor:recheck-count';  // Track rapid re-check count per event
@@ -334,6 +335,9 @@ export default async function handler(request) {
           if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
 
           if (finding.severity === 'routine') continue;
+
+          // Cap alerts per cycle to prevent notification floods
+          if (alertsSent >= MAX_ALERTS_PER_CYCLE) break;
 
           // Tier-aware Telegram source check — don't blanket-suppress verified OSINT
           const sources = Array.isArray(finding.sources)
