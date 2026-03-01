@@ -153,7 +153,7 @@ const LLM_TIMEOUT_MS = 15000; // Edge = 25s total. Budget: collect 6s + LLM 15s 
 const MAX_TOKENS = 1800;  // ~360 words per finding for top 5 candidates
 const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
 const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
-const MAX_ALERTS_PER_CYCLE = 5; // Cap alerts per cycle — prevents notification floods
+const MAX_ALERTS_PER_CYCLE = 2; // Max 2 alerts per 5-min cycle — quality over quantity
 const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
 const CYCLE_LOCK_TTL = 30; // seconds — auto-expires if handler crashes
 const RECHECK_KEY = 'monitor:recheck-count';  // Track rapid re-check count per event
@@ -384,31 +384,28 @@ export default async function handler(request) {
 
           if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
 
-          // Escalation-aware dedup — AND logic (title AND entity), escalation bypasses
+          // Dedup — block alerts about stories we already sent.
+          // Uses entity overlap (OR logic) — if we already alerted about Iran,
+          // don't send another Iran alert for the TTL window.
+          // Only exception: genuine severity ESCALATION (notable → urgent).
           const findingEntities = finding._entities || [];
-          const ESCALATION_KEYWORDS = ['war', 'strike', 'attack', 'invasion', 'nuclear', 'ceasefire'];
-          const hasEscalationKeyword = ESCALATION_KEYWORDS.some(kw =>
-            finding.title.toLowerCase().includes(kw) || (finding.analysis || '').toLowerCase().includes(kw)
-          );
           const isDuplicate = recentAlerts.some(recent => {
-            // Title word overlap
-            const titleMatch = jaccardSimilarity(finding.title, recent.title) > 0.4;
-            // Entity set overlap
             const recentEntities = recent.entities || [];
-            if (recentEntities.length === 0 || findingEntities.length === 0) return titleMatch;
+            if (recentEntities.length === 0 && findingEntities.length === 0) {
+              // No entities — fall back to title similarity
+              return jaccardSimilarity(finding.title, recent.title) > 0.4;
+            }
+            // Entity overlap — if 50%+ of entities match, it's the same story
             const overlap = findingEntities.filter(e => recentEntities.includes(e)).length;
             const minLen = Math.min(findingEntities.length, recentEntities.length);
             const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
-            // AND logic — must match BOTH title and entities to be a duplicate
-            const isBaseDuplicate = titleMatch && entityMatch;
-            // Escalation detection: if new severity is higher, let it through
+            if (!entityMatch) return false;
+            // Only let through genuine severity escalation (not same or lower)
             const SEVERITY_RANK = { routine: 0, developing: 1, notable: 2, breaking: 3, urgent: 4 };
             const newRank = SEVERITY_RANK[finding.severity] || 0;
             const oldRank = SEVERITY_RANK[recent.severity] || 0;
-            const isEscalation = newRank > oldRank;
-            // Escalation keywords also bypass dedup
-            if (isEscalation || hasEscalationKeyword) return false;
-            return isBaseDuplicate;
+            if (newRank > oldRank) return false; // Escalation — let it through
+            return true; // Same or lower severity = duplicate, block it
           });
           if (isDuplicate) { skippedDuplicate++; continue; }
 
@@ -1122,9 +1119,8 @@ async function saveRecentAlert(redisUrl, redisToken, title, entities, severity) 
   if (!redisUrl || !redisToken) return;
   try {
     const existing = await loadRecentAlerts(redisUrl, redisToken);
-    // Tiered TTL: breaking/urgent expire faster so escalation alerts get through
-    const ttl = (severity === 'breaking' || severity === 'urgent') ? 3600
-      : severity === 'notable' ? 10800 : RECENT_ALERTS_TTL;
+    // Flat 12-hour TTL — all severities. Don't re-alert about the same story.
+    const ttl = 43200;
     const updated = [...existing, { title, entities: entities || [], severity: severity || 'notable' }].slice(-MAX_RECENT_ALERTS);
     await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), ttl);
   } catch (err) {
