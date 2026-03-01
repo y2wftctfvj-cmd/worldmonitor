@@ -308,21 +308,35 @@ export function score(candidates, previousRecordIds) {
  */
 export function promote(candidates) {
   return candidates.map(candidate => {
-    const { confidence, scoreBreakdown, watchlistMatch } = candidate;
+    const { confidence, scoreBreakdown, watchlistMatch, entities, clusterId } = candidate;
+
+    // Single-entity clusters ("Iran", "Trump") are topics, not events.
+    // They vacuum up unrelated records and inflate scores artificially.
+    // Only entity-pair clusters ("Iran+Nuclear", "Trump+Tariff") represent specific events.
+    const isEntityPair = clusterId.includes('+');
+    const isBroadTopic = !isEntityPair && entities.length <= 1;
 
     let severity = 'routine';
 
-    if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
-      // Urgent: high confidence + either cross-domain OR heavy corroboration
-      severity = 'urgent';
-    } else if (confidence >= 55 && scoreBreakdown.corroboration >= 16 && scoreBreakdown.reliability >= 28) {
-      // Breaking: requires BOTH multi-source corroboration AND verified sources
-      // Single-source posts can't reach breaking no matter how reliable
-      severity = 'breaking';
-    } else if (confidence >= 45 && (scoreBreakdown.corroboration >= 16 || scoreBreakdown.reliability >= 32)) {
-      severity = 'notable';
-    } else if (confidence >= 25 && watchlistMatch) {
-      severity = 'notable';
+    if (isBroadTopic) {
+      // Broad single-entity topics can only reach notable (never urgent/breaking)
+      // and only with watchlist match — prevents "Iran" from being urgent
+      if (confidence >= 25 && watchlistMatch) {
+        severity = 'notable';
+      }
+    } else {
+      // Entity-pair clusters — normal promotion rules
+      if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
+        severity = 'urgent';
+      } else if (confidence >= 55 && scoreBreakdown.corroboration >= 16 && scoreBreakdown.reliability >= 28) {
+        severity = 'breaking';
+      } else if (confidence >= 45 && scoreBreakdown.corroboration >= 16) {
+        severity = 'notable';
+      } else if (confidence >= 45 && scoreBreakdown.reliability >= 32 && scoreBreakdown.corroboration >= 8) {
+        severity = 'notable';
+      } else if (confidence >= 25 && watchlistMatch) {
+        severity = 'notable';
+      }
     }
 
     return { ...candidate, severity };
