@@ -48,6 +48,9 @@ const SOURCE_MAP = {
 
   // Twitter/X OSINT accounts — verified analysts
   twitter:    'osint_verified',
+
+  // Bluesky OSINT accounts — verified analysts (AT Protocol, free API)
+  bluesky:    'osint_verified',
 };
 
 /**

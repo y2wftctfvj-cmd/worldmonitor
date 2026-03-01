@@ -6,7 +6,7 @@
  * LLM now only summarizes pre-scored candidates — it doesn't decide what to alert on.
  *
  * The cycle:
- *   1. COLLECT   — fetch all 10 data sources in parallel
+ *   1. COLLECT   — fetch all 11 data sources in parallel
  *   2. FUSE      — normalize records, cluster by entity, score additively, promote by threshold
  *   3. SUMMARIZE — LLM writes analysis + watch_next for promoted candidates only
  *   4. ALERT     — send notable/urgent findings to Telegram with confidence metadata
@@ -35,6 +35,7 @@ import {
   fetchMilitaryNews,
   fetchGovFeeds,
   fetchTwitterOsint,
+  fetchBlueskyOsint,
 } from './_tools/monitor-tools.js';
 
 import {
@@ -114,6 +115,12 @@ const SOURCE_DISPLAY_NAMES = {
   'twitter:RALee85': '@RALee85',
   'twitter:Flash_news_ua': '@Flash_news_ua',
   'twitter:Faytuks': '@Faytuks',
+  // Bluesky OSINT
+  'bluesky:bellingcat': '@bellingcat',
+  'bluesky:conflictnews': '@conflictnews',
+  'bluesky:baboratorium': '@baboratorium',
+  'bluesky:osinttechnical': '@osinttechnical',
+  'bluesky:julianroepcke': '@julianroepcke',
 };
 
 /**
@@ -125,6 +132,7 @@ function formatSourceName(sourceId) {
   if (sourceId.startsWith('telegram:')) return `@${sourceId.split(':')[1]}`;
   if (sourceId.startsWith('reddit:')) return `r/${sourceId.split(':')[1]}`;
   if (sourceId.startsWith('twitter:')) return `@${sourceId.split(':')[1]}`;
+  if (sourceId.startsWith('bluesky:')) return `@${sourceId.split(':')[1]}`;
   return sourceId;
 }
 
@@ -211,15 +219,16 @@ export default async function handler(request) {
         fetchMilitaryNews(),
         fetchGovFeeds(),
         fetchTwitterOsint(),
+        fetchBlueskyOsint(),
       ]);
       const [
         headlines, markets, telegram, reddit, predictions,
-        earthquakes, outages, military, govFeeds, twitter,
+        earthquakes, outages, military, govFeeds, twitter, bluesky,
       ] = results;
       const succeeded = results.filter(r => r.status === 'fulfilled').length;
       return {
-        _meta: { succeeded, failed: 10 - succeeded },
-        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds, twitter },
+        _meta: { succeeded, failed: 11 - succeeded },
+        _value: { headlines, markets, telegram, reddit, predictions, earthquakes, outages, military, govFeeds, twitter, bluesky },
       };
     });
 

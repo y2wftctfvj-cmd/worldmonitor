@@ -66,13 +66,25 @@ export const MARKET_SYMBOLS = [
   { symbol: '^TNX', name: '10Y Yield' },
   { symbol: '^VIX', name: 'VIX' },
   { symbol: 'BTC-USD', name: 'Bitcoin' },
+  { symbol: 'ITA', name: 'Defense ETF' },  // iShares Aerospace & Defense — spikes before military news breaks
 ];
 
 /** Government & wire service RSS feeds */
 const GOV_FEEDS = [
+  // Wire services — primary breaking news sources
   { url: 'https://feeds.reuters.com/reuters/worldNews', name: 'Reuters World' },
   { url: 'https://www.state.gov/rss-feeds/press-releases/feed/', name: 'State Dept' },
+  { url: 'http://feeds.bbci.co.uk/news/world/rss.xml', name: 'BBC World' },
+  { url: 'https://www.france24.com/en/rss', name: 'France24' },
+  { url: 'https://www.aljazeera.com/xml/rss/all.xml', name: 'Al Jazeera' },
+  // Defense specialist — break military stories before mainstream
   { url: 'https://warontherocks.com/feed/', name: 'War on the Rocks' },
+  { url: 'https://breakingdefense.com/feed/', name: 'Breaking Defense' },
+  { url: 'https://www.thedrive.com/the-war-zone/feed', name: 'The War Zone' },
+  // Alliance/institution feeds
+  { url: 'https://www.nato.int/cps/en/natohq/news.htm', name: 'NATO' },
+  // UN disaster coordination — earthquakes, tsunamis, floods, cyclones
+  { url: 'https://www.gdacs.org/xml/rss.xml', name: 'GDACS' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -814,6 +826,54 @@ export async function fetchTwitterOsint() {
   }
 
   return allTweets;
+}
+
+/**
+ * Fetch recent posts from OSINT accounts on Bluesky via the AT Protocol.
+ * Free public API, no auth needed, growing OSINT community (many migrated from Twitter).
+ * Returns array of { account, text } objects.
+ */
+export async function fetchBlueskyOsint() {
+  const BLUESKY_ACCOUNTS = [
+    'bellingcat.com',               // Bellingcat — OSINT investigations
+    'conflictnews.com',             // Conflict News — breaking conflict alerts
+    'baboratorium.bsky.social',     // OSINT researcher
+    'osinttechnical.bsky.social',   // OSINTtechnical — military OSINT
+    'julianroepcke.bsky.social',    // Julian Röpcke — BILD conflict reporter
+  ];
+
+  const allPosts = [];
+
+  const results = await Promise.allSettled(
+    BLUESKY_ACCOUNTS.map(async (handle) => {
+      try {
+        const url = `https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=${encodeURIComponent(handle)}&limit=5&filter=posts_no_replies`;
+        const resp = await fetch(url, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return [];
+
+        const data = await resp.json();
+        return (data.feed || [])
+          .map(item => {
+            const text = item.post?.record?.text;
+            if (!text || text.length < 10) return null;
+            const truncated = text.length > 280 ? text.slice(0, 280) + '...' : text;
+            return { account: handle.split('.')[0], text: truncated };
+          })
+          .filter(Boolean)
+          .slice(0, 3); // Max 3 posts per account
+      } catch {
+        return [];
+      }
+    })
+  );
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') allPosts.push(...result.value);
+  }
+
+  return allPosts;
 }
 
 // Re-export prediction market functions

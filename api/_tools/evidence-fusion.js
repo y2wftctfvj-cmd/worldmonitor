@@ -70,6 +70,16 @@ export function normalize(collectResults) {
     }
   }
 
+  // Bluesky (array of { account, text })
+  if (collectResults.bluesky?.status === 'fulfilled' && Array.isArray(collectResults.bluesky.value)) {
+    for (const post of collectResults.bluesky.value) {
+      if (!post.text || post.text.length < 10) continue;
+      const sourceId = `bluesky:${post.account}`;
+      const { tier } = getReliability('bluesky');
+      records.push(makeRecord(sourceId, tier, post.text, now, { account: post.account }));
+    }
+  }
+
   // Markets (string with "- Symbol: price (change)" lines)
   if (collectResults.markets?.status === 'fulfilled' && collectResults.markets.value) {
     const lines = collectResults.markets.value.split('\n').filter(l => l.trim().startsWith('-'));
