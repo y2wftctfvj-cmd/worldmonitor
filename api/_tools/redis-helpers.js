@@ -6,13 +6,15 @@
  * (they return empty defaults).
  */
 
+import { applyWatchlistMatchStats, hydrateWatchlistItems } from './watchlist-utils.js';
+
 // ---------------------------------------------------------------------------
 // Watchlist — shared between monitor-check (bulk scan) and telegram-webhook
 // ---------------------------------------------------------------------------
 
 /**
  * Load a single user's watchlist from Redis.
- * Returns array of { term, addedAt } objects.
+ * Returns array of normalized watchlist objects.
  */
 export async function loadWatchlist(chatId, redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return [];
@@ -29,7 +31,7 @@ export async function loadWatchlist(chatId, redisUrl, redisToken) {
     if (!data.result) return [];
 
     const watchlist = JSON.parse(data.result);
-    return Array.isArray(watchlist) ? watchlist : [];
+    return hydrateWatchlistItems(watchlist);
   } catch {
     return [];
   }
@@ -40,7 +42,7 @@ export async function loadWatchlist(chatId, redisUrl, redisToken) {
  */
 export async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
   const key = `watchlist:${chatId}`;
-  const value = JSON.stringify(watchlist);
+  const value = JSON.stringify(hydrateWatchlistItems(watchlist));
   const resp = await fetch(`${redisUrl}/pipeline`, {
     method: 'POST',
     headers: {
@@ -58,7 +60,7 @@ export async function saveWatchlist(chatId, watchlist, redisUrl, redisToken) {
 /**
  * Load ALL user watchlists (for the analysis cycle).
  * Scans Redis for watchlist:* keys with full cursor iteration.
- * Returns array of { chatId, terms[] }.
+ * Returns array of { chatId, items[], terms[] }.
  */
 export async function loadAllWatchlists(redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return [];
@@ -101,10 +103,14 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
       const result = batchData[i]?.result;
       if (!result) continue;
       try {
-        const items = JSON.parse(result);
+        const items = hydrateWatchlistItems(JSON.parse(result));
         if (Array.isArray(items) && items.length > 0) {
           const chatIdFromKey = keys[i].replace('watchlist:', '');
-          watchlists.push({ chatId: chatIdFromKey, terms: items.map(w => w.term) });
+          watchlists.push({
+            chatId: chatIdFromKey,
+            items,
+            terms: items.map((w) => w.term),
+          });
         }
       } catch {
         // Skip malformed watchlist
@@ -116,12 +122,36 @@ export async function loadAllWatchlists(redisUrl, redisToken) {
   }
 }
 
+/**
+ * Update watchlist hit counters and lastMatchedAt metadata for matched items.
+ *
+ * @param {Array<{chatId: string, term?: string, normalized?: string}>} matches
+ */
+export async function updateWatchlistMatchStats(matches, redisUrl, redisToken, now = Date.now()) {
+  if (!redisUrl || !redisToken || !Array.isArray(matches) || matches.length === 0) return;
+
+  const byChat = new Map();
+  for (const match of matches) {
+    const chatId = String(match?.chatId || '');
+    if (!chatId) continue;
+    if (!byChat.has(chatId)) byChat.set(chatId, []);
+    byChat.get(chatId).push(match);
+  }
+
+  for (const [chatId, chatMatches] of byChat.entries()) {
+    const current = await loadWatchlist(chatId, redisUrl, redisToken);
+    if (current.length === 0) continue;
+    const updated = applyWatchlistMatchStats(current, chatMatches, now);
+    await saveWatchlist(chatId, updated, redisUrl, redisToken);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Record IDs — delta detection between fusion cycles
 // ---------------------------------------------------------------------------
 
 const RECORD_IDS_KEY = 'monitor:record-ids';
-const RECORD_IDS_TTL = 600; // 10 min — same as snapshot TTL
+const RECORD_IDS_TTL = 900; // 15 min — survives 2 full 5-min cycles with buffer
 
 /**
  * Load previous cycle's record IDs from Redis.

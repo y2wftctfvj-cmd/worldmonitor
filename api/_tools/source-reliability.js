@@ -16,6 +16,9 @@ const RELIABILITY = {
   weak:            { score: 4,  label: 'Weak/Anon' },       // Single anonymous source
 };
 
+const STRONG_TIERS = new Set(['wire', 'mainstream']);
+const VERIFIED_TIERS = new Set(['wire', 'mainstream', 'osint_verified', 'domain']);
+
 // Telegram channels — split into 3 tiers for granular reliability scoring
 
 // Tier 1: Mainstream news orgs — same reliability as Google News headlines
@@ -95,4 +98,12 @@ export function getReliability(sourceId, meta) {
   return { ...RELIABILITY.weak, tier: 'weak' };
 }
 
-export { RELIABILITY, TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED };
+export function isStrongTier(tier) {
+  return STRONG_TIERS.has(tier);
+}
+
+export function isVerifiedTier(tier) {
+  return VERIFIED_TIERS.has(tier);
+}
+
+export { RELIABILITY, STRONG_TIERS, VERIFIED_TIERS, TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED };

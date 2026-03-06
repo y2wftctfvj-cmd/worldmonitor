@@ -20,16 +20,16 @@ const ALLOWED_ORIGINS = [
 ];
 
 function sanitizeOrigin(raw) {
-  if (!raw) return 'https://worldmonitor.app';
+  if (!raw) return 'https://worldmonitor-two-kappa.vercel.app';
   try {
     const parsed = new URL(raw);
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:' && parsed.protocol !== 'tauri:') {
-      return 'https://worldmonitor.app';
+      return 'https://worldmonitor-two-kappa.vercel.app';
     }
     const origin = parsed.origin !== 'null' ? parsed.origin : raw;
     if (ALLOWED_ORIGINS.some(p => p.test(origin))) return origin;
   } catch { /* invalid URL */ }
-  return 'https://worldmonitor.app';
+  return 'https://worldmonitor-two-kappa.vercel.app';
 }
 
 export default async function handler(request) {

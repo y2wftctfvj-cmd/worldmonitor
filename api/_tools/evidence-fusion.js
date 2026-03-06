@@ -8,9 +8,11 @@
  * Pipeline: COLLECT -> NORMALIZE -> CLUSTER -> SCORE -> PROMOTE -> LLM SUMMARIZE
  */
 
+import { buildEvidenceProfile } from './evidence-gate.js';
 import { getReliability } from './source-reliability.js';
 import { extractEntities } from './entity-dictionary.js';
 import { filterValidRecords, validateCandidate } from './schema-validator.js';
+import { findCandidateWatchlistMatches } from './watchlist-utils.js';
 
 // ---------------------------------------------------------------------------
 // Step 1: NORMALIZE — convert raw source data into CanonicalRecords
@@ -46,7 +48,17 @@ export function normalize(collectResults) {
       if (!post.text || post.text.length < 10) continue;
       const sourceId = `telegram:${post.channel}`;
       const { tier } = getReliability(sourceId);
-      records.push(makeRecord(sourceId, tier, post.text, now, { channel: post.channel }));
+      records.push(makeRecord(
+        sourceId,
+        tier,
+        post.text,
+        post.publishedAt || now,
+        {
+          channel: post.channel,
+          link: post.link || null,
+          publishedAt: post.publishedAt || null,
+        }
+      ));
     }
   }
 
@@ -305,6 +317,7 @@ export function score(candidates, previousRecordIds) {
 
   return candidates.map(candidate => {
     const { records } = candidate;
+    const sourceProfile = buildEvidenceProfile(records);
 
     // Reliability: best source in the cluster
     const reliability = Math.max(...records.map(r => {
@@ -313,7 +326,7 @@ export function score(candidates, previousRecordIds) {
     }));
 
     // Corroboration: number of distinct source identifiers
-    const distinctSources = new Set(records.map(r => r.sourceId)).size;
+    const distinctSources = sourceProfile.distinctSources;
     const corroboration = Math.min(distinctSources * 8, 25);
 
     // Recency: how fresh is the newest record?
@@ -328,8 +341,7 @@ export function score(candidates, previousRecordIds) {
     else if (ageMs < 6 * 60 * 60 * 1000) recency = 5;  // < 6 hours
 
     // Cross-domain: distinct source types (wire, social, domain, etc.)
-    const sourceTypes = new Set(records.map(r => r.sourceType));
-    const crossDomain = Math.min(sourceTypes.size * 5, 15);
+    const crossDomain = Math.min(sourceProfile.distinctTypes * 5, 15);
 
     // Novelty: bonus for records not seen in the previous cycle
     const newRecordCount = records.filter(r => !prevIds.has(r.id)).length;
@@ -350,6 +362,7 @@ export function score(candidates, previousRecordIds) {
     return {
       ...candidate,
       confidence,
+      sourceProfile,
       scoreBreakdown: {
         reliability,
         corroboration,
@@ -382,12 +395,20 @@ export function score(candidates, previousRecordIds) {
  */
 export function promote(candidates) {
   return candidates.map(candidate => {
-    const { confidence, scoreBreakdown, watchlistMatch, entities, clusterId, records } = candidate;
+    const {
+      confidence,
+      scoreBreakdown,
+      watchlistMatch,
+      clusterId,
+      records,
+      sourceProfile,
+    } = candidate;
 
     // Hard gate: minimum 2 distinct sources required for ANY promotion.
     // A single headline from one source is never "notable intelligence."
     const distinctSources = new Set(records.map(r => r.sourceId)).size;
     const hasMultipleSources = distinctSources >= 2;
+    const passesTrustGate = sourceProfile?.passesTrustGate === true;
 
     // Entity-pair clusters ("Iran+Israel") represent specific events.
     // Single-entity clusters ("Iran", "Trump") are broad topics — cap at notable.
@@ -395,25 +416,35 @@ export function promote(candidates) {
 
     let severity = 'routine';
 
-    if (!hasMultipleSources) {
+    if (!hasMultipleSources || !passesTrustGate) {
       // Single source = routine. No exceptions.
-      // One headline is never intelligence, even if it matches your watchlist.
+      // Trust gate blocks social-only or low-quality corroboration from alerting.
       severity = 'routine';
     } else if (!isEntityPair) {
       // Multi-source broad topic — cap at notable (never urgent/breaking)
-      // "Iran" trending across 6 sources is notable context, not an alert
-      if (confidence >= 50 && watchlistMatch) {
+      // Watchlists lower the bar slightly, but only after the trust gate passes.
+      if (confidence >= 46 && watchlistMatch) {
+        severity = 'notable';
+      } else if (confidence >= 50 && distinctSources >= 3 && scoreBreakdown.crossDomain >= 10) {
         severity = 'notable';
       }
     } else {
       // Entity-pair clusters with 2+ sources — full promotion rules
-      if (confidence >= 65 && (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 20)) {
+      if (
+        confidence >= 60 &&
+        sourceProfile?.strongSourceCount >= 1 &&
+        (scoreBreakdown.crossDomain >= 10 || scoreBreakdown.corroboration >= 16)
+      ) {
         severity = 'urgent';
-      } else if (confidence >= 55 && scoreBreakdown.corroboration >= 16 && scoreBreakdown.reliability >= 28) {
+      } else if (
+        confidence >= 52 &&
+        scoreBreakdown.corroboration >= 16 &&
+        (sourceProfile?.strongSourceCount >= 1 || scoreBreakdown.reliability >= 24)
+      ) {
         severity = 'breaking';
-      } else if (confidence >= 45 && scoreBreakdown.corroboration >= 16) {
+      } else if (confidence >= 40 && scoreBreakdown.corroboration >= 12) {
         severity = 'notable';
-      } else if (confidence >= 45 && watchlistMatch) {
+      } else if (confidence >= 36 && watchlistMatch) {
         severity = 'notable';
       }
     }
@@ -441,10 +472,15 @@ export function runFusion(collectResults, previousRecordIds, watchlistTerms) {
 
   // Tag watchlist matches before promotion
   const tagged = scored.map(candidate => {
-    const match = (watchlistTerms || []).find(term =>
-      candidate.entities.some(e => e.toLowerCase().includes(term.toLowerCase()))
-    );
-    return { ...candidate, watchlistMatch: match || null };
+    const watchlists = Array.isArray(watchlistTerms) && watchlistTerms.length > 0
+      ? [{ chatId: 'local', items: watchlistTerms.map((term) => ({ term })) }]
+      : [];
+    const matches = findCandidateWatchlistMatches(candidate, watchlists);
+    return {
+      ...candidate,
+      watchlistMatches: matches,
+      watchlistMatch: matches[0]?.term || null,
+    };
   });
 
   const promoted = promote(tagged);

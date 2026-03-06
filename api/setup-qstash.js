@@ -13,10 +13,12 @@
 
 const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
 const CRON_SECRET = process.env.CRON_SECRET;
-const DESTINATION = process.env.VERCEL_URL
-  ? `https://${process.env.VERCEL_URL}/api/monitor-check`
-  : 'https://worldmonitor-two-kappa.vercel.app/api/monitor-check';
+const DESTINATION = process.env.QSTASH_DESTINATION
+  || (process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}/api/monitor-check`
+    : 'https://worldmonitor-two-kappa.vercel.app/api/monitor-check');
 const SCHEDULE = '*/5 * * * *'; // Every 5 minutes
+const baseUrl = process.env.QSTASH_URL || 'https://qstash-us-east-1.upstash.io';
 
 async function setupQStashSchedule() {
   if (!QSTASH_TOKEN) {
@@ -35,6 +37,8 @@ async function setupQStashSchedule() {
   console.log(`  Schedule: ${SCHEDULE}`);
 
   try {
+    await pruneExistingSchedules();
+
     const headers = {
       Authorization: `Bearer ${QSTASH_TOKEN}`,
       'Content-Type': 'application/json',
@@ -47,7 +51,7 @@ async function setupQStashSchedule() {
       headers['Upstash-Forward-Authorization'] = `Bearer ${CRON_SECRET}`;
     }
 
-    const resp = await fetch(`https://qstash.upstash.io/v2/schedules/${DESTINATION}`, {
+    const resp = await fetch(`${baseUrl}/v2/schedules/${DESTINATION}`, {
       method: 'POST',
       headers,
     });
@@ -66,6 +70,53 @@ async function setupQStashSchedule() {
   } catch (err) {
     console.error('Failed to create schedule:', err.message);
     process.exit(1);
+  }
+}
+
+async function pruneExistingSchedules() {
+  const resp = await fetch(`${baseUrl}/v2/schedules`, {
+    headers: { Authorization: `Bearer ${QSTASH_TOKEN}` },
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text();
+    throw new Error(`Failed to list schedules: ${resp.status} ${errBody}`);
+  }
+
+  const schedules = await resp.json();
+  const monitorSchedules = Array.isArray(schedules)
+    ? schedules.filter((schedule) => isMonitorDestination(schedule.destination))
+    : [];
+
+  if (monitorSchedules.length === 0) return;
+
+  console.log(`Removing ${monitorSchedules.length} existing monitor schedule(s)...`);
+  for (const schedule of monitorSchedules) {
+    const deleteResp = await fetch(`${baseUrl}/v2/schedules/${schedule.scheduleId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${QSTASH_TOKEN}` },
+    });
+
+    if (!deleteResp.ok) {
+      const errBody = await deleteResp.text();
+      throw new Error(`Failed to delete schedule ${schedule.scheduleId}: ${deleteResp.status} ${errBody}`);
+    }
+  }
+}
+
+function isMonitorDestination(destination) {
+  if (typeof destination !== 'string') return false;
+  try {
+    const url = new URL(destination);
+    return url.pathname === '/api/monitor-check'
+      && (
+        url.hostname === 'worldmonitor-two-kappa.vercel.app'
+        || url.hostname === 'www.worldmonitor.app'
+        || url.hostname === 'worldmonitor.app'
+        || (url.hostname.startsWith('worldmonitor-') && url.hostname.endsWith('.vercel.app'))
+      );
+  } catch {
+    return false;
   }
 }
 

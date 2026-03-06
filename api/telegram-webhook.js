@@ -8,7 +8,8 @@
  * Auth: Telegram's X-Telegram-Bot-Api-Secret-Token header (set via setWebhook).
  *   Falls back to ?token= query param for backwards compatibility.
  *
- * Commands: /watch, /unwatch, /watches, /brief, /status, /clear
+ * Commands: /watch, /unwatch, /watches, /brief, /status, /clear,
+ *           /history, /anomalies, /convergence, /sitrep
  *
  * Setup (one-time):
  *   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=https://worldmonitor-two-kappa.vercel.app/api/telegram-webhook&secret_token=${CRON_SECRET}"
@@ -30,8 +31,16 @@ import {
 import {
   loadWatchlist,
   saveWatchlist,
-  loadAllWatchlists,
 } from './_tools/redis-helpers.js';
+
+import { getEntityHistory, normalizeEntity, loadLedgerEntries, computeBaselines } from './_tools/event-ledger.js';
+import { detectAnomalies, detectConvergence } from './_tools/intel-analysis.js';
+import {
+  createWatchlistItem,
+  formatWatchlistSummary,
+  hydrateWatchlistItems,
+  normalizeWatchTerm,
+} from './_tools/watchlist-utils.js';
 
 // ---------------------------------------------------------------------------
 // LLM settings
@@ -235,7 +244,7 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
     if (watchlist.length === 0) {
       await sendTelegramMessage(botToken, chatId, 'No active watches. Use /watch <topic> to add one.');
     } else {
-      const list = watchlist.map((w, i) => `${i + 1}. ${w.term} (since ${new Date(w.addedAt).toLocaleDateString()})`).join('\n');
+      const list = formatWatchlistSummary(watchlist, MAX_WATCHLIST_ITEMS);
       await sendTelegramMessage(botToken, chatId, `*Active Watchlist* (${watchlist.length}/${MAX_WATCHLIST_ITEMS}):\n${list}`);
     }
     return true;
@@ -260,6 +269,40 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
   if (lower === '/clear') {
     await clearHistory(chatId, redisUrl, redisToken);
     await sendTelegramMessage(botToken, chatId, 'Conversation history cleared.');
+    return true;
+  }
+
+  // /history <entity> — 7-day timeline for an entity
+  if (lower.startsWith('/history ')) {
+    const entity = text.slice(9).trim();
+    if (!entity) {
+      await sendTelegramMessage(botToken, chatId, 'Usage: /history <entity>\nExample: /history Iran');
+      return true;
+    }
+    const result = await handleHistoryCommand(entity, redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, result);
+    return true;
+  }
+
+  // /anomalies — current entities above baseline
+  if (lower === '/anomalies') {
+    const result = await handleAnomaliesCommand(redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, result);
+    return true;
+  }
+
+  // /convergence — cross-domain convergence signals
+  if (lower === '/convergence') {
+    const result = await handleConvergenceCommand(redisUrl, redisToken);
+    await sendTelegramMessage(botToken, chatId, result);
+    return true;
+  }
+
+  // /sitrep — full situation report with patterns
+  if (lower === '/sitrep') {
+    await sendTelegramMessage(botToken, chatId, 'Compiling situation report...');
+    const result = await handleSitrepCommand(redisUrl, redisToken, openRouterKey, groqKey);
+    await sendTelegramMessage(botToken, chatId, result);
     return true;
   }
 
@@ -456,6 +499,295 @@ async function generateStatus() {
   }
 
   parts.push('\n_Use /brief for full analysis._');
+  return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// New intel commands — /history, /anomalies, /convergence, /sitrep
+// ---------------------------------------------------------------------------
+
+/**
+ * /history <entity> — show 7-day timeline from the ledger.
+ */
+async function handleHistoryCommand(entity, redisUrl, redisToken) {
+  const ledger = await getEntityHistory(entity, redisUrl, redisToken);
+
+  if (!ledger) {
+    return `No history found for "${entity}". The entity may not have appeared in recent monitoring cycles, or the ledger hasn't accumulated enough data yet.`;
+  }
+
+  const observations = ledger.observations || [];
+  const baseline = ledger.baseline || {};
+
+  const parts = [];
+  parts.push(`*ENTITY HISTORY: ${ledger.displayName || entity}*`);
+  parts.push(`Normalized: ${ledger.entity}`);
+  parts.push(`Observations: ${observations.length} over ${Math.round((Date.now() - (observations[0]?.ts || Date.now())) / 86400000)} days`);
+  parts.push('');
+
+  // Baseline stats
+  if (baseline.observationCount >= 5) {
+    parts.push('*Baseline (7-day)*');
+    parts.push(`Avg daily mentions: ${baseline.avgDailyMentions}`);
+    parts.push(`Avg confidence: ${baseline.avgConfidence}`);
+    parts.push(`Avg source count: ${baseline.avgSourceCount}`);
+    parts.push('');
+  }
+
+  // Recent observations (last 10)
+  const recentObs = observations.slice(-10);
+  if (recentObs.length > 0) {
+    parts.push('*Recent Activity*');
+    for (const obs of recentObs) {
+      const date = new Date(obs.ts).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
+      const sources = obs.sourceCount || 1;
+      parts.push(`- ${date} UTC | ${obs.severity} | conf: ${obs.confidence} | ${sources} sources`);
+    }
+    parts.push('');
+  }
+
+  // Severity distribution
+  const severityCounts = {};
+  for (const obs of observations) {
+    severityCounts[obs.severity] = (severityCounts[obs.severity] || 0) + 1;
+  }
+  parts.push('*Severity Distribution*');
+  for (const [sev, count] of Object.entries(severityCounts).sort((a, b) => b[1] - a[1])) {
+    parts.push(`${sev}: ${count}`);
+  }
+
+  return parts.join('\n');
+}
+
+/**
+ * /anomalies — show entities currently above their baseline.
+ * Reads from recent alerts and ledger data.
+ */
+async function handleAnomaliesCommand(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return 'Anomaly detection requires Redis.';
+
+  // Load recent alerts to find active entities
+  let recentAlerts = [];
+  try {
+    const resp = await fetch(`${redisUrl}/get/monitor:recent-alerts`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.result) recentAlerts = JSON.parse(data.result);
+    }
+  } catch { /* proceed with empty */ }
+
+  if (recentAlerts.length === 0) {
+    return '*ANOMALY REPORT*\n\nNo recent alerts to analyze. The monitor pipeline may not have produced alerts recently.';
+  }
+
+  // Extract entities from recent alerts
+  const allEntities = [...new Set(recentAlerts.flatMap(a => a.entities || []))];
+  if (allEntities.length === 0) {
+    return '*ANOMALY REPORT*\n\nNo entity data in recent alerts.';
+  }
+
+  const baselines = await computeBaselines(allEntities, redisUrl, redisToken);
+
+  const parts = ['*ANOMALY REPORT*', ''];
+  let foundAnomalies = 0;
+
+  for (const [entity, baseline] of baselines) {
+    if (baseline.insufficient) continue;
+    // Count how many recent alerts mention this entity
+    const recentCount = recentAlerts.filter(a => (a.entities || []).some(e => normalizeEntity(e) === entity)).length;
+    // Compare to baseline (alerts per day vs observations per day)
+    if (recentCount >= 3 && baseline.avgDailyMentions > 0) {
+      const ratio = Math.round((recentCount / baseline.avgDailyMentions) * 100);
+      parts.push(`\u26A1 *${entity}*: ${recentCount} alerts (${ratio}% of daily baseline ${baseline.avgDailyMentions})`);
+      foundAnomalies++;
+    }
+  }
+
+  if (foundAnomalies === 0) {
+    parts.push('No anomalies detected. All entities are within normal baseline ranges.');
+  }
+
+  parts.push('');
+  parts.push(`_Based on ${allEntities.length} entities from ${recentAlerts.length} recent alerts._`);
+
+  return parts.join('\n');
+}
+
+/**
+ * /convergence — show cross-domain convergence signals from the latest digest cache.
+ */
+async function handleConvergenceCommand(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return 'Convergence detection requires Redis.';
+
+  // Load today's digest cache for entity activity data
+  let cache = null;
+  try {
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(`monitor:digest-cache:${dateStr}`)}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.result) cache = JSON.parse(data.result);
+    }
+  } catch { /* proceed without cache */ }
+
+  const parts = ['*CROSS-DOMAIN CONVERGENCE*', ''];
+
+  if (!cache || !cache.topAlerts || cache.topAlerts.length === 0) {
+    parts.push('No convergence data available. The monitor pipeline needs to accumulate cycle data first.');
+    return parts.join('\n');
+  }
+
+  // Look for entities that appear across multiple source types
+  const entitySourceTypes = new Map();
+  for (const alert of cache.topAlerts) {
+    const sourceTypes = alert.sourceTypes || [];
+    for (const entity of (alert.entities || [])) {
+      const normalized = normalizeEntity(entity);
+      if (!entitySourceTypes.has(normalized)) {
+        entitySourceTypes.set(normalized, { types: new Set(), displayName: entity });
+      }
+      for (const type of sourceTypes) {
+        entitySourceTypes.get(normalized).types.add(type);
+      }
+    }
+  }
+
+  // Show entities with 3+ source types (proxy for cross-domain)
+  let found = 0;
+  const sorted = [...entitySourceTypes.entries()].sort((a, b) => b[1].types.size - a[1].types.size);
+  for (const [entity, data] of sorted) {
+    if (data.types.size >= 3) {
+      parts.push(`\u{1F500} *${data.displayName}*: ${[...data.types].join(' + ')} (${data.types.size} source types)`);
+      found++;
+    }
+    if (found >= 10) break;
+  }
+
+  if (found === 0) {
+    parts.push('No multi-domain convergence detected in today\'s data.');
+  }
+
+  parts.push('');
+  parts.push(`_Based on ${cache.topAlerts.length} promoted events today._`);
+
+  return parts.join('\n');
+}
+
+/**
+ * /sitrep — full situation report combining recent alerts + analysis.
+ */
+async function handleSitrepCommand(redisUrl, redisToken, openRouterKey, groqKey) {
+  if (!redisUrl || !redisToken) return 'SITREP requires Redis.';
+
+  // Load all available data from Redis
+  const [recentAlertsResp, sourceHealthResp, cacheResp] = await Promise.allSettled([
+    fetch(`${redisUrl}/get/monitor:recent-alerts`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    }),
+    fetch(`${redisUrl}/get/monitor:source-health`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    }),
+    fetch(`${redisUrl}/get/${encodeURIComponent(`monitor:digest-cache:${new Date().toISOString().slice(0, 10)}`)}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    }),
+  ]);
+
+  let recentAlerts = [];
+  let sourceHealth = null;
+  let cache = null;
+
+  try {
+    if (recentAlertsResp.status === 'fulfilled' && recentAlertsResp.value.ok) {
+      const data = await recentAlertsResp.value.json();
+      if (data.result) recentAlerts = JSON.parse(data.result);
+    }
+  } catch { /* proceed */ }
+
+  try {
+    if (sourceHealthResp.status === 'fulfilled' && sourceHealthResp.value.ok) {
+      const data = await sourceHealthResp.value.json();
+      if (data.result) sourceHealth = JSON.parse(data.result);
+    }
+  } catch { /* proceed */ }
+
+  try {
+    if (cacheResp.status === 'fulfilled' && cacheResp.value.ok) {
+      const data = await cacheResp.value.json();
+      if (data.result) cache = JSON.parse(data.result);
+    }
+  } catch { /* proceed */ }
+
+  // Build SITREP message
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  });
+
+  const parts = [];
+  parts.push(`*SITUATION REPORT*`);
+  parts.push(dateStr);
+  parts.push('');
+
+  // Recent alerts summary
+  if (recentAlerts.length > 0) {
+    parts.push('*RECENT ALERTS*');
+    const top = recentAlerts.slice(-5);
+    for (const alert of top) {
+      const title = typeof alert === 'string' ? alert : alert.title;
+      const severity = typeof alert === 'object' ? alert.severity : 'unknown';
+      parts.push(`- [${severity}] ${title}`);
+    }
+    parts.push('');
+  }
+
+  // Entity activity from cache
+  if (cache?.entityCounts) {
+    const topEntities = Object.entries(cache.entityCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+    if (topEntities.length > 0) {
+      parts.push('*ENTITY ACTIVITY*');
+      for (const [entity, count] of topEntities) {
+        parts.push(`- ${entity}: ${count} mentions`);
+      }
+      parts.push('');
+    }
+  }
+
+  // Source health
+  if (sourceHealth) {
+    const entries = Object.entries(sourceHealth);
+    const okCount = entries.filter(([, v]) => v.status === 'ok').length;
+    const degraded = entries
+      .filter(([, v]) => v.status === 'degraded' || (v.consecutiveDegraded || 0) >= 2)
+      .map(([name, value]) => `${name} (${value.detail || `${value.consecutiveDegraded || 0} degraded`})`);
+    const failed = entries
+      .filter(([, v]) => v.status === 'failed' || (v.consecutiveFailures || 0) >= 2)
+      .map(([name, value]) => `${name} (${value.consecutiveFailures || 0} fails)`);
+    parts.push('*SOURCE STATUS*');
+    parts.push(`${okCount}/${entries.length} healthy`);
+    if (degraded.length > 0) {
+      parts.push(`Degraded: ${degraded.join(', ')}`);
+    }
+    if (failed.length > 0) {
+      parts.push(`Failed: ${failed.join(', ')}`);
+    }
+    parts.push('');
+  }
+
+  if (parts.length <= 3) {
+    parts.push('No data available for SITREP. The monitor pipeline may not have run recently.');
+  }
+
   return parts.join('\n');
 }
 
@@ -769,29 +1101,28 @@ async function clearHistory(chatId, redisUrl, redisToken) {
 async function addToWatchlist(chatId, rawTerm, redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return 'Watchlist requires Redis. Configure UPSTASH_REDIS_REST_URL.';
 
-  // Sanitize: strip to alphanumeric/spaces/hyphens, max 50 chars
-  const term = rawTerm.replace(/[^\w\s\-]/g, '').trim().slice(0, 50);
-  if (term.length === 0) return 'Invalid watchlist term.';
+  const item = createWatchlistItem(rawTerm);
+  if (!item) return 'Invalid watchlist term.';
 
   const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
+  const normalized = normalizeWatchTerm(item.term);
 
-  // Check for duplicates (case-insensitive)
-  if (watchlist.some(w => w.term.toLowerCase() === term.toLowerCase())) {
-    return `"${term}" is already on your watchlist.`;
+  if (watchlist.some((entry) => normalizeWatchTerm(entry.normalized || entry.term) === normalized)) {
+    return `"${item.term}" is already on your watchlist.`;
   }
 
   if (watchlist.length >= MAX_WATCHLIST_ITEMS) {
     return `Watchlist full (${MAX_WATCHLIST_ITEMS} max). Remove one first with /unwatch.`;
   }
 
-  const updated = [...watchlist, { term, addedAt: Date.now() }];
+  const updated = [...hydrateWatchlistItems(watchlist), item];
   try {
     await saveWatchlist(chatId, updated, redisUrl, redisToken);
   } catch (err) {
     console.error('[telegram-webhook] Watchlist save failed:', err.message);
-    return `Failed to save "${term}" to watchlist. Try again in a moment.`;
+    return `Failed to save "${item.term}" to watchlist. Try again in a moment.`;
   }
-  return `Added "${term}" to watchlist. I'll alert you when it appears in any intel source.`;
+  return `Added "${item.term}" to watchlist. I'll alert you when it appears in high-trust intel.`;
 }
 
 /**
@@ -801,8 +1132,8 @@ async function removeFromWatchlist(chatId, term, redisUrl, redisToken) {
   if (!redisUrl || !redisToken) return 'Watchlist requires Redis.';
 
   const watchlist = await loadWatchlist(chatId, redisUrl, redisToken);
-  const termLower = term.toLowerCase();
-  const updated = watchlist.filter(w => w.term.toLowerCase() !== termLower);
+  const normalized = normalizeWatchTerm(term);
+  const updated = watchlist.filter((entry) => normalizeWatchTerm(entry.normalized || entry.term) !== normalized);
 
   if (updated.length === watchlist.length) {
     return `"${term}" was not on your watchlist.`;

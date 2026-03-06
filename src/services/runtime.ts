@@ -1,7 +1,8 @@
 const DEFAULT_REMOTE_HOSTS: Record<string, string> = {
   tech: 'https://tech.worldmonitor.app',
-  full: 'https://worldmonitor.app',
-  world: 'https://worldmonitor.app',
+  finance: 'https://finance.worldmonitor.app',
+  full: 'https://worldmonitor-two-kappa.vercel.app',
+  world: 'https://worldmonitor-two-kappa.vercel.app',
 };
 
 const DEFAULT_LOCAL_API_BASE = 'http://127.0.0.1:46123';
@@ -82,7 +83,7 @@ export function getRemoteApiBaseUrl(): string {
   }
 
   const variant = import.meta.env.VITE_VARIANT || 'full';
-  return DEFAULT_REMOTE_HOSTS[variant] ?? DEFAULT_REMOTE_HOSTS.full ?? 'https://worldmonitor.app';
+  return DEFAULT_REMOTE_HOSTS[variant] ?? DEFAULT_REMOTE_HOSTS.full ?? 'https://worldmonitor-two-kappa.vercel.app';
 }
 
 export function toRuntimeUrl(path: string): string {

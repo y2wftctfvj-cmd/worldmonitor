@@ -1,44 +1,35 @@
 /**
- * Daily Intelligence Digest — multi-section professional briefing.
+ * Daily Intelligence Digest — reads from monitor-check's cached data.
  *
- * v3.0.0: SitDeck-inspired upgrade. Multi-section briefing with:
- *   - Security overview (from recent monitor-check alerts in Redis)
- *   - Markets & economic (expanded: S&P, Oil, Gold, VIX, BTC, Defense ETF, predictions)
- *   - Cyber threats (CISA advisories)
- *   - Disaster & environmental (GDACS Orange/Red, earthquakes, NASA FIRMS fire data)
- *   - Travel & sanctions (Level 3-4 travel advisories, OFAC changes)
- *   - Signal intelligence (GPS jamming, internet outages)
- *   - Source health (which sources succeeded/failed in last 24h)
- *   - Watchlist summary
+ * v4.0.0: Redis-first approach. Instead of live-fetching 10+ sources under a 25s
+ * edge timeout (where most timeout), the digest reads pre-cached data from the
+ * monitor-check pipeline that runs every 5 minutes.
+ *
+ * Live fetches (fast, ~3s total):
+ *   - Markets: Finnhub -> Yahoo Finance (1s each)
+ *   - Predictions: Polymarket (1s)
+ *
+ * Redis reads (instant, ~1s total):
+ *   - monitor:recent-alerts — last 12h of promoted alerts from the pipeline
+ *   - monitor:source-health — which sources succeeded/failed
+ *   - monitor:digest-cache:{YYYY-MM-DD} — bounded daily cache with top alerts,
+ *     entity counts, and source health from all cycles today
+ *   - watchlist:{chatId} — user's watchlist
+ *
+ * Time budget: 3s fetch + 10s LLM + 5s Telegram = 18s total. 7s headroom.
  *
  * Runs at midnight UTC (configured in vercel.json).
- *
- * Data sources:
- *   Headlines:    GDELT -> Google News RSS (no key)
- *   Markets:      Finnhub -> Yahoo Finance (no key)
- *   Predictions:  Polymarket (free, no key)
- *   New sources:  CISA, GDACS, travel advisories, GPS jamming, NASA FIRMS, OFAC
- *   Redis:        Recent alerts, source health, watchlists
- *   AI:           Qwen 3.5 Plus -> DeepSeek V3.2 -> Groq Llama
  *
  * Required env vars:
  *   CRON_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  * Optional:
  *   FINNHUB_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY,
- *   NASA_FIRMS_API_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+ *   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
  */
 
 export const config = { runtime: 'edge' };
 
 import { fetchGeopoliticalMarkets } from './_tools/prediction-markets.js';
-import {
-  fetchCISAAlerts,
-  fetchTravelAdvisories,
-  fetchNASAFirms,
-  fetchGPSJamming,
-  fetchGDACSAlerts,
-  fetchEarthquakes,
-} from './_tools/monitor-tools.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -54,12 +45,6 @@ const SYMBOL_LABELS = {
 };
 
 const YAHOO_SYMBOLS = { SPY: 'SPY', QQQ: 'QQQ', GLD: 'GLD', USO: 'USO' };
-
-const GDELT_URL =
-  'https://api.gdeltproject.org/api/v2/doc/doc?query=sourcelang:eng&mode=artlist&maxrecords=5&format=json&sort=hybridrel';
-
-const GOOGLE_NEWS_RSS =
-  'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFZxYUdjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en';
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -79,62 +64,46 @@ export default async function handler(request) {
 
   const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
-  const nasaKey = process.env.NASA_FIRMS_API_KEY;
 
-  // Gather all data sources in parallel.
-  // Edge function timeout = 25s. Budget: ~12s fetch + ~10s LLM + 3s overhead.
-  // Wrap slow sources (NASA FIRMS) with tighter timeouts for the digest path.
+  // Timeout helper for live fetches
   const withTimeout = (promise, ms) =>
     Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), ms))]);
 
-  // All external sources get a hard 4s cap for the digest path.
-  // Total parallel fetch budget: ~4s. LLM budget: ~8s. Telegram: ~5s. Overhead: 3s.
-  // Must stay under 25s edge function limit (20s total target).
+  // Fetch live data (markets + predictions only — fast, ~1s each) and Redis data in parallel
+  // Total budget: ~3s for all parallel fetches
   const [
-    headlines, finnhubQuotes, yahooQuotes, predictions,
-    cisaAlerts, travelAdvisories, gdacsAlerts,
-    earthquakes, gpsJamming, nasaFirms,
-    recentAlerts, sourceHealth, watchlists,
+    finnhubQuotes, yahooQuotes, predictions,
+    recentAlerts, sourceHealth, digestCache, watchlists,
   ] = await Promise.allSettled([
-    // Existing sources (capped at 4s each — all run in parallel)
-    withTimeout(fetchHeadlines(), 4000),
+    // Live fetches — only markets + predictions (fast, reliable)
     withTimeout(fetchFinnhubQuotes(), 4000),
     withTimeout(fetchYahooQuotes(), 4000),
     withTimeout(fetchGeopoliticalMarkets(), 4000),
-    // New sources (capped at 4s each)
-    withTimeout(fetchCISAAlerts(), 4000),
-    withTimeout(fetchTravelAdvisories(), 4000),
-    withTimeout(fetchGDACSAlerts(), 4000),
-    withTimeout(fetchEarthquakes(), 4000),
-    withTimeout(fetchGPSJamming(), 4000),
-    withTimeout(fetchNASAFirms(nasaKey), 4000),
-    // Redis data (fast — 2s each)
+    // Redis reads — pre-cached by monitor-check pipeline (instant)
     withTimeout(loadRecentAlertsForDigest(redisUrl, redisToken), 2000),
     withTimeout(loadSourceHealth(redisUrl, redisToken), 2000),
+    withTimeout(loadDigestCache(redisUrl, redisToken), 2000),
     withTimeout(loadWatchlistAlerts(redisUrl, redisToken, chatId), 2000),
   ]);
 
-  // Resolve all data with safe defaults (withTimeout returns null on timeout)
+  // Resolve all data with safe defaults
   const safeValue = (result, fallback) =>
     result.status === 'fulfilled' && result.value != null ? result.value : fallback;
 
   const finnhubData = safeValue(finnhubQuotes, []);
   const yahooData = safeValue(yahooQuotes, []);
   const marketQuotes = finnhubData.length > 0 ? finnhubData : yahooData;
+  const cache = safeValue(digestCache, { topAlerts: [], entityCounts: {}, sourceHealth: null });
 
   const briefingData = {
-    headlines: safeValue(headlines, []),
     marketQuotes,
     predictions: safeValue(predictions, []),
-    cisaAlerts: safeValue(cisaAlerts, []),
-    travelAdvisories: safeValue(travelAdvisories, []),
-    gdacsAlerts: safeValue(gdacsAlerts, []),
-    earthquakes: safeValue(earthquakes, []),
-    gpsJamming: safeValue(gpsJamming, []),
-    nasaFirms: safeValue(nasaFirms, null),
     recentAlerts: safeValue(recentAlerts, []),
     sourceHealth: safeValue(sourceHealth, null),
     watchlists: safeValue(watchlists, []),
+    // From digest cache (populated by monitor-check every 5 min)
+    topAlerts: cache.topAlerts || [],
+    entityCounts: cache.entityCounts || {},
   };
 
   // Generate AI briefing — hard 12s cap so we stay under 25s edge limit
@@ -154,15 +123,11 @@ export default async function handler(request) {
       ok: true,
       chunks: chunks.length,
       sections: {
-        headlines: briefingData.headlines.length,
         markets: briefingData.marketQuotes.length,
         predictions: briefingData.predictions.length,
-        cisaAlerts: briefingData.cisaAlerts.length,
-        travelAdvisories: briefingData.travelAdvisories.length,
-        gdacsAlerts: briefingData.gdacsAlerts.length,
-        gpsJamming: briefingData.gpsJamming.length,
-        nasaFirms: !!briefingData.nasaFirms,
         recentAlerts: briefingData.recentAlerts.length,
+        topAlerts: briefingData.topAlerts.length,
+        entityCount: Object.keys(briefingData.entityCounts).length,
         sourceHealth: !!briefingData.sourceHealth,
         aiBriefing: !!aiBriefing,
       },
@@ -174,58 +139,8 @@ export default async function handler(request) {
 }
 
 // ---------------------------------------------------------------------------
-// Data fetchers — headlines and markets
+// Data fetchers — markets only (everything else comes from Redis cache)
 // ---------------------------------------------------------------------------
-
-async function fetchHeadlines() {
-  // Race GDELT and Google News in parallel — use whichever returns data first
-  const [gdelt, gnews] = await Promise.allSettled([
-    fetchGdeltHeadlines(),
-    fetchGoogleNewsRss(),
-  ]);
-  const gdeltData = gdelt.status === 'fulfilled' ? gdelt.value : [];
-  if (gdeltData.length > 0) return gdeltData;
-  return gnews.status === 'fulfilled' ? gnews.value : [];
-}
-
-async function fetchGdeltHeadlines() {
-  try {
-    const resp = await fetch(GDELT_URL, { signal: AbortSignal.timeout(5_000) });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    return (data?.articles ?? []).slice(0, 5).map((a) => ({
-      title: a.title ?? 'Untitled',
-      url: a.url ?? '',
-    }));
-  } catch (err) {
-    console.error('[daily-digest] GDELT fetch failed:', err.message);
-    return [];
-  }
-}
-
-async function fetchGoogleNewsRss() {
-  try {
-    const resp = await fetch(GOOGLE_NEWS_RSS, { signal: AbortSignal.timeout(5_000) });
-    if (!resp.ok) return [];
-
-    const xml = await resp.text();
-    const items = [];
-    const itemPattern = /<item>[\s\S]*?<\/item>/g;
-    const titlePattern = /<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/;
-    const linkPattern = /<link>(.*?)<\/link>/;
-    let itemMatch;
-    while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 5) {
-      const titleMatch = itemMatch[0].match(titlePattern);
-      const linkMatch = itemMatch[0].match(linkPattern);
-      const title = titleMatch?.[1] || titleMatch?.[2];
-      if (title) items.push({ title, url: linkMatch?.[1] || '' });
-    }
-    return items;
-  } catch (err) {
-    console.error('[daily-digest] Google News RSS failed:', err.message);
-    return [];
-  }
-}
 
 async function fetchFinnhubQuotes() {
   const apiKey = process.env.FINNHUB_API_KEY;
@@ -261,7 +176,7 @@ async function fetchYahooQuotes() {
     const symbols = Object.values(YAHOO_SYMBOLS).join(',');
     const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${symbols}&range=1d&interval=1d`;
     const resp = await fetch(yahooUrl, {
-      headers: { 'User-Agent': 'WorldMonitor/3.0' },
+      headers: { 'User-Agent': 'WorldMonitor/4.0' },
       signal: AbortSignal.timeout(5_000),
     });
     if (!resp.ok) return [];
@@ -296,7 +211,7 @@ async function fetchYahooQuotes() {
 }
 
 // ---------------------------------------------------------------------------
-// Redis loaders — recent alerts, source health, watchlists
+// Redis loaders — recent alerts, source health, digest cache, watchlists
 // ---------------------------------------------------------------------------
 
 async function loadRecentAlertsForDigest(redisUrl, redisToken) {
@@ -332,6 +247,28 @@ async function loadSourceHealth(redisUrl, redisToken) {
   }
 }
 
+/**
+ * Load today's digest cache — bounded daily data from monitor-check cycles.
+ * Contains topAlerts (20), entityCounts (50), sourceHealth snapshot.
+ */
+async function loadDigestCache(redisUrl, redisToken) {
+  if (!redisUrl || !redisToken) return null;
+  try {
+    const dateStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const cacheKey = `monitor:digest-cache:${dateStr}`;
+    const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(cacheKey)}`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data.result) return null;
+    return JSON.parse(data.result);
+  } catch {
+    return null;
+  }
+}
+
 async function loadWatchlistAlerts(redisUrl, redisToken, chatId) {
   if (!redisUrl || !redisToken || !chatId) return [];
   try {
@@ -350,7 +287,7 @@ async function loadWatchlistAlerts(redisUrl, redisToken, chatId) {
 }
 
 // ---------------------------------------------------------------------------
-// AI intelligence briefing — enhanced with all new data
+// AI intelligence briefing — reads from cached data
 // ---------------------------------------------------------------------------
 
 async function generateIntelBriefing(data) {
@@ -358,15 +295,10 @@ async function generateIntelBriefing(data) {
   const groqKey = process.env.GROQ_API_KEY;
   if (!openRouterKey && !groqKey) return null;
 
-  // Build comprehensive data summary for the LLM
+  // Build data summary for the LLM from cached + live data
   const sections = [];
 
-  // Headlines
-  if (data.headlines.length > 0) {
-    sections.push(`HEADLINES:\n${data.headlines.map((h, i) => `${i + 1}. ${h.title}`).join('\n')}`);
-  }
-
-  // Markets
+  // Markets (live)
   if (data.marketQuotes.length > 0) {
     const marketLines = data.marketQuotes.map((q) => {
       const sign = q.changePercent >= 0 ? '+' : '';
@@ -374,12 +306,13 @@ async function generateIntelBriefing(data) {
     });
     sections.push(`MARKETS:\n${marketLines.join('\n')}`);
   }
-  // Predictions
+
+  // Predictions (live)
   if (data.predictions.length > 0) {
     sections.push(`PREDICTION MARKETS:\n${data.predictions.slice(0, 5).map(m => `${m.title}: ${m.probability}%`).join('\n')}`);
   }
 
-  // Recent alerts from monitor pipeline
+  // Recent alerts from monitor pipeline (Redis)
   if (data.recentAlerts.length > 0) {
     const alertSummary = data.recentAlerts
       .slice(-10)
@@ -392,44 +325,38 @@ async function generateIntelBriefing(data) {
     sections.push(`RECENT ALERTS (last 24h):\n${alertSummary}`);
   }
 
-  // CISA
-  if (data.cisaAlerts.length > 0) {
-    sections.push(`CYBER THREATS (CISA):\n${data.cisaAlerts.map(a => `- ${a.title}`).join('\n')}`);
+  // Top alerts from digest cache (Redis — accumulated across all cycles today)
+  if (data.topAlerts.length > 0) {
+    const topSummary = data.topAlerts.slice(0, 10).map(a => {
+      const entityStr = (a.entities || []).join(', ');
+      const sources = a.sourceCount || 0;
+      return `- [${a.severity}] ${entityStr} (conf: ${a.confidence}, ${sources} sources)`;
+    }).join('\n');
+    sections.push(`TOP EVENTS TODAY (from ${data.topAlerts.length} promoted events):\n${topSummary}`);
   }
 
-  // GDACS
-  if (data.gdacsAlerts.length > 0) {
-    sections.push(`DISASTERS (GDACS):\n${data.gdacsAlerts.map(a => `- [${a.alertLevel}] ${a.title}${a.severity ? ` (${a.severity})` : ''}`).join('\n')}`);
+  // Entity activity from digest cache (Redis — frequency counts)
+  const entityEntries = Object.entries(data.entityCounts || {});
+  if (entityEntries.length > 0) {
+    const topEntities = entityEntries
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([entity, count]) => `- ${entity}: ${count} mentions`)
+      .join('\n');
+    sections.push(`ENTITY ACTIVITY (top 15 by frequency):\n${topEntities}`);
   }
 
-  // Earthquakes
-  if (data.earthquakes.length > 0) {
-    sections.push(`EARTHQUAKES:\n${data.earthquakes.map(eq => `- M${(eq.mag || 0).toFixed(1)} — ${eq.place}`).join('\n')}`);
-  }
-
-  // Travel advisories
-  if (data.travelAdvisories.length > 0) {
-    sections.push(`TRAVEL ADVISORIES:\n${data.travelAdvisories.map(a => `- [${a.source}] ${a.title}`).join('\n')}`);
-  }
-
-  // GPS jamming
-  if (data.gpsJamming.length > 0) {
-    sections.push(`GPS JAMMING:\n${data.gpsJamming.map(h => `- ${h.region}: ${h.pctAffected}% aircraft affected`).join('\n')}`);
-  }
-
-  // NASA FIRMS
-  if (data.nasaFirms) {
-    const fireLines = Object.entries(data.nasaFirms).map(([zone, count]) => `- ${zone}: ${count} fire detections`);
-    sections.push(`SATELLITE FIRE DETECTION (NASA FIRMS):\n${fireLines.join('\n')}`);
-  }
-
-  // Source health
+  // Source health (Redis)
   if (data.sourceHealth) {
+    const degraded = Object.entries(data.sourceHealth)
+      .filter(([, v]) => v.status === 'degraded' || v.consecutiveDegraded >= 2)
+      .map(([name, v]) => `- ${name}: degraded (${v.detail || `${v.consecutiveDegraded || 0} empty cycles`})`);
     const failed = Object.entries(data.sourceHealth)
-      .filter(([, v]) => v.consecutiveFailures >= 3)
-      .map(([name, v]) => `- ${name}: ${v.consecutiveFailures} consecutive failures`);
-    if (failed.length > 0) {
-      sections.push(`SOURCE GAPS:\n${failed.join('\n')}`);
+      .filter(([, v]) => v.status === 'failed' || v.consecutiveFailures >= 2)
+      .map(([name, v]) => `- ${name}: ${v.consecutiveFailures || 0} consecutive failures`);
+    const sourceGaps = [...failed, ...degraded];
+    if (sourceGaps.length > 0) {
+      sections.push(`SOURCE GAPS:\n${sourceGaps.join('\n')}`);
     }
   }
 
@@ -439,19 +366,13 @@ async function generateIntelBriefing(data) {
 
 Generate a DAILY INTELLIGENCE BRIEFING with these sections:
 
-1. SECURITY OVERVIEW: Top 3 security events from the last 24h. Lead with the most significant development. Include "SO WHAT" for each.
+1. SECURITY OVERVIEW: Top 3 security events from the last 24h based on the alerts and top events. Lead with the most significant. Include "SO WHAT" for each.
 
-2. MARKETS & ECONOMIC: Key market moves and what they signal. Note any cross-domain connections (e.g., defense stocks up + conflict news).
+2. MARKETS & ECONOMIC: Key market moves and what they signal. Note cross-domain connections (e.g., defense stocks up + conflict news).
 
-3. CYBER THREATS: CISA advisories or active campaigns (if any data provided).
+3. ENTITY ACTIVITY: Which entities dominated today's intelligence cycle and what patterns are visible in the frequency data.
 
-4. DISASTER & ENVIRONMENTAL: GDACS alerts, significant earthquakes, anomalous fire activity (if any).
-
-5. TRAVEL & SANCTIONS: Travel advisory changes, OFAC additions (if any).
-
-6. SIGNAL INTELLIGENCE: GPS jamming hotspots, internet outage patterns (if any).
-
-7. 24-HOUR OUTLOOK: What to watch today with specific, measurable indicators.
+4. 24-HOUR OUTLOOK: What to watch today with specific, measurable indicators.
 
 RULES:
 - Lead each section with the most significant item
@@ -469,6 +390,7 @@ RULES:
     { role: 'user', content: userPrompt },
   ];
 
+  // Provider cascade — try fastest first
   const providers = [];
   if (openRouterKey) {
     providers.push({
@@ -507,7 +429,7 @@ RULES:
           temperature: 0.3,
           max_tokens: 800,
         }),
-        signal: AbortSignal.timeout(5_000),
+        signal: AbortSignal.timeout(8_000),
       });
 
       if (!resp.ok) continue;
@@ -543,7 +465,7 @@ function buildBriefingMessage(data, aiBriefing) {
     parts.push('');
   }
 
-  // MARKETS section
+  // MARKETS section (live data)
   parts.push('*MARKETS \\& ECONOMIC*');
   if (data.marketQuotes.length > 0) {
     for (const quote of data.marketQuotes) {
@@ -557,7 +479,7 @@ function buildBriefingMessage(data, aiBriefing) {
   }
   parts.push('');
 
-  // PREDICTION MARKETS section
+  // PREDICTION MARKETS section (live data)
   if (data.predictions.length > 0) {
     parts.push('*PREDICTION MARKETS*');
     for (const m of data.predictions.slice(0, 5)) {
@@ -566,79 +488,56 @@ function buildBriefingMessage(data, aiBriefing) {
     parts.push('');
   }
 
-  // CYBER THREATS section
-  if (data.cisaAlerts.length > 0) {
-    parts.push('*CYBER THREATS*');
-    for (const alert of data.cisaAlerts.slice(0, 3)) {
-      parts.push(escapeMarkdown(`- ${alert.title}`));
+  // KEY DEVELOPMENTS section (from Redis cache — replaces old headlines/CISA/etc)
+  if (data.recentAlerts.length > 0) {
+    parts.push('*KEY DEVELOPMENTS \\(24h\\)*');
+    const alerts = data.recentAlerts.slice(-5);
+    for (const alert of alerts) {
+      const title = typeof alert === 'string' ? alert : alert.title;
+      const severity = typeof alert === 'object' ? alert.severity : '';
+      const sevLabel = severity ? `[${severity}] ` : '';
+      parts.push(escapeMarkdown(`- ${sevLabel}${title}`));
     }
     parts.push('');
   }
 
-  // DISASTER & ENVIRONMENTAL section
-  const hasDisasterData = data.gdacsAlerts.length > 0 || data.earthquakes.length > 0 || data.nasaFirms;
-  if (hasDisasterData) {
-    parts.push('*DISASTER \\& ENVIRONMENTAL*');
-    for (const alert of data.gdacsAlerts.slice(0, 3)) {
-      parts.push(escapeMarkdown(`[${alert.alertLevel}] ${alert.title}`));
-    }
-    for (const eq of data.earthquakes.slice(0, 3)) {
-      parts.push(escapeMarkdown(`M${(eq.mag || 0).toFixed(1)} — ${eq.place}`));
-    }
-    if (data.nasaFirms) {
-      for (const [zone, count] of Object.entries(data.nasaFirms)) {
-        parts.push(escapeMarkdown(`Fire: ${zone} — ${count} detections`));
-      }
-    }
-    parts.push('');
-  }
-
-  // TRAVEL & SANCTIONS section
-  const hasTravelData = data.travelAdvisories.length > 0;
-  if (hasTravelData) {
-    parts.push('*TRAVEL \\& SANCTIONS*');
-    for (const advisory of data.travelAdvisories.slice(0, 5)) {
-      parts.push(escapeMarkdown(`[L${advisory.level}] ${advisory.title}`));
+  // ENTITY ACTIVITY section (from digest cache)
+  const entityEntries = Object.entries(data.entityCounts || {});
+  if (entityEntries.length > 0) {
+    parts.push('*ENTITY ACTIVITY*');
+    const topEntities = entityEntries
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+    const maxCount = topEntities[0]?.[1] || 1;
+    for (const [entity, count] of topEntities) {
+      // Simple bar chart using block characters
+      const barLen = Math.round((count / maxCount) * 10);
+      const bar = '\u2588'.repeat(barLen) + '\u2591'.repeat(10 - barLen);
+      parts.push(escapeMarkdown(`${entity}: ${bar} ${count}`));
     }
     parts.push('');
   }
 
-  // SIGNAL INTELLIGENCE section
-  if (data.gpsJamming.length > 0) {
-    parts.push('*SIGNAL INTELLIGENCE*');
-    for (const hotspot of data.gpsJamming.slice(0, 3)) {
-      parts.push(escapeMarkdown(`GPS: ${hotspot.region} — ${hotspot.pctAffected}% affected`));
-    }
-    parts.push('');
-  }
-
-  // SOURCE HEALTH section
+  // SOURCE HEALTH section (from Redis)
   if (data.sourceHealth) {
     const healthEntries = Object.entries(data.sourceHealth);
     const okCount = healthEntries.filter(([, v]) => v.status === 'ok').length;
+    const degradedSources = healthEntries
+      .filter(([, v]) => v.status === 'degraded' || v.consecutiveDegraded >= 2)
+      .map(([name]) => name);
     const failedSources = healthEntries
-      .filter(([, v]) => v.consecutiveFailures >= 2)
+      .filter(([, v]) => v.status === 'failed' || v.consecutiveFailures >= 2)
       .map(([name]) => name);
 
     parts.push('*SOURCE HEALTH*');
-    if (failedSources.length > 0) {
-      parts.push(escapeMarkdown(`${okCount}/${healthEntries.length} online | Gaps: ${failedSources.join(', ')}`));
+    const gaps = [...failedSources, ...degradedSources];
+    if (gaps.length > 0) {
+      parts.push(escapeMarkdown(`${okCount}/${healthEntries.length} healthy | Gaps: ${gaps.join(', ')}`));
     } else {
-      parts.push(escapeMarkdown(`${okCount}/${healthEntries.length} sources online — all healthy`));
+      parts.push(escapeMarkdown(`${okCount}/${healthEntries.length} sources healthy — all green`));
     }
     parts.push('');
   }
-
-  // TOP STORIES section
-  parts.push('*TOP STORIES*');
-  if (data.headlines.length > 0) {
-    for (let i = 0; i < data.headlines.length; i++) {
-      parts.push(escapeMarkdown(`${i + 1}. ${data.headlines[i].title}`));
-    }
-  } else {
-    parts.push(escapeMarkdown('No headlines available.'));
-  }
-  parts.push('');
 
   parts.push('_Monitor is watching\\. Sleep well\\._');
   return parts.join('\n');

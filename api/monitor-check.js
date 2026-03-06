@@ -48,152 +48,32 @@ import {
   redisSet,
   loadPreviousRecordIds,
   storeRecordIds,
+  updateWatchlistMatchStats,
 } from './_tools/redis-helpers.js';
 
 import { normalize, cluster, score, promote } from './_tools/evidence-fusion.js';
-import { TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED } from './_tools/source-reliability.js';
+import { getReliability, TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED } from './_tools/source-reliability.js';
 import { createCycleTelemetry, storeTelemetry } from './_tools/telemetry.js';
-
-// ---------------------------------------------------------------------------
-// Human-readable source display names
-// ---------------------------------------------------------------------------
-const SOURCE_DISPLAY_NAMES = {
-  // System sources
-  'headlines': 'Google News',
-  'govFeeds': 'Wire Services',
-  'earthquakes': 'USGS',
-  'outages': 'Cloudflare Radar',
-  'markets': 'Yahoo Finance',
-  'predictions': 'Polymarket',
-  'military': 'GDELT Military',
-  // Telegram — conflict/geopolitical
-  'telegram:intelslava': '@IntelSlava',
-  'telegram:militarysummary': '@MilitarySummary',
-  'telegram:breakingmash': '@BreakingMash',
-  'telegram:legitimniy': '@Legitimniy',
-  'telegram:iranintl_en': '@IranIntl',
-  'telegram:CIG_telegram': '@CIG',
-  'telegram:IntelRepublic': '@IntelRepublic',
-  'telegram:combatftg': '@CombatFootage',
-  'telegram:osintdefender': '@OSINTDefender',
-  'telegram:BellumActaNews': '@BellumActa',
-  'telegram:OsintTv': '@OsintTv',
-  'telegram:GeneralMCNews': '@GeneralMCNews',
-  'telegram:rnintelligence': '@RNIntelligence',
-  'telegram:RVvoenkor': '@RVvoenkor',
-  'telegram:usaperiodical': '@USAPeriodical',
-  // Telegram — mainstream news
-  'telegram:Bloomberg': '@Bloomberg',
-  'telegram:guardian': '@Guardian',
-  'telegram:cnbci': '@CNBC',
-  'telegram:AJENews_Official': '@AlJazeeraEN',
-  'telegram:ajanews': '@AlJazeeraAR',
-  // Telegram — Ukraine/Russia
-  'telegram:KyivIndependent_official': '@KyivIndependent',
-  'telegram:ukrainenowenglish': '@UkraineNow',
-  // Telegram — Israel/Middle East
-  'telegram:idfofficial': '@IDF',
-  'telegram:ILTVNews': '@ILTV',
-  'telegram:TheTimesOfIsrael2022': '@TimesOfIsrael',
-  'telegram:barakravid1': '@BarakRavid',
-  // Reddit — geopolitics
-  'reddit:worldnews': 'r/worldnews',
-  'reddit:geopolitics': 'r/geopolitics',
-  'reddit:osint': 'r/osint',
-  'reddit:CredibleDefense': 'r/CredibleDefense',
-  'reddit:internationalsecurity': 'r/internationalsecurity',
-  'reddit:middleeastwar': 'r/middleeastwar',
-  'reddit:iranpolitics': 'r/iranpolitics',
-  // Reddit — military/defense
-  'reddit:CombatFootage': 'r/CombatFootage',
-  'reddit:WarCollege': 'r/WarCollege',
-  // Reddit — cyber
-  'reddit:netsec': 'r/netsec',
-  'reddit:cybersecurity': 'r/cybersecurity',
-  // Reddit — markets
-  'reddit:wallstreetbets': 'r/wallstreetbets',
-  // Twitter/X OSINT
-  'twitter:IntelDoge': '@IntelDoge',
-  'twitter:sentdefender': '@sentdefender',
-  'twitter:Global_Mil_Info': '@Global_Mil_Info',
-  'twitter:NotWoofers': '@NotWoofers',
-  'twitter:RALee85': '@RALee85',
-  'twitter:Flash_news_ua': '@Flash_news_ua',
-  'twitter:Faytuks': '@Faytuks',
-  // Bluesky OSINT
-  'bluesky:bellingcat': '@bellingcat',
-  'bluesky:conflictnews': '@conflictnews',
-  'bluesky:baboratorium': '@baboratorium',
-  'bluesky:osinttechnical': '@osinttechnical',
-  'bluesky:julianroepcke': '@julianroepcke',
-  // New intelligence sources
-  'cisa': 'CISA Cyber',
-  'travelAdvisory': 'Travel Advisory',
-  'gpsJamming': 'GPS Jamming',
-  'sanctions': 'OFAC Sanctions',
-  'gdacsEnhanced': 'GDACS Alerts',
-};
-
-/**
- * Convert a raw sourceId like "telegram:Bloomberg" to a human-readable name.
- * Falls back to @channel or r/sub format for unknown IDs.
- */
-function formatSourceName(sourceId) {
-  if (SOURCE_DISPLAY_NAMES[sourceId]) return SOURCE_DISPLAY_NAMES[sourceId];
-  if (sourceId.startsWith('telegram:')) return `@${sourceId.split(':')[1]}`;
-  if (sourceId.startsWith('reddit:')) return `r/${sourceId.split(':')[1]}`;
-  if (sourceId.startsWith('twitter:')) return `@${sourceId.split(':')[1]}`;
-  if (sourceId.startsWith('bluesky:')) return `@${sourceId.split(':')[1]}`;
-  return sourceId;
-}
-
-/**
- * Convert a numeric confidence score + severity into a specific label.
- * Includes source count and type info for transparency.
- *
- * @param {number} confidence - Fusion confidence score (0-100)
- * @param {string} severity - Event severity level
- * @param {Object} scoreBreakdown - Score component breakdown
- * @param {string[]} sources - Source IDs contributing to this event
- * @returns {string} Human-readable confidence label
- */
-function getConfidenceLabel(confidence, severity, scoreBreakdown, sources) {
-  const sourceCount = sources ? new Set(sources).size : 0;
-  const sourceTypes = sources ? new Set(sources.map(s => s.split(':')[0])).size : 0;
-
-  if (confidence >= 65) {
-    return `HIGH CONFIDENCE | ${sourceCount} sources, ${sourceTypes} types`;
-  }
-  if (confidence >= 55) {
-    return `BREAKING | ${sourceCount} sources corroborate`;
-  }
-  if (confidence >= 45) {
-    return `MODERATE | ${sourceCount} sources`;
-  }
-  return `LOW | ${sourceCount} sources`;
-}
-
-/**
- * Build compact score breakdown string for alert transparency.
- */
-function formatScoreBreakdown(scoreBreakdown, confidence) {
-  if (!scoreBreakdown) return '';
-  return `Score: rel=${scoreBreakdown.reliability} corr=${scoreBreakdown.corroboration} rec=${scoreBreakdown.recency} xdom=${scoreBreakdown.crossDomain} | ${confidence}/100`;
-}
+import { updateLedger, loadLedgerEntries, computeBaselines } from './_tools/event-ledger.js';
+import { detectAnomalies, detectEscalation, detectConvergence, generateHistoricalContext } from './_tools/intel-analysis.js';
+import { acquireLock, releaseLock } from './_tools/cycle-lock.js';
+import { buildSnapshot, storeSnapshot } from './_tools/snapshot-builder.js';
+import { isDuplicateAlert, loadRecentAlerts, saveRecentAlert } from './_tools/alert-dedup.js';
+import { formatSourceName, sendIntelAlert } from './_tools/alert-sender.js';
+import { loadDevelopingItems, updateDevelopingItems, checkDevelopingAlerts } from './_tools/developing-tracker.js';
+import { buildEvidenceProfile, buildTriggerExplanation } from './_tools/evidence-gate.js';
+import { filterLowSignalRecords } from './_tools/intel-noise.js';
+import { classifySourceResult, mergeSourceHealth } from './_tools/source-health.js';
+import { findCandidateWatchlistMatches } from './_tools/watchlist-utils.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 const LLM_TIMEOUT_MS = 15000; // Edge = 25s total. Budget: collect 6s + LLM 15s + overhead 4s
 const MAX_TOKENS = 1800;  // ~360 words per finding for top 5 candidates
-const SNAPSHOT_TTL_SECONDS = 600; // 10 min — snapshots expire after 2 cycles
-const DEVELOPING_THRESHOLD = 3; // 3 consecutive cycles to trigger "developing" alert
-const MAX_ALERTS_PER_CYCLE = 2; // Max 2 alerts per 5-min cycle — quality over quantity
-const CYCLE_LOCK_KEY = 'monitor:cycle-lock';
-const CYCLE_LOCK_TTL = 30; // seconds — auto-expires if handler crashes
-const RECHECK_KEY = 'monitor:recheck-count';  // Track rapid re-check count per event
-const MAX_RAPID_RECHECKS = 3;                  // Max rapid re-checks before returning to normal cycle
-const RECHECK_DELAY_MS = 60000;                // 60 seconds between rapid re-checks
+const SNAPSHOT_TTL_SECONDS = 900; // 15 min — survives 2 full 5-min cycles with buffer
+const MAX_ALERTS_PER_CYCLE = 3; // Telegram-first workflow: fewer, sharper alerts
+const ENABLE_TWITTER_ALERT_SOURCE = process.env.ENABLE_TWITTER_ALERT_SOURCE === '1';
 
 // ---------------------------------------------------------------------------
 // Main handler
@@ -229,11 +109,17 @@ export default async function handler(request) {
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
   const cloudflareToken = process.env.CLOUDFLARE_API_TOKEN;
 
-  // Overlap protection: acquire a Redis lock so QStash + Vercel cron
-  // can't run concurrent cycles. Lock auto-expires after 30s.
-  const lockAcquired = await acquireLock(redisUrl, redisToken);
+  // Derive cycle timestamp once — all downstream code uses this, not Date.now()
+  // Truncated to 5-min boundary so QStash retries get the same key
+  const cycleNow = Date.now();
+  const cycleTsBoundary = Math.floor(cycleNow / 300000) * 300000;
+  const cycleKey = `cycle:${new Date(cycleTsBoundary).toISOString().replace(/[-:T]/g, '').slice(0, 12)}`;
+
+  // Idempotency: SET NX EX — if key exists, this cycle already ran (or is running)
+  // Prevents QStash retry double-writes and concurrent Vercel cron overlap
+  const lockAcquired = await acquireLock(redisUrl, redisToken, cycleKey);
   if (!lockAcquired) {
-    return jsonResponse(200, { skipped: true, reason: 'Another cycle is already running' });
+    return jsonResponse(200, { skipped: true, reason: 'Cycle already processed', cycleKey });
   }
 
   try {
@@ -242,62 +128,77 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     const telem = createCycleTelemetry();
 
-    const collectResults = await telem.stage('collect', async () => {
-      const results = await Promise.allSettled([
-        fetchGoogleNewsHeadlines(),
-        fetchMarketQuotes(),
-        fetchAllTelegramChannels(),
-        fetchAllRedditPosts(),
-        fetchGeopoliticalMarkets(),
-        fetchEarthquakes(),
-        fetchInternetOutages(cloudflareToken),
-        fetchMilitaryNews(),
-        fetchGovFeeds(),
-        fetchTwitterOsint(),
-        fetchBlueskyOsint(),
-        // New sources (SitDeck-inspired upgrade)
-        fetchCISAAlerts(),
-        fetchTravelAdvisories(),
-        fetchGPSJamming(),
-        fetchOFACSanctions(redisUrl, redisToken),
-        fetchGDACSAlerts(),
-      ]);
-      const [
-        headlines, markets, telegram, reddit, predictions,
-        earthquakes, outages, military, govFeeds, twitter, bluesky,
-        cisaAlerts, travelAdvisories, gpsJamming, sanctions, gdacsEnhanced,
-      ] = results;
-      const totalSources = results.length;
-      const succeeded = results.filter(r => r.status === 'fulfilled').length;
+    const sourceTasks = [
+      { name: 'headlines', fetch: () => fetchGoogleNewsHeadlines() },
+      { name: 'markets', fetch: () => fetchMarketQuotes() },
+      { name: 'telegram', fetch: () => fetchAllTelegramChannels() },
+      { name: 'reddit', fetch: () => fetchAllRedditPosts() },
+      { name: 'predictions', fetch: () => fetchGeopoliticalMarkets() },
+      { name: 'earthquakes', fetch: () => fetchEarthquakes() },
+      { name: 'outages', fetch: () => fetchInternetOutages(cloudflareToken) },
+      { name: 'military', fetch: () => fetchMilitaryNews() },
+      { name: 'govFeeds', fetch: () => fetchGovFeeds() },
+      ENABLE_TWITTER_ALERT_SOURCE
+        ? { name: 'twitter', fetch: () => fetchTwitterOsint() }
+        : { name: 'twitter', disabled: true },
+      { name: 'bluesky', fetch: () => fetchBlueskyOsint() },
+      { name: 'cisaAlerts', fetch: () => fetchCISAAlerts() },
+      { name: 'travelAdvisories', fetch: () => fetchTravelAdvisories() },
+      { name: 'gpsJamming', fetch: () => fetchGPSJamming() },
+      { name: 'sanctions', fetch: () => fetchOFACSanctions(redisUrl, redisToken) },
+      { name: 'gdacsEnhanced', fetch: () => fetchGDACSAlerts() },
+    ];
+
+    const {
+      results: collectResults,
+      assessments: sourceAssessments,
+    } = await telem.stage('collect', async () => {
+      const activeTasks = sourceTasks.filter((task) => !task.disabled);
+      const settled = await Promise.allSettled(activeTasks.map((task) => task.fetch()));
+
+      const results = {};
+      const assessments = {};
+      let succeeded = 0;
+      let degraded = 0;
+      let failed = 0;
+      let disabled = 0;
+      let activeIndex = 0;
+
+      for (const task of sourceTasks) {
+        if (task.disabled) {
+          results[task.name] = { status: 'fulfilled', value: [] };
+          assessments[task.name] = { status: 'degraded', sampleSize: 0, reason: 'disabled_by_default' };
+          degraded++;
+          disabled++;
+          continue;
+        }
+
+        const settledResult = settled[activeIndex++];
+        results[task.name] = settledResult;
+        const assessment = classifySourceResult(task.name, settledResult);
+        assessments[task.name] = assessment;
+
+        if (assessment.status === 'ok') succeeded++;
+        else if (assessment.status === 'degraded') degraded++;
+        else failed++;
+      }
+
       return {
-        _meta: { succeeded, failed: totalSources - succeeded, totalSources },
-        _value: {
-          headlines, markets, telegram, reddit, predictions,
-          earthquakes, outages, military, govFeeds, twitter, bluesky,
-          cisaAlerts, travelAdvisories, gpsJamming, sanctions, gdacsEnhanced,
+        _meta: {
+          succeeded,
+          degraded,
+          failed,
+          disabled,
+          totalSources: sourceTasks.length,
         },
+        _value: { results, assessments },
       };
     });
 
     // -----------------------------------------------------------------------
     // 1b. SOURCE HEALTH — track which sources succeeded/failed
     // -----------------------------------------------------------------------
-    const sourceNames = [
-      'headlines', 'markets', 'telegram', 'reddit', 'predictions',
-      'earthquakes', 'outages', 'military', 'govFeeds', 'twitter', 'bluesky',
-      'cisaAlerts', 'travelAdvisories', 'gpsJamming', 'sanctions', 'gdacsEnhanced',
-    ];
-    const sourceHealth = { succeeded: [], failed: [], degraded: [] };
-    for (const name of sourceNames) {
-      if (collectResults[name]?.status === 'fulfilled') {
-        sourceHealth.succeeded.push(name);
-      } else {
-        sourceHealth.failed.push(name);
-      }
-    }
-
-    // Store source health in Redis for daily digest and gap reporting
-    await updateSourceHealth(redisUrl, redisToken, sourceHealth);
+    const sourceHealth = await updateSourceHealth(redisUrl, redisToken, sourceAssessments);
 
     // -----------------------------------------------------------------------
     // 2. EVIDENCE FUSION — normalize, cluster, score, promote (individually timed)
@@ -309,10 +210,10 @@ export default async function handler(request) {
       loadPreviousRecordIds(redisUrl, redisToken),
       loadDevelopingItems(redisUrl, redisToken),
     ]);
-    const watchlistTerms = watchlists.flatMap(w => w.terms);
+    const watchlistTerms = watchlists.flatMap((watchlist) => watchlist.items?.map((item) => item.term) || watchlist.terms || []);
 
     const records = await telem.stage('normalize', () => {
-      const r = normalize(collectResults);
+      const r = filterLowSignalRecords(normalize(collectResults), watchlistTerms);
       return { _meta: { recordCount: r.length }, _value: r };
     });
 
@@ -327,10 +228,12 @@ export default async function handler(request) {
 
     // Tag watchlist matches before promotion
     const tagged = scored.map(candidate => {
-      const match = (watchlistTerms || []).find(term =>
-        candidate.entities.some(e => e.toLowerCase().includes(term.toLowerCase()))
-      );
-      return { ...candidate, watchlistMatch: match || null };
+      const matches = findCandidateWatchlistMatches(candidate, watchlists);
+      return {
+        ...candidate,
+        watchlistMatches: matches,
+        watchlistMatch: matches[0]?.term || null,
+      };
     });
 
     const allCandidates = await telem.stage('promote', () => {
@@ -342,6 +245,47 @@ export default async function handler(request) {
 
     const promotedCandidates = allCandidates.filter(c => c.severity !== 'routine');
     console.log(`[monitor-check] Fusion: ${records.length} records -> ${allCandidates.length} clusters -> ${promotedCandidates.length} promoted`);
+
+    // -----------------------------------------------------------------------
+    // 2b. LEDGER — persist entity observations for memory + baselines
+    // -----------------------------------------------------------------------
+    await telem.stage('ledger', async () => {
+      await updateLedger(promotedCandidates, cycleKey, cycleTsBoundary, redisUrl, redisToken);
+      return { _meta: { entities: promotedCandidates.flatMap(c => c.entities).length }, _value: null };
+    });
+
+    // -----------------------------------------------------------------------
+    // 2c. ANALYZE — anomaly detection, escalation, convergence, historical context
+    // -----------------------------------------------------------------------
+    let analysisResults = { anomalies: [], escalations: [], convergences: [], historicalContext: [] };
+
+    if (promotedCandidates.length > 0) {
+      analysisResults = await telem.stage('analyze', async () => {
+        // Load ledger data and baselines for entities in this cycle
+        const allEntities = [...new Set(promotedCandidates.flatMap(c => c.entities))];
+        const [ledgerEntries, baselines] = await Promise.all([
+          loadLedgerEntries(allEntities, redisUrl, redisToken),
+          computeBaselines(allEntities, redisUrl, redisToken),
+        ]);
+
+        // Run all four analysis functions (all deterministic, no LLM)
+        const anomalies = detectAnomalies(promotedCandidates, baselines);
+        const escalations = detectEscalation(ledgerEntries);
+        const convergences = detectConvergence(allCandidates); // Uses ALL candidates for domain coverage
+        const historicalContext = generateHistoricalContext(promotedCandidates, ledgerEntries, baselines);
+
+        const results = { anomalies, escalations, convergences, historicalContext };
+        return {
+          _meta: {
+            anomalies: anomalies.length,
+            escalations: escalations.length,
+            convergences: convergences.length,
+            contextLines: historicalContext.length,
+          },
+          _value: results,
+        };
+      });
+    }
 
     // -----------------------------------------------------------------------
     // 3. LLM SUMMARIZE — only for promoted candidates (notable/urgent)
@@ -358,7 +302,8 @@ export default async function handler(request) {
           llmCandidates,
           developingItems,
           openRouterKey,
-          groqKey
+          groqKey,
+          analysisResults
         );
 
         // Build fallback findings for overflow candidates (or all if LLM failed)
@@ -368,16 +313,21 @@ export default async function handler(request) {
             .slice(0, 3)
             .map(r => `[${formatSourceName(r.sourceId)}] ${r.text.substring(0, 200)}`)
             .join('\n');
+          const sourceProfile = c.sourceProfile || buildEvidenceProfile(c.records);
+          const whyTriggered = buildTriggerExplanation(sourceProfile, c.watchlistMatch);
           return {
             severity: c.severity,
-            title: c.entities.slice(0, 3).join(' / ') || 'Unknown event',
+            title: deriveGroundedTitle(c),
             analysis: sampleTexts,
+            why_matters: c.records[0]?.text?.substring(0, 220) || '',
             sources: sourceNames,
             watchlist_match: c.watchlistMatch,
             watch_next: [`${c.records.length} record(s) from ${sourceNames.length} source(s)`, `Score: ${c.confidence}`],
             _confidence: c.confidence,
             _scoreBreakdown: c.scoreBreakdown,
             _entities: c.entities,
+            _sourceProfile: sourceProfile,
+            _whyTriggered: whyTriggered,
           };
         };
 
@@ -401,9 +351,19 @@ export default async function handler(request) {
       let alertsSent = 0;
       let skippedDeveloping = 0;
       let skippedDuplicate = 0;
+      let watchlistHitsUpdated = 0;
 
       if (findings.length > 0) {
         const recentAlerts = await loadRecentAlerts(redisUrl, redisToken);
+        const trustworthyWatchlistMatches = allCandidates
+          .filter((candidate) => candidate.watchlistMatches?.length > 0)
+          .filter((candidate) => candidate.sourceProfile?.passesTrustGate || candidate.sourceProfile?.verifiedSourceCount >= 1)
+          .flatMap((candidate) => candidate.watchlistMatches);
+
+        if (trustworthyWatchlistMatches.length > 0) {
+          await updateWatchlistMatchStats(trustworthyWatchlistMatches, redisUrl, redisToken, cycleTsBoundary);
+          watchlistHitsUpdated = trustworthyWatchlistMatches.length;
+        }
 
         for (const finding of findings) {
           if (!finding || typeof finding !== 'object') continue;
@@ -411,6 +371,7 @@ export default async function handler(request) {
           if (typeof finding.title !== 'string' || finding.title.length === 0) continue;
 
           if (finding.severity === 'routine') continue;
+          if (finding._sourceProfile && finding._sourceProfile.passesTrustGate === false) continue;
 
           // Cap alerts per cycle to prevent notification floods
           if (alertsSent >= MAX_ALERTS_PER_CYCLE) break;
@@ -451,34 +412,15 @@ export default async function handler(request) {
 
           if (alertFinding.severity === 'developing') { skippedDeveloping++; continue; }
 
-          // Dedup — block alerts about stories we already sent.
-          // Uses entity overlap (OR logic) — if we already alerted about Iran,
-          // don't send another Iran alert for the TTL window.
-          // Only exception: genuine severity ESCALATION (notable → urgent).
-          const findingEntities = finding._entities || [];
-          const isDuplicate = recentAlerts.some(recent => {
-            const recentEntities = recent.entities || [];
-            if (recentEntities.length === 0 && findingEntities.length === 0) {
-              // No entities — fall back to title similarity
-              return jaccardSimilarity(finding.title, recent.title) > 0.4;
-            }
-            // Entity overlap — if 50%+ of entities match, it's the same story
-            const overlap = findingEntities.filter(e => recentEntities.includes(e)).length;
-            const minLen = Math.min(findingEntities.length, recentEntities.length);
-            const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
-            if (!entityMatch) return false;
-            // Only let through genuine severity escalation (not same or lower)
-            const SEVERITY_RANK = { routine: 0, developing: 1, notable: 2, breaking: 3, urgent: 4 };
-            const newRank = SEVERITY_RANK[finding.severity] || 0;
-            const oldRank = SEVERITY_RANK[recent.severity] || 0;
-            if (newRank > oldRank) return false; // Escalation — let it through
-            return true; // Same or lower severity = duplicate, block it
-          });
+          const isDuplicate = isDuplicateAlert(alertFinding, recentAlerts);
           if (isDuplicate) { skippedDuplicate++; continue; }
 
           // Add fusion metadata to the alert
           await sendIntelAlert(botToken, chatId, alertFinding);
-          await saveRecentAlert(redisUrl, redisToken, finding.title, finding._entities, alertFinding.severity);
+          // Save only top 5 entities — prevents bloated entity lists from blocking everything
+          const topEntities = (finding._entities || []).slice(0, 5);
+          await saveRecentAlert(redisUrl, redisToken, alertFinding.title, topEntities, alertFinding.severity);
+          recentAlerts.push({ title: alertFinding.title, entities: topEntities, severity: alertFinding.severity });
           alertsSent++;
 
           // Rapid re-check disabled — QStash cascade caused alert floods.
@@ -497,7 +439,7 @@ export default async function handler(request) {
 
       return {
         _meta: { sent: alertsSent },
-        _value: { alertsSent, skippedDeveloping, skippedDuplicate },
+        _value: { alertsSent, skippedDeveloping, skippedDuplicate, watchlistHitsUpdated },
       };
     });
 
@@ -507,11 +449,16 @@ export default async function handler(request) {
     const currentRecordIds = records.map(r => r.id);
     await storeRecordIds(redisUrl, redisToken, currentRecordIds);
 
-    // Also store snapshot for /brief and other features that use it
+    // Store snapshot for /brief and other features that use it
     if (records.length > 0) {
       const currentSnapshot = buildSnapshot(collectResults);
-      await storeSnapshot(redisUrl, redisToken, currentSnapshot);
+      await storeSnapshot(redisUrl, redisToken, currentSnapshot, SNAPSHOT_TTL_SECONDS);
     }
+
+    // -----------------------------------------------------------------------
+    // 5b. DIGEST-CACHE — save bounded daily cache for daily digest
+    // -----------------------------------------------------------------------
+    await updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, sourceHealth, cycleTsBoundary);
 
     // Finalize and store telemetry
     const telemetry = telem.finish();
@@ -521,13 +468,20 @@ export default async function handler(request) {
 
     return jsonResponse(200, {
       ok: true,
+      cycleKey,
       alertsSent: alertResult.alertsSent,
       fusionClusters: allCandidates.length,
       promoted: promotedCandidates.length,
       findings: findings.length,
       skippedDeveloping: alertResult.skippedDeveloping,
       skippedDuplicate: alertResult.skippedDuplicate,
+      watchlistHitsUpdated: alertResult.watchlistHitsUpdated,
       sourceHealth,
+      analysis: {
+        anomalies: analysisResults.anomalies?.length || 0,
+        escalations: analysisResults.escalations?.length || 0,
+        convergences: analysisResults.convergences?.length || 0,
+      },
       telemetry,
     });
   } catch (err) {
@@ -537,188 +491,66 @@ export default async function handler(request) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Cycle lock — prevents overlapping runs from QStash + Vercel cron
-// ---------------------------------------------------------------------------
-
-/**
- * Try to acquire an exclusive lock via Redis SET NX EX.
- * Returns true if lock acquired, false if another cycle holds it.
- */
-async function acquireLock(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return true; // No Redis = no locking, proceed
-
-  try {
-    const resp = await fetch(`${redisUrl}/set/${CYCLE_LOCK_KEY}/1/EX/${CYCLE_LOCK_TTL}/NX`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return true; // Redis error = don't block, proceed
-
-    const data = await resp.json();
-    return data.result === 'OK';
-  } catch {
-    return true; // Network error = don't block, proceed
-  }
-}
-
-/**
- * Release the cycle lock.
- */
-async function releaseLock(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return;
-
-  try {
-    await fetch(`${redisUrl}/del/${CYCLE_LOCK_KEY}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch {
-    // Lock will auto-expire via TTL
-  }
-}
-
-/**
- * Schedule a rapid re-check via QStash if a breaking/urgent alert was sent.
- * Re-runs the same pipeline 60s later to catch follow-up reports and escalation.
- * Max 3 rapid re-checks per event burst, then back to normal 5-min cycle.
- */
-async function scheduleRecheck(redisUrl, redisToken) {
-  const qstashToken = process.env.QSTASH_TOKEN;
-  const cronSecret = process.env.CRON_SECRET;
-  const vercelUrl = process.env.VERCEL_URL;
-  if (!qstashToken || !cronSecret || !vercelUrl) return;
-
-  // Check if we've already hit the rapid re-check limit
-  const recheckCount = await getRecheckCount(redisUrl, redisToken);
-  if (recheckCount >= MAX_RAPID_RECHECKS) {
-    console.log(`[monitor-check] Skipping re-check: already at ${recheckCount}/${MAX_RAPID_RECHECKS} rapid re-checks`);
-    return;
-  }
-
-  try {
-    // Increment re-check counter (auto-expires in 10 min so it resets after the burst)
-    await incrementRecheckCount(redisUrl, redisToken);
-
-    // Schedule QStash callback with delay
-    const targetUrl = `https://${vercelUrl}/api/monitor-check`;
-    const resp = await fetch('https://qstash.upstash.io/v2/publish/' + encodeURIComponent(targetUrl), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${qstashToken}`,
-        'Content-Type': 'application/json',
-        'Upstash-Delay': `${Math.round(RECHECK_DELAY_MS / 1000)}s`,
-        'Upstash-Forward-Authorization': `Bearer ${cronSecret}`,
-      },
-    });
-
-    if (resp.ok) {
-      console.log(`[monitor-check] Scheduled rapid re-check #${recheckCount + 1} in ${RECHECK_DELAY_MS / 1000}s`);
-    } else {
-      console.error(`[monitor-check] QStash re-check failed: ${resp.status}`);
-    }
-  } catch (err) {
-    console.error('[monitor-check] Failed to schedule re-check:', err.message);
-  }
-}
-
-async function getRecheckCount(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return 0;
-  try {
-    const resp = await fetch(`${redisUrl}/get/${RECHECK_KEY}`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return 0;
-    const data = await resp.json();
-    return parseInt(data.result, 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function incrementRecheckCount(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return;
-  try {
-    // INCR + set TTL: counter auto-resets after 10 min (2 normal cycles)
-    await fetch(`${redisUrl}/incr/${RECHECK_KEY}`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    await fetch(`${redisUrl}/expire/${RECHECK_KEY}/600`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-  } catch {
-    // Non-critical — if this fails, worst case we do extra re-checks
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot building — assemble all data into context
-// ---------------------------------------------------------------------------
-
-function buildSnapshot(results) {
-  const sections = [];
-  const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-  sections.push(`TIMESTAMP: ${now}`);
-
-  // Headlines
-  if (results.headlines.status === 'fulfilled' && results.headlines.value) {
-    sections.push(`HEADLINES:\n${results.headlines.value}`);
-  }
-
-  // Markets
-  if (results.markets.status === 'fulfilled' && results.markets.value) {
-    sections.push(`MARKETS:\n${results.markets.value}`);
-  }
-
-  // Telegram OSINT
-  if (results.telegram.status === 'fulfilled' && results.telegram.value?.length > 0) {
-    const posts = results.telegram.value.slice(-20);
-    sections.push(`TELEGRAM OSINT (${posts.length} posts from ${new Set(posts.map(p => p.channel)).size} channels):\n${posts.map(p => `- [${p.channel}] ${p.text}`).join('\n')}`);
-  }
-
-  // Reddit OSINT
-  if (results.reddit.status === 'fulfilled' && results.reddit.value?.length > 0) {
-    const posts = results.reddit.value.slice(0, 15);
-    sections.push(`REDDIT OSINT (${posts.length} posts):\n${posts.map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`).join('\n')}`);
-  }
-
-  // Prediction markets
-  if (results.predictions.status === 'fulfilled' && results.predictions.value?.length > 0) {
-    const markets = results.predictions.value.slice(0, 10);
-    sections.push(`PREDICTION MARKETS (Polymarket):\n${markets.map(m => `- ${m.title}: ${m.probability ?? 'N/A'}% (vol: $${Math.round(m.volume || 0).toLocaleString('en-US')})`).join('\n')}`);
-  }
-
-  // Earthquakes
-  if (results.earthquakes.status === 'fulfilled' && results.earthquakes.value?.length > 0) {
-    sections.push(`EARTHQUAKES:\n${results.earthquakes.value.map(eq => `- M${(eq.mag || 0).toFixed(1)} — ${eq.place} (${eq.time})`).join('\n')}`);
-  }
-
-  // Internet outages
-  if (results.outages.status === 'fulfilled' && results.outages.value?.length > 0) {
-    sections.push(`INTERNET OUTAGES:\n${results.outages.value.map(o => `- ${o.country}: ${o.description}`).join('\n')}`);
-  }
-
-  // Military news
-  if (results.military.status === 'fulfilled' && results.military.value) {
-    const mil = results.military.value;
-    sections.push(`MILITARY NEWS (${mil.count} articles in last 2h):\n${mil.articles.map(a => `- ${a}`).join('\n')}`);
-  }
-
-  // Government/wire feeds
-  if (results.govFeeds.status === 'fulfilled' && results.govFeeds.value?.length > 0) {
-    sections.push(`WIRE SERVICES:\n${results.govFeeds.value.map(f => `- [${f.source}] ${f.title}`).join('\n')}`);
-  }
-
-  return sections.join('\n\n');
-}
 
 // ---------------------------------------------------------------------------
 // AI analysis cycle
 // ---------------------------------------------------------------------------
+
+/**
+ * Build analysis context section for the LLM prompt.
+ * Contains anomalies, convergences, and historical context from deterministic analysis.
+ */
+function buildAnalysisSection(analysisResults) {
+  const sections = [];
+
+  if (analysisResults.anomalies?.length > 0) {
+    const lines = analysisResults.anomalies.map(a =>
+      `- ${a.displayName}: ${a.ratio}x above baseline (${a.currentSources} sources, normally ${a.baselineDaily}/day)`
+    );
+    sections.push(`ANOMALIES DETECTED:\n${lines.join('\n')}`);
+  }
+
+  if (analysisResults.convergences?.length > 0) {
+    const lines = analysisResults.convergences.map(c =>
+      `- ${c.displayName}: signals from ${c.domains.join(' + ')} (${c.domainCount} domains)`
+    );
+    sections.push(`CROSS-DOMAIN CONVERGENCE:\n${lines.join('\n')}`);
+  }
+
+  if (analysisResults.escalations?.length > 0) {
+    const lines = analysisResults.escalations.map(e =>
+      `- ${e.displayName}: severity rising (delta +${e.severityDelta}), ${e.escalationsThisMonth} notable+ events this month`
+    );
+    sections.push(`ESCALATION DETECTED:\n${lines.join('\n')}`);
+  }
+
+  if (analysisResults.historicalContext?.length > 0) {
+    sections.push(`HISTORICAL CONTEXT:\n${analysisResults.historicalContext.map(l => `- ${l}`).join('\n')}`);
+  }
+
+  return sections.length > 0 ? '\n' + sections.join('\n\n') : '';
+}
+
+export function deriveGroundedTitle(candidate) {
+  const bestRecord = candidate?.records
+    ?.filter((record) => record.text && record.text.length > 15)
+    .sort((a, b) => {
+      const relA = getReliability(a.sourceId, a.meta);
+      const relB = getReliability(b.sourceId, b.meta);
+      return (relB?.score || 0) - (relA?.score || 0);
+    })[0];
+
+  if (!bestRecord?.text) {
+    return candidate?.entities?.slice(0, 3).join(', ') + ': developing situation';
+  }
+
+  return bestRecord.text
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/\s+-\s+(Reuters|AP News|Associated Press|BBC News|Bloomberg|The Guardian|Guardian|CNN|CNBC|CBS News|NBC News)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 110);
+}
 
 /**
  * Summarize pre-scored fusion candidates using LLM.
@@ -727,10 +559,13 @@ function buildSnapshot(results) {
  * It does NOT set severity or confidence — those come from the fusion engine.
  * This cuts LLM input tokens by ~60% vs the old full-dump approach.
  */
-async function summarizeCandidates(promotedCandidates, developingItems, openRouterKey, groqKey) {
+async function summarizeCandidates(promotedCandidates, developingItems, openRouterKey, groqKey, analysisResults) {
   const developingSection = developingItems.length > 0
     ? `\nDEVELOPING ITEMS FROM PREVIOUS CYCLES:\n${developingItems.map(d => `- "${d.topic}" (${d.count} consecutive cycles)`).join('\n')}`
     : '';
+
+  // Build analysis context from deterministic intel analysis
+  const analysisSection = buildAnalysisSection(analysisResults || {});
 
   // Build compact candidate summaries for the LLM
   const candidateSummaries = promotedCandidates.map((c, i) => {
@@ -747,36 +582,46 @@ Sample records:
 ${sampleTexts}`;
   }).join('\n\n');
 
-  const analysisPrompt = `These events have been pre-scored by the evidence fusion system.
-For each event, write:
-1. A short headline title (5-10 words) — specific actors and actions, not vague topics
-2. A 3-5 sentence analysis structured as: WHAT happened (cite specific facts from records) -> WHY it matters (context) -> SO WHAT (implications)
-3. 2-3 specific, measurable indicators to watch next
+  const analysisPrompt = `You are writing intelligence alert headlines and analysis. Read the SOURCE RECORDS below and write:
 
-Reference specific details from source records — names, numbers, locations, times.
-Do NOT change the severity — it has been set by the scoring system.
+1. A NEWS HEADLINE title (5-10 words) — describe WHAT HAPPENED, name specific actors and actions
+2. A 3-5 sentence analysis: SITUATION (cite facts from records) -> ASSESSMENT (meaning) -> IMPLICATIONS (consequences)
+3. A single-sentence WHY IT MATTERS summary
+4. 2-3 specific, measurable indicators to watch next
+
+PRE-SCORED EVENTS WITH SOURCE RECORDS:
+${candidateSummaries}
 ${developingSection}
 
-PRE-SCORED EVENTS:
-${candidateSummaries}
+ADDITIONAL CONTEXT (reference in assessment section, NEVER use in titles):
+${analysisSection || 'No anomaly or escalation data available.'}
 
 OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
 {
   "findings": [
     {
-      "title": "Short headline with specific actors/actions",
-      "analysis": "3-5 sentences: WHAT (specific facts from records) -> WHY it matters -> SO WHAT (implications)",
+      "title": "Actor Does Action in Location",
+      "analysis": "SITUATION: [what happened, cite sources]. ASSESSMENT: [what this means]. IMPLICATIONS: [consequences].",
+      "why_matters": "Short sentence on why this matters now.",
       "watch_next": ["specific measurable indicator", "concrete trigger to monitor"]
     }
   ]
 }
 
-RULES:
+TITLE RULES (CRITICAL):
+- Titles MUST describe an EVENT, not a statistic. Write it like a Reuters headline.
+- GOOD: "Israel Strikes Iranian Nuclear Facilities", "Pakistan Bombs Taliban Positions in Kabul"
+- BAD: "Iran's Anomaly: 5x above baseline", "Macron Escalation Detected", "Multiple Sources Report Activity"
+- BAD: Any title containing "anomaly", "baseline", "escalation", "convergence", or "sources"
+- Title = WHAT HAPPENED. Not a description of our system's analysis.
+
+OTHER RULES:
 - Output exactly ${promotedCandidates.length} findings, one per event, in the same order.
-- Keep titles consistent across cycles. Use consistent topic-level names.
+- Reference specific details from source records — names, numbers, locations, times.
+- Do NOT change the severity — it has been set by the scoring system.
 - Telegram-only claims should note "UNVERIFIED" in analysis.
-- watch_next must be specific and observable. BAD: "further developments", "situation escalation". GOOD: "IAEA Board emergency session", "Brent crude above $92/bbl".
-- Never use these phrases: "situation developing", "remains to be seen", "could potentially escalate", "bears watching".`;
+- watch_next must be specific. BAD: "further developments". GOOD: "IAEA Board emergency session".
+- Never use: "situation developing", "remains to be seen", "could potentially escalate", "bears watching".`;
 
   const messages = [
     { role: 'system', content: `You are Monitor, a senior intelligence analyst writing alerts for a geopolitical dashboard.
@@ -853,20 +698,28 @@ Output ONLY valid JSON. No markdown fences.` },
 
       // Merge LLM output back into fusion candidates
       // LLM provides title + analysis + watch_next; fusion provides severity, sources, confidence
+      // Analysis provides anomalies, escalations, convergences for each entity
       const mergedFindings = promotedCandidates.map((candidate, i) => {
         const llmFinding = parsed.findings?.[i] || {};
         const sources = [...new Set(candidate.records.map(r => r.sourceId))];
+        const sourceProfile = candidate.sourceProfile || buildEvidenceProfile(candidate.records);
+        const whyTriggered = buildTriggerExplanation(sourceProfile, candidate.watchlistMatch);
+        const title = deriveGroundedTitle(candidate);
 
         return {
           severity: candidate.severity,
-          title: llmFinding.title || candidate.entities.slice(0, 3).join(' / '),
+          title,
           analysis: llmFinding.analysis || '',
+          why_matters: llmFinding.why_matters || '',
           sources,
           watchlist_match: candidate.watchlistMatch,
           watch_next: llmFinding.watch_next || [],
           _confidence: candidate.confidence,
           _scoreBreakdown: candidate.scoreBreakdown,
           _entities: candidate.entities,
+          _analysis: analysisResults || {},
+          _sourceProfile: sourceProfile,
+          _whyTriggered: whyTriggered,
         };
       });
 
@@ -888,319 +741,7 @@ Output ONLY valid JSON. No markdown fences.` },
   return { findings: null, errors: llmErrors };
 }
 
-// ---------------------------------------------------------------------------
-// Smart alert formatting
-// ---------------------------------------------------------------------------
 
-async function sendIntelAlert(botToken, chatId, finding) {
-  const severityEmoji = {
-    urgent: '\u{1F534}',    // red circle
-    breaking: '\u{1F534}',  // red circle — breaking is nearly as serious as urgent
-    notable: '\u{1F7E1}',   // yellow circle
-    developing: '\u{1F4E1}', // satellite
-  };
-
-  const emoji = severityEmoji[finding.severity] || '\u{1F7E1}';
-  const confidenceLabel = finding._confidence != null
-    ? getConfidenceLabel(finding._confidence, finding.severity, finding._scoreBreakdown, finding.sources)
-    : finding.severity.toUpperCase();
-
-  // Clean source names for display
-  const displaySources = Array.isArray(finding.sources)
-    ? [...new Set(finding.sources.map(s => formatSourceName(s)))]
-    : [];
-
-  const parts = [
-    `${emoji} *${escapeMarkdown(finding.severity.toUpperCase())}* \\| ${escapeMarkdown(confidenceLabel)}`,
-    `*${escapeMarkdown(finding.title)}*`,
-    '',
-  ];
-
-  if (finding.analysis) {
-    parts.push(escapeMarkdown(finding.analysis));
-    parts.push('');
-  }
-
-  if (displaySources.length > 0) {
-    parts.push(`_${escapeMarkdown(displaySources.join(' \u00b7 '))}_`);
-  }
-
-  if (finding.watchlist_match) {
-    parts.push(`\u{1F50D} _Watchlist: "${escapeMarkdown(finding.watchlist_match)}"_`);
-  }
-
-  if (finding.watch_next && finding.watch_next.length > 0) {
-    parts.push('');
-    parts.push('*Next indicators:*');
-    for (const indicator of finding.watch_next) {
-      parts.push(`  \\> ${escapeMarkdown(indicator)}`);
-    }
-  }
-
-  // Score transparency — compact breakdown so user understands WHY this rating
-  if (finding._scoreBreakdown && finding._confidence != null) {
-    parts.push('');
-    parts.push(`_${escapeMarkdown(formatScoreBreakdown(finding._scoreBreakdown, finding._confidence))}_`);
-  }
-
-  const text = parts.join('\n');
-
-  const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const resp = await fetch(telegramUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: 'MarkdownV2',
-      disable_web_page_preview: true,
-    }),
-    signal: AbortSignal.timeout(5000),
-  });
-
-  if (!resp.ok) {
-    // Retry without markdown on parse failure
-    const errBody = await resp.text();
-    if (resp.status === 400 && errBody.includes("can't parse")) {
-      const plainSources = (finding.sources || []).map(s => formatSourceName(s)).join(' \u00b7 ');
-      const confLabel = finding._confidence != null ? `\n\n${getConfidenceLabel(finding._confidence)}` : '';
-      const plainText = `${finding.severity.toUpperCase()} — ${finding.title}\n\n${finding.analysis || ''}\n\n${plainSources}${confLabel}`;
-      await fetch(telegramUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: plainText,
-          disable_web_page_preview: true,
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
-    } else {
-      console.error('[monitor-check] Telegram API error:', resp.status, errBody);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Developing items tracking
-// ---------------------------------------------------------------------------
-
-async function loadDevelopingItems(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return [];
-  try {
-    const resp = await fetch(`${redisUrl}/get/monitor:developing`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    if (!data.result) return [];
-    return JSON.parse(data.result);
-  } catch {
-    return [];
-  }
-}
-
-async function updateDevelopingItems(findings, redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return;
-
-  const existing = await loadDevelopingItems(redisUrl, redisToken);
-  const now = Date.now();
-
-  // Build updated list — use fuzzy matching (Jaccard OR entity overlap) instead of exact title
-  const developingFindings = findings.filter(f => f.severity === 'developing');
-  const matchedFindingIndices = new Set();
-
-  let updated = existing.map(d => {
-    const dEntities = d.entities || [];
-    const matchIdx = developingFindings.findIndex((f, i) => {
-      if (matchedFindingIndices.has(i)) return false;
-      // Fuzzy title match
-      if (jaccardSimilarity(f.title, d.topic) > 0.35) return true;
-      // Entity overlap match — same entities = same story
-      const fEntities = f._entities || [];
-      if (fEntities.length === 0 || dEntities.length === 0) return false;
-      const overlap = fEntities.filter(e => dEntities.includes(e)).length;
-      const minLen = Math.min(fEntities.length, dEntities.length);
-      return minLen > 0 && (overlap / minLen) > 0.5;
-    });
-
-    if (matchIdx >= 0) {
-      matchedFindingIndices.add(matchIdx);
-      const match = developingFindings[matchIdx];
-      // Merge entities from the new finding
-      const mergedEntities = [...new Set([...dEntities, ...(match._entities || [])])];
-      return { ...d, count: d.count + 1, lastSeen: now, entities: mergedEntities };
-    }
-    return d;
-  });
-
-  // Add new developing items not already tracked
-  for (let i = 0; i < developingFindings.length; i++) {
-    if (matchedFindingIndices.has(i)) continue;
-    const finding = developingFindings[i];
-    updated = [...updated, {
-      topic: finding.title,
-      count: 1,
-      lastSeen: now,
-      entities: finding._entities || [],
-      alerted: false,
-    }];
-  }
-
-  // Remove items not seen in last 30 min (6 cycles)
-  const thirtyMinAgo = now - 30 * 60 * 1000;
-  const active = updated.filter(d => d.lastSeen > thirtyMinAgo);
-
-  try {
-    await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(active), 3600);
-  } catch (err) {
-    console.error('[monitor-check] Failed to save developing items:', err.message);
-  }
-}
-
-async function checkDevelopingAlerts(botToken, chatId, redisUrl, redisToken) {
-  const developing = await loadDevelopingItems(redisUrl, redisToken);
-  const recentAlerts = await loadRecentAlerts(redisUrl, redisToken);
-  let anyAlerted = false;
-
-  for (const item of developing) {
-    // Skip items already alerted — never re-trigger
-    if (item.alerted) continue;
-    if (item.count < DEVELOPING_THRESHOLD) continue;
-
-    // Dedup: Jaccard on title OR entity overlap (same as main alert path)
-    const itemEntities = item.entities || [];
-    const isDuplicate = recentAlerts.some(recent => {
-      const titleMatch = jaccardSimilarity(item.topic, recent.title) > 0.4;
-      const recentEntities = recent.entities || [];
-      if (recentEntities.length === 0 || itemEntities.length === 0) return titleMatch;
-      const overlap = itemEntities.filter(e => recentEntities.includes(e)).length;
-      const minLen = Math.min(itemEntities.length, recentEntities.length);
-      const entityMatch = minLen > 0 && (overlap / minLen) > 0.5;
-      return titleMatch || entityMatch;
-    });
-    if (isDuplicate) {
-      // Mark as alerted so we don't re-check every cycle
-      item.alerted = true;
-      anyAlerted = true;
-      continue;
-    }
-
-    await sendIntelAlert(botToken, chatId, {
-      severity: 'developing',
-      title: item.topic,
-      analysis: `This has been building for ${item.count * 5} minutes across ${item.count} analysis cycles. No mainstream trigger yet, but the pattern is consistent.`,
-      sources: ['multi-cycle analysis'],
-      watchlist_match: null,
-      watch_next: [
-        'Confirmation from wire services or mainstream media',
-        `Increase beyond ${item.count} consecutive detection cycles`,
-      ],
-    });
-
-    await saveRecentAlert(redisUrl, redisToken, item.topic, itemEntities);
-    item.alerted = true;
-    anyAlerted = true;
-  }
-
-  // Persist alerted flags back to Redis
-  if (anyAlerted) {
-    try {
-      await redisSet(redisUrl, redisToken, 'monitor:developing', JSON.stringify(developing), 3600);
-    } catch (err) {
-      console.error('[monitor-check] Failed to save developing alerted flags:', err.message);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Redis snapshot storage
-// ---------------------------------------------------------------------------
-
-async function storeSnapshot(redisUrl, redisToken, snapshot) {
-  if (!redisUrl || !redisToken) return;
-
-  try {
-    // Truncate snapshot if too large for Redis (max ~1MB for free tier)
-    if (snapshot.length > 500000) {
-      console.warn(`[monitor-check] Snapshot truncated: ${snapshot.length} → 500000 chars (${Math.round((snapshot.length - 500000) / 1000)}KB lost)`);
-    }
-    const truncated = snapshot.length > 500000 ? snapshot.slice(0, 500000) : snapshot;
-    await redisSet(redisUrl, redisToken, 'monitor:snapshot', truncated, SNAPSHOT_TTL_SECONDS);
-  } catch (err) {
-    console.error('[monitor-check] Failed to store snapshot:', err.message);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Similarity-based deduplication
-// ---------------------------------------------------------------------------
-
-const RECENT_ALERTS_KEY = 'monitor:recent-alerts';
-const RECENT_ALERTS_TTL = 21600; // 6 hours — stories persist longer than 2h
-const MAX_RECENT_ALERTS = 100;
-
-/**
- * Jaccard word similarity — compares word overlap between two strings.
- * Returns 0.0 (no overlap) to 1.0 (identical words).
- * Zero dependencies, fast, works well for short alert titles.
- */
-function jaccardSimilarity(a, b) {
-  const wordsA = new Set(a.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2));
-  const wordsB = new Set(b.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2));
-  if (wordsA.size === 0 || wordsB.size === 0) return 0;
-
-  let intersection = 0;
-  for (const word of wordsA) {
-    if (wordsB.has(word)) intersection++;
-  }
-
-  const union = new Set([...wordsA, ...wordsB]).size;
-  return union === 0 ? 0 : intersection / union;
-}
-
-/**
- * Load recent alerts from Redis (last 50, 2h TTL).
- * Returns array of { title, entities } objects.
- * Backward-compatible: handles old format (string[]) gracefully.
- */
-async function loadRecentAlerts(redisUrl, redisToken) {
-  if (!redisUrl || !redisToken) return [];
-  try {
-    const resp = await fetch(`${redisUrl}/get/${RECENT_ALERTS_KEY}`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!resp.ok) return [];
-    const data = await resp.json();
-    if (!data.result) return [];
-    const parsed = JSON.parse(data.result);
-    if (!Array.isArray(parsed)) return [];
-    // Handle old format (string[]) — convert to { title, entities }
-    return parsed.map(item =>
-      typeof item === 'string' ? { title: item, entities: [] } : item
-    );
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Save a new alert to the recent alerts list with title + entities.
- */
-async function saveRecentAlert(redisUrl, redisToken, title, entities, severity) {
-  if (!redisUrl || !redisToken) return;
-  try {
-    const existing = await loadRecentAlerts(redisUrl, redisToken);
-    // Flat 12-hour TTL — all severities. Don't re-alert about the same story.
-    const ttl = 43200;
-    const updated = [...existing, { title, entities: entities || [], severity: severity || 'notable' }].slice(-MAX_RECENT_ALERTS);
-    await redisSet(redisUrl, redisToken, RECENT_ALERTS_KEY, JSON.stringify(updated), ttl);
-  } catch (err) {
-    console.error('[monitor-check] Failed to save recent alert:', err.message);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Source health tracking — intelligence gap reporting
@@ -1208,11 +749,11 @@ async function saveRecentAlert(redisUrl, redisToken, title, entities, severity) 
 
 /**
  * Track per-source health across cycles in Redis.
- * Stores a hash map: sourceId -> { status, lastSuccess, consecutiveFailures }.
+ * Stores a hash map: sourceId -> { status, lastSuccessAt, lastNonEmptyAt, ... }.
  * TTL: 24 hours (for daily digest).
  */
-async function updateSourceHealth(redisUrl, redisToken, sourceHealth) {
-  if (!redisUrl || !redisToken) return;
+async function updateSourceHealth(redisUrl, redisToken, sourceAssessments) {
+  if (!redisUrl || !redisToken) return {};
 
   try {
     // Load existing health data
@@ -1226,41 +767,92 @@ async function updateSourceHealth(redisUrl, redisToken, sourceHealth) {
       if (data.result) existing = JSON.parse(data.result);
     }
 
-    const now = Date.now();
-
-    // Update health for succeeded sources
-    for (const name of sourceHealth.succeeded) {
-      existing[name] = {
-        status: 'ok',
-        lastSuccess: now,
-        consecutiveFailures: 0,
-      };
-    }
-
-    // Update health for failed sources
-    for (const name of sourceHealth.failed) {
-      const prev = existing[name] || {};
-      existing[name] = {
-        status: 'failed',
-        lastSuccess: prev.lastSuccess || 0,
-        consecutiveFailures: (prev.consecutiveFailures || 0) + 1,
-      };
-    }
+    const merged = mergeSourceHealth(existing, sourceAssessments, Date.now());
 
     // Store with 24h TTL
-    await redisSet(redisUrl, redisToken, 'monitor:source-health', JSON.stringify(existing), 86400);
+    await redisSet(redisUrl, redisToken, 'monitor:source-health', JSON.stringify(merged), 86400);
+    return merged;
   } catch {
     // Non-critical — don't block the cycle
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Digest cache — bounded daily cache for the daily digest
+// ---------------------------------------------------------------------------
+
+/**
+ * Save cycle data to a per-day digest cache key for the daily digest to read.
+ * Bounded: top 20 alerts, top 50 entities, latest source health.
+ * TTL: 48h (timezone edge safety).
+ */
+async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, currentSourceHealth, cycleTs) {
+  if (!redisUrl || !redisToken) return;
+
+  try {
+    const dateStr = new Date(cycleTs).toISOString().slice(0, 10); // YYYY-MM-DD
+    const cacheKey = `monitor:digest-cache:${dateStr}`;
+    const DIGEST_CACHE_TTL = 172800; // 48h
+
+    // Load existing cache for today (if any)
+    let existing = { topAlerts: [], entityCounts: {}, sourceHealth: null };
+    try {
+      const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(cacheKey)}`, {
+        headers: { Authorization: `Bearer ${redisToken}` },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.result) existing = JSON.parse(data.result);
+      }
+    } catch {
+      // Start fresh if cache is corrupted
+    }
+
+    // Append promoted candidates to topAlerts (capped at 20, sorted by confidence)
+    const newAlerts = promotedCandidates.map(c => ({
+      entities: c.entities.slice(0, 5),
+      severity: c.severity,
+      confidence: c.confidence,
+      sourceCount: new Set(c.records.map(r => r.sourceId)).size,
+      sourceTypes: [...new Set(c.records.map(r => r.sourceId.split(':')[0]))],
+      ts: cycleTs,
+    }));
+    const allAlerts = [...(existing.topAlerts || []), ...newAlerts]
+      .sort((a, b) => b.confidence - a.confidence)
+      .slice(0, 20);
+
+    // Accumulate entity counts (top 50 by frequency)
+    const entityCounts = { ...(existing.entityCounts || {}) };
+    for (const candidate of allCandidates) {
+      for (const entity of candidate.entities) {
+        entityCounts[entity] = (entityCounts[entity] || 0) + 1;
+      }
+    }
+    // Keep only top 50 entities
+    const sortedEntities = Object.entries(entityCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 50);
+    const trimmedEntityCounts = Object.fromEntries(sortedEntities);
+
+    // Latest source health (overwritten each cycle, not accumulated)
+    const cache = {
+      topAlerts: allAlerts,
+      entityCounts: trimmedEntityCounts,
+      sourceHealth: currentSourceHealth,
+      lastCycleTs: cycleTs,
+    };
+
+    await redisSet(redisUrl, redisToken, cacheKey, JSON.stringify(cache), DIGEST_CACHE_TTL);
+  } catch (err) {
+    console.error('[monitor-check] Failed to update digest cache:', err.message);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-
-function escapeMarkdown(text) {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
-}
 
 function jsonResponse(status, body) {
   return new Response(JSON.stringify(body), {

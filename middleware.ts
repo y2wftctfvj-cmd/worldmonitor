@@ -11,6 +11,7 @@ const SOCIAL_PREVIEW_UA =
   /twitterbot|facebookexternalhit|linkedinbot|slackbot|telegrambot|whatsapp|discordbot|redditbot/i;
 
 const SOCIAL_PREVIEW_PATHS = new Set(['/api/story', '/api/og-story']);
+const PUBLIC_API_PATHS = new Set(['/api/version', '/api/download', '/api/fwdstart']);
 
 // Slack uses Slack-ImgProxy to fetch OG images — distinct from Slackbot
 const SOCIAL_IMAGE_UA =
@@ -28,6 +29,10 @@ export default function middleware(request: Request) {
 
   // Allow cron/scheduled endpoints — QStash and Vercel cron use bot-like UAs
   if (path === '/api/monitor-check' || path === '/api/daily-digest') {
+    return;
+  }
+
+  if (PUBLIC_API_PATHS.has(path)) {
     return;
   }
 

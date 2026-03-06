@@ -121,7 +121,7 @@ export default async function handler(request: Request): Promise<Response> {
   try {
     corsHeaders = getCorsHeaders(request);
   } catch {
-    corsHeaders = { 'Access-Control-Allow-Origin': 'https://worldmonitor.app', 'Vary': 'Origin' };
+    corsHeaders = { 'Access-Control-Allow-Origin': 'https://worldmonitor-two-kappa.vercel.app', 'Vary': 'Origin' };
   }
 
   // OPTIONS preflight
