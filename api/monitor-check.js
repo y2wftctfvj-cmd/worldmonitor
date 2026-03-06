@@ -65,6 +65,13 @@ import { buildEvidenceProfile, buildTriggerExplanation } from './_tools/evidence
 import { filterLowSignalRecords } from './_tools/intel-noise.js';
 import { classifySourceResult, mergeSourceHealth } from './_tools/source-health.js';
 import { findCandidateWatchlistMatches } from './_tools/watchlist-utils.js';
+import {
+  buildCandidateSupport,
+  buildCandidateChangeSummary,
+  buildCandidateUncertaintySummary,
+  buildCandidateFactLine,
+  buildEvidenceNarrative,
+} from './_tools/alert-enrichment.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -313,22 +320,11 @@ export default async function handler(request) {
             .slice(0, 3)
             .map(r => `[${formatSourceName(r.sourceId)}] ${r.text.substring(0, 200)}`)
             .join('\n');
-          const sourceProfile = c.sourceProfile || buildEvidenceProfile(c.records);
-          const whyTriggered = buildTriggerExplanation(sourceProfile, c.watchlistMatch);
-          return {
-            severity: c.severity,
-            title: deriveGroundedTitle(c),
+          return buildStructuredFinding(c, {
             analysis: sampleTexts,
             why_matters: c.records[0]?.text?.substring(0, 220) || '',
-            sources: sourceNames,
-            watchlist_match: c.watchlistMatch,
             watch_next: [`${c.records.length} record(s) from ${sourceNames.length} source(s)`, `Score: ${c.confidence}`],
-            _confidence: c.confidence,
-            _scoreBreakdown: c.scoreBreakdown,
-            _entities: c.entities,
-            _sourceProfile: sourceProfile,
-            _whyTriggered: whyTriggered,
-          };
+          }, analysisResults);
         };
 
         const overflowFindings = overflowCandidates.map(buildFallback);
@@ -552,6 +548,36 @@ export function deriveGroundedTitle(candidate) {
     .slice(0, 110);
 }
 
+function buildStructuredFinding(candidate, llmFinding = {}, analysisResults = {}) {
+  const sources = [...new Set(candidate.records.map((record) => record.sourceId))];
+  const sourceProfile = candidate.sourceProfile || buildEvidenceProfile(candidate.records);
+  const whyTriggered = buildTriggerExplanation(sourceProfile, candidate.watchlistMatch);
+  const support = buildCandidateSupport(candidate);
+
+  return {
+    severity: candidate.severity,
+    title: deriveGroundedTitle(candidate),
+    fact_line: buildCandidateFactLine(candidate, llmFinding.fact_line || ''),
+    analysis: llmFinding.analysis || '',
+    why_matters: llmFinding.why_matters || llmFinding.why_now || '',
+    why_i_believe: buildEvidenceNarrative({ support, _sourceProfile: sourceProfile }),
+    what_changed: buildCandidateChangeSummary(candidate),
+    uncertainty: buildCandidateUncertaintySummary(candidate, llmFinding.uncertainty || ''),
+    sources,
+    support,
+    watchlist_match: candidate.watchlistMatch,
+    watch_next: Array.isArray(llmFinding.watch_next)
+      ? llmFinding.watch_next.filter((item) => typeof item === 'string' && item.trim()).slice(0, 4)
+      : [],
+    _confidence: candidate.confidence,
+    _scoreBreakdown: candidate.scoreBreakdown,
+    _entities: candidate.entities,
+    _analysis: analysisResults || {},
+    _sourceProfile: sourceProfile,
+    _whyTriggered: whyTriggered,
+  };
+}
+
 /**
  * Summarize pre-scored fusion candidates using LLM.
  *
@@ -582,12 +608,13 @@ Sample records:
 ${sampleTexts}`;
   }).join('\n\n');
 
-  const analysisPrompt = `You are writing intelligence alert headlines and analysis. Read the SOURCE RECORDS below and write:
+  const analysisPrompt = `You are writing intelligence alert briefs. Read the SOURCE RECORDS below and write:
 
-1. A NEWS HEADLINE title (5-10 words) — describe WHAT HAPPENED, name specific actors and actions
+1. A single-sentence FACT LINE — concrete, factual, and anchored in the strongest reporting
 2. A 3-5 sentence analysis: SITUATION (cite facts from records) -> ASSESSMENT (meaning) -> IMPLICATIONS (consequences)
 3. A single-sentence WHY IT MATTERS summary
-4. 2-3 specific, measurable indicators to watch next
+4. A single-sentence UNCERTAINTY line — what is not confirmed yet
+5. 2-3 specific, measurable indicators to watch next
 
 PRE-SCORED EVENTS WITH SOURCE RECORDS:
 ${candidateSummaries}
@@ -600,26 +627,21 @@ OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
 {
   "findings": [
     {
-      "title": "Actor Does Action in Location",
+      "fact_line": "Single factual sentence anchored in the source records.",
       "analysis": "SITUATION: [what happened, cite sources]. ASSESSMENT: [what this means]. IMPLICATIONS: [consequences].",
       "why_matters": "Short sentence on why this matters now.",
+      "uncertainty": "Short sentence on what remains unconfirmed.",
       "watch_next": ["specific measurable indicator", "concrete trigger to monitor"]
     }
   ]
 }
 
-TITLE RULES (CRITICAL):
-- Titles MUST describe an EVENT, not a statistic. Write it like a Reuters headline.
-- GOOD: "Israel Strikes Iranian Nuclear Facilities", "Pakistan Bombs Taliban Positions in Kabul"
-- BAD: "Iran's Anomaly: 5x above baseline", "Macron Escalation Detected", "Multiple Sources Report Activity"
-- BAD: Any title containing "anomaly", "baseline", "escalation", "convergence", or "sources"
-- Title = WHAT HAPPENED. Not a description of our system's analysis.
-
 OTHER RULES:
 - Output exactly ${promotedCandidates.length} findings, one per event, in the same order.
 - Reference specific details from source records — names, numbers, locations, times.
-- Do NOT change the severity — it has been set by the scoring system.
 - Telegram-only claims should note "UNVERIFIED" in analysis.
+- FACT LINE must be a plain factual sentence, not analysis or speculation.
+- UNCERTAINTY must describe what is still unknown, not repeat the confirmed facts.
 - watch_next must be specific. BAD: "further developments". GOOD: "IAEA Board emergency session".
 - Never use: "situation developing", "remains to be seen", "could potentially escalate", "bears watching".`;
 
@@ -633,6 +655,7 @@ Writing style:
 - Name specific actors, locations, numbers, dates from the source data
 - Structure: WHAT is happening -> WHY it matters -> SO WHAT (implications)
 - If sources disagree or only one domain reports, say so explicitly
+- Include one line on what remains unknown
 - Never use filler: "situation developing", "remains to be seen", "could escalate"
 
 Output ONLY valid JSON. No markdown fences.` },
@@ -697,36 +720,15 @@ Output ONLY valid JSON. No markdown fences.` },
       const parsed = JSON.parse(content);
 
       // Merge LLM output back into fusion candidates
-      // LLM provides title + analysis + watch_next; fusion provides severity, sources, confidence
-      // Analysis provides anomalies, escalations, convergences for each entity
       const mergedFindings = promotedCandidates.map((candidate, i) => {
         const llmFinding = parsed.findings?.[i] || {};
-        const sources = [...new Set(candidate.records.map(r => r.sourceId))];
-        const sourceProfile = candidate.sourceProfile || buildEvidenceProfile(candidate.records);
-        const whyTriggered = buildTriggerExplanation(sourceProfile, candidate.watchlistMatch);
-        const title = deriveGroundedTitle(candidate);
-
-        return {
-          severity: candidate.severity,
-          title,
-          analysis: llmFinding.analysis || '',
-          why_matters: llmFinding.why_matters || '',
-          sources,
-          watchlist_match: candidate.watchlistMatch,
-          watch_next: llmFinding.watch_next || [],
-          _confidence: candidate.confidence,
-          _scoreBreakdown: candidate.scoreBreakdown,
-          _entities: candidate.entities,
-          _analysis: analysisResults || {},
-          _sourceProfile: sourceProfile,
-          _whyTriggered: whyTriggered,
-        };
+        return buildStructuredFinding(candidate, llmFinding, analysisResults);
       });
 
       // Log first finding so we can verify LLM output quality in Vercel logs
       if (mergedFindings.length > 0) {
         const sample = mergedFindings[0];
-        console.log(`[monitor-check] Sample finding: "${sample.title}" | analysis: ${(sample.analysis || '').substring(0, 200)} | watch_next: ${JSON.stringify(sample.watch_next)}`);
+        console.log(`[monitor-check] Sample finding: "${sample.title}" | fact: ${(sample.fact_line || '').substring(0, 160)} | uncertainty: ${(sample.uncertainty || '').substring(0, 120)} | watch_next: ${JSON.stringify(sample.watch_next)}`);
       }
       console.log(`[monitor-check] ${provider.name} summarized ${mergedFindings.length} candidates`);
       return { findings: mergedFindings, provider: provider.name };

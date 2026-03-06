@@ -235,7 +235,7 @@ export async function fetchMilitaryNews() {
 
 /**
  * Fetch headlines from government & wire service RSS feeds.
- * Returns array of { source, title } objects.
+ * Returns array of { source, title, link, publishedAt, date } objects.
  */
 export async function fetchGovFeeds() {
   const results = await Promise.allSettled(
@@ -250,8 +250,19 @@ export async function fetchGovFeeds() {
         let itemMatch;
         while ((itemMatch = itemPattern.exec(xml)) !== null && items.length < 3) {
           const titleMatch = itemMatch[0].match(TITLE_PATTERN);
+          const linkMatch = itemMatch[0].match(LINK_PATTERN);
+          const dateMatch = itemMatch[0].match(DATE_PATTERN);
           const title = titleMatch?.[1] || titleMatch?.[2];
-          if (title) items.push({ source: feed.name, title });
+          if (title) {
+            const publishedAt = dateMatch?.[1] || '';
+            items.push({
+              source: feed.name,
+              title,
+              link: linkMatch?.[1] || '',
+              publishedAt,
+              date: publishedAt,
+            });
+          }
         }
         return items;
       } catch {

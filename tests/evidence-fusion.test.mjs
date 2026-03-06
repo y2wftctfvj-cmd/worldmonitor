@@ -132,13 +132,21 @@ describe('normalize', () => {
   it('normalizes gov feeds into records', () => {
     const results = mockCollectResults({
       govFeeds: [
-        { source: 'Reuters', title: 'Iran enriches uranium past nuclear deal threshold limits significantly' },
+        {
+          source: 'Reuters',
+          title: 'Iran enriches uranium past nuclear deal threshold limits significantly',
+          link: 'https://www.reuters.com/example',
+          publishedAt: '2026-03-06T03:20:00Z',
+        },
       ],
     });
 
     const records = normalize(results);
     assert.ok(records.length >= 1, 'should produce records from govFeeds');
     assert.equal(records[0].sourceId, 'govFeeds');
+    assert.equal(records[0].meta.feedSource, 'Reuters');
+    assert.equal(records[0].meta.link, 'https://www.reuters.com/example');
+    assert.equal(records[0].timestamp, '2026-03-06T03:20:00Z');
   });
 
   it('skips short text entries', () => {
@@ -289,6 +297,10 @@ describe('score', () => {
         scoredNew[0].confidence >= scoredOld[0].confidence,
         'new records should score >= old records'
       );
+      assert.ok(scoredNew[0].delta.newRecordCount >= 1);
+      assert.ok(Array.isArray(scoredNew[0].delta.newSourceIds));
+      assert.ok(Array.isArray(scoredNew[0].delta.newSourceLabels));
+      assert.equal(scoredOld[0].delta.newRecordCount, 0);
     }
   });
 });

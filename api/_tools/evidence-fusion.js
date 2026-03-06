@@ -9,7 +9,7 @@
  */
 
 import { buildEvidenceProfile } from './evidence-gate.js';
-import { getReliability } from './source-reliability.js';
+import { getReliability, isStrongTier, isVerifiedTier } from './source-reliability.js';
 import { extractEntities } from './entity-dictionary.js';
 import { filterValidRecords, validateCandidate } from './schema-validator.js';
 import { findCandidateWatchlistMatches } from './watchlist-utils.js';
@@ -155,7 +155,11 @@ export function normalize(collectResults) {
     for (const feed of collectResults.govFeeds.value) {
       if (!feed.title || feed.title.length < 10) continue;
       const { tier } = getReliability('govFeeds');
-      records.push(makeRecord('govFeeds', tier, `[${feed.source}] ${feed.title}`, now, { feedSource: feed.source }));
+      records.push(makeRecord('govFeeds', tier, `[${feed.source}] ${feed.title}`, feed.publishedAt || feed.date || now, {
+        feedSource: feed.source,
+        link: feed.link || null,
+        publishedAt: feed.publishedAt || feed.date || null,
+      }));
     }
   }
 
@@ -164,7 +168,10 @@ export function normalize(collectResults) {
     for (const alert of collectResults.cisaAlerts.value) {
       if (!alert.title || alert.title.length < 10) continue;
       const { tier } = getReliability('cisa');
-      records.push(makeRecord('cisa', tier, `[CISA] ${alert.title}`, now, { link: alert.link }));
+      records.push(makeRecord('cisa', tier, `[CISA] ${alert.title}`, alert.date || now, {
+        link: alert.link,
+        publishedAt: alert.date || null,
+      }));
     }
   }
 
@@ -285,6 +292,7 @@ export function cluster(records) {
       corroboration: 0,
       recency: 0,
       crossDomain: 0,
+      novelty: 0,
       surge: 0,
       contradiction: 0,
     },
@@ -344,8 +352,29 @@ export function score(candidates, previousRecordIds) {
     const crossDomain = Math.min(sourceProfile.distinctTypes * 5, 15);
 
     // Novelty: bonus for records not seen in the previous cycle
-    const newRecordCount = records.filter(r => !prevIds.has(r.id)).length;
+    const newRecords = records.filter((record) => !prevIds.has(record.id));
+    const newRecordCount = newRecords.length;
     const novelty = newRecordCount > 0 ? Math.min(newRecordCount * 3, 10) : 0;
+    const newSourceIds = [...new Set(newRecords.map((record) => record.sourceId).filter(Boolean))];
+    const newSourceLabels = [...new Set(newRecords.map((record) => getRecordSourceLabel(record)).filter(Boolean))];
+    const newStrongSourceIds = [...new Set(
+      newRecords
+        .filter((record) => isStrongTier(getReliability(record.sourceId, record.meta).tier))
+        .map((record) => record.sourceId)
+        .filter(Boolean)
+    )];
+    const newStrongSourceLabels = [...new Set(
+      newRecords
+        .filter((record) => isStrongTier(getReliability(record.sourceId, record.meta).tier))
+        .map((record) => getRecordSourceLabel(record))
+        .filter(Boolean)
+    )];
+    const newVerifiedSourceIds = [...new Set(
+      newRecords
+        .filter((record) => isVerifiedTier(getReliability(record.sourceId, record.meta).tier))
+        .map((record) => record.sourceId)
+        .filter(Boolean)
+    )];
 
     // Surge: bonus when many distinct sources report on the same cluster in one cycle
     const surge = distinctSources >= 4 ? 10 : 0;
@@ -371,6 +400,14 @@ export function score(candidates, previousRecordIds) {
         novelty,
         surge,
         contradiction,
+      },
+      delta: {
+        newRecordCount,
+        newSourceIds,
+        newSourceLabels,
+        newStrongSourceIds,
+        newStrongSourceLabels,
+        newVerifiedSourceIds,
       },
     };
   });
@@ -706,4 +743,8 @@ function detectContradiction(records) {
   }
 
   return Math.min(penalty, 25);
+}
+
+function getRecordSourceLabel(record) {
+  return record?.meta?.feedSource || record?.sourceId || '';
 }

@@ -188,6 +188,10 @@ export function deriveWhyItMatters(finding) {
 }
 
 function deriveSituationSummary(finding) {
+  if (typeof finding.fact_line === 'string' && finding.fact_line.trim()) {
+    return finding.fact_line.trim();
+  }
+
   const analysis = String(finding.analysis || '');
   const situationMatch = analysis.match(/SITUATION:\s*([\s\S]*?)(?:ASSESSMENT:|IMPLICATIONS?:|$)/i);
   if (situationMatch?.[1]?.trim()) return situationMatch[1].trim();
@@ -197,6 +201,7 @@ function deriveSituationSummary(finding) {
 
 function toPlainText(markdownText) {
   return String(markdownText || '')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1: $2')
     .replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
     .replace(/_([^_]+)_/g, '$1');
@@ -208,6 +213,44 @@ function buildSourceSummary(finding) {
     : [];
 
   return displaySources.slice(0, 5);
+}
+
+function formatSupportTime(publishedAt) {
+  if (!publishedAt) return '';
+  const date = new Date(publishedAt);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${date.toISOString().slice(11, 16)} UTC`;
+}
+
+function escapeMarkdownLinkUrl(url) {
+  return String(url || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+function buildSupportSummary(finding) {
+  const support = Array.isArray(finding.support) ? finding.support : [];
+  return support.slice(0, 3).map((item) => {
+    const source = item.sourceLabel || formatSourceName(item.sourceId || '');
+    const reason = item.reason ? ` (${item.reason})` : '';
+    const timeLabel = formatSupportTime(item.publishedAt);
+    const suffix = timeLabel ? ` — ${timeLabel}` : '';
+    return `${source}${reason}${suffix}: ${item.excerpt || 'Supporting record available.'}`;
+  });
+}
+
+function buildTopLinks(finding) {
+  const support = Array.isArray(finding.support) ? finding.support : [];
+  return support
+    .filter((item) => item?.link)
+    .slice(0, 3)
+    .map((item) => {
+      const label = item.publishedAt
+        ? `${item.sourceLabel || formatSourceName(item.sourceId || '')} ${formatSupportTime(item.publishedAt)}`
+        : (item.sourceLabel || formatSourceName(item.sourceId || ''));
+      return `\\- [${escapeMarkdown(label)}](${escapeMarkdownLinkUrl(item.link)})`;
+    });
 }
 
 export function buildIntelAlertText(finding) {
@@ -229,9 +272,11 @@ export function buildIntelAlertText(finding) {
     )
     : String(finding.severity || '').toUpperCase();
 
-  const whyTriggered = finding._whyTriggered || finding.why_triggered || 'Confidence gate triggered';
+  const whyTriggered = finding.why_i_believe || finding._whyTriggered || finding.why_triggered || 'Confidence gate triggered';
   const whyItMatters = deriveWhyItMatters(finding);
   const situationSummary = deriveSituationSummary(finding);
+  const supportSummary = buildSupportSummary(finding);
+  const topLinks = buildTopLinks(finding);
   const displaySources = buildSourceSummary(finding);
 
   const parts = [
@@ -247,19 +292,30 @@ export function buildIntelAlertText(finding) {
   }
 
   parts.push('');
-  parts.push('*WHY IT TRIGGERED*');
+  parts.push('*WHY I BELIEVE THIS*');
   parts.push(escapeMarkdown(whyTriggered));
 
-  const analysisMetadata = buildAlertAnalysisMetadata(finding);
-  if (analysisMetadata.length > 0) {
-    for (const line of analysisMetadata) {
+  if (supportSummary.length > 0) {
+    for (const line of supportSummary) {
       parts.push(`\\- ${escapeMarkdown(line)}`);
     }
+  }
+
+  if (finding.what_changed) {
+    parts.push('');
+    parts.push('*WHAT CHANGED*');
+    parts.push(escapeMarkdown(String(finding.what_changed)));
   }
 
   parts.push('');
   parts.push('*WHY IT MATTERS*');
   parts.push(escapeMarkdown(whyItMatters));
+
+  if (finding.uncertainty) {
+    parts.push('');
+    parts.push('*UNCONFIRMED*');
+    parts.push(escapeMarkdown(String(finding.uncertainty)));
+  }
 
   if (Array.isArray(finding.watch_next) && finding.watch_next.length > 0) {
     parts.push('');
@@ -269,7 +325,13 @@ export function buildIntelAlertText(finding) {
     }
   }
 
-  if (displaySources.length > 0) {
+  if (topLinks.length > 0) {
+    parts.push('');
+    parts.push('*TOP LINKS*');
+    for (const linkLine of topLinks) {
+      parts.push(linkLine);
+    }
+  } else if (displaySources.length > 0) {
     parts.push('');
     parts.push('*TOP SOURCES*');
     for (const source of displaySources) {
