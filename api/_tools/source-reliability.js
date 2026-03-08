@@ -64,6 +64,13 @@ const SOURCE_MAP = {
   gdacsEnhanced:   'wire',           // GDACS with alert level metadata
   mcpNews:         'domain',         // MCP-backed GDELT/news archive search
   mcpEvents:       'domain',         // MCP-backed event overlap search
+
+  // MCP intelligence sources
+  usgsQuake:       'wire',           // USGS earthquake data — authoritative government source
+  flightTrack:     'domain',         // OpenSky ADS-B derived flight data
+  ofacMcp:         'wire',           // OFAC SDN sanctions list — US Treasury official
+  polymarketMcp:   'domain',         // Polymarket prediction market probabilities
+  maritime:        'domain',         // Datalastic vessel tracking data
 };
 
 /**

@@ -27,7 +27,7 @@ function jsonResponse(payload) {
   };
 }
 
-describe('monitor-tools MCP integration', { concurrency: 1 }, () => {
+describe('monitor-tools MCP integration', { concurrency: 1, timeout: 15000 }, () => {
   it('appends MCP archive context to Reddit tool responses when available', async () => {
     const restoreEnv = withEnv({
       MCP_GATEWAY_URL: 'https://mcp.test',
@@ -101,9 +101,113 @@ describe('monitor-tools MCP integration', { concurrency: 1 }, () => {
     try {
       const output = await runTool('search_reddit', { query: 'iran' });
       assert.match(output, /Iran discussion on Reddit/);
-      assert.match(output, /\*MCP REDDIT ARCHIVE: iran\*/);
+      assert.match(output, /\*REDDIT ARCHIVE: iran\*/);
       assert.match(output, /Archive Reddit thread/);
       assert.match(output, /Older archive mention/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('search_sanctions invokes MCP and formats OFAC results', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'sanctions_search',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async (url, init = {}) => {
+      const raw = String(url);
+      if (raw === 'https://mcp.test/v1/tools/invoke') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              ok: true,
+              result: {
+                structuredContent: {
+                  results: [{
+                    name: 'TEST SANCTIONS ENTITY',
+                    type: 'Individual',
+                    program: 'SDGT',
+                    aliases: ['TSE'],
+                    id: '99999',
+                  }],
+                },
+              },
+            };
+          },
+        };
+      }
+      throw new Error(`Unexpected fetch URL: ${raw}`);
+    };
+
+    try {
+      const output = await runTool('search_sanctions', { query: 'test entity' });
+      assert.match(output, /OFAC SDN MATCHES/);
+      assert.match(output, /TEST SANCTIONS ENTITY/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('search_predictions_market combines live and MCP data', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'predictions_search',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async (url, init = {}) => {
+      const raw = String(url);
+      // Live Polymarket search
+      if (raw.includes('gamma-api.polymarket.com')) {
+        return jsonResponse([{
+          title: 'Will Iran reach nuclear deal?',
+          markets: [{
+            outcomePrices: '[0.25, 0.75]',
+            volume: '80000',
+            groupItemTitle: 'Yes',
+          }],
+          endDate: '2027-01-01',
+          slug: 'iran-nuclear',
+        }]);
+      }
+      // MCP predictions search
+      if (raw === 'https://mcp.test/v1/tools/invoke') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              ok: true,
+              result: {
+                structuredContent: {
+                  markets: [{
+                    title: 'MCP enriched prediction',
+                    probability: 30,
+                    volume: 50000,
+                    outcomes: ['Yes', 'No'],
+                    url: 'https://polymarket.com/test',
+                  }],
+                },
+              },
+            };
+          },
+        };
+      }
+      throw new Error(`Unexpected fetch URL: ${raw}`);
+    };
+
+    try {
+      const output = await runTool('search_predictions_market', { query: 'iran' });
+      assert.match(output, /Iran reach nuclear deal/);
+      assert.match(output, /PREDICTION MARKETS/);
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv();

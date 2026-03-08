@@ -63,8 +63,11 @@ import { fetchEarthquakes } from './fetchers/signals.js';
 import {
   formatMcpObservationSection,
   gatewayConfigured as mcpGatewayConfigured,
+  invokeMcpTool,
   searchMcpNews,
+  searchMcpPredictions,
   searchMcpReddit,
+  searchMcpSanctions,
 } from './mcp-adapter.js';
 
 // ---------------------------------------------------------------------------
@@ -172,6 +175,80 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'search_earthquakes',
+      description: 'Search USGS earthquake database by region, magnitude, and timeframe',
+      parameters: {
+        type: 'object',
+        properties: {
+          region: { type: 'string', description: 'Region name (e.g., "middle east", "pacific ring", "mediterranean")' },
+          min_magnitude: { type: 'string', description: 'Minimum magnitude (default: 4.5)' },
+          days_back: { type: 'string', description: 'Days to search back (default: 7)' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'track_flights',
+      description: 'Track aircraft with military callsign pattern detection via ADS-B data',
+      parameters: {
+        type: 'object',
+        properties: {
+          region: { type: 'string', description: 'Hotspot region (e.g., "middle east", "taiwan strait", "baltic", "black sea")' },
+          military_only: { type: 'boolean', description: 'Only show military callsign matches (default: true)' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_sanctions',
+      description: 'Search OFAC SDN sanctions list by entity name',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Entity name to search (person, organization, vessel)' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_predictions_market',
+      description: 'Search Polymarket prediction markets for event probabilities and volumes',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Topic to search (e.g., "Iran", "Ukraine ceasefire", "Trump")' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'track_maritime',
+      description: 'Track vessel activity in maritime regions or ports',
+      parameters: {
+        type: 'object',
+        properties: {
+          region: { type: 'string', description: 'Maritime region for vessel search (e.g., "strait of hormuz", "south china sea")' },
+          port: { type: 'string', description: 'Port name for arrival/departure activity' },
+        },
+        required: [],
+      },
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -198,6 +275,16 @@ export async function runTool(toolName, args) {
       return await toolCheckEarthquakes();
     case 'check_flights':
       return await toolCheckFlights(args.region);
+    case 'search_earthquakes':
+      return await toolSearchEarthquakes(args.region, args.min_magnitude, args.days_back);
+    case 'track_flights':
+      return await toolTrackFlights(args.region, args.military_only);
+    case 'search_sanctions':
+      return await toolSearchSanctions(args.query);
+    case 'search_predictions_market':
+      return await toolSearchPredictionsMarket(args.query);
+    case 'track_maritime':
+      return await toolTrackMaritime(args.region, args.port);
     default:
       return `Unknown tool: ${toolName}`;
   }
@@ -216,7 +303,7 @@ async function toolSearchNews(query) {
 
   if (query && mcpGatewayConfigured()) {
     const mcp = await searchMcpNews(query, { timeoutMs: 1200 });
-    const section = formatMcpObservationSection(`MCP NEWS ARCHIVE: ${query}`, mcp.observations, 5);
+    const section = formatMcpObservationSection(`NEWS ARCHIVE: ${query}`, mcp.observations, 5);
     if (section) sections.push(section);
   }
 
@@ -295,7 +382,7 @@ async function toolSearchReddit(query) {
 
   if (query && mcpGatewayConfigured()) {
     const mcp = await searchMcpReddit(query, { timeoutMs: 1200 });
-    const section = formatMcpObservationSection(`MCP REDDIT ARCHIVE: ${query}`, mcp.observations, 5);
+    const section = formatMcpObservationSection(`REDDIT ARCHIVE: ${query}`, mcp.observations, 5);
     if (section) sections.push(section);
   }
 
@@ -304,32 +391,60 @@ async function toolSearchReddit(query) {
 }
 
 async function toolCheckPredictions(query) {
+  const sections = [];
   const markets = query
     ? await searchPredictionMarkets(query)
     : await fetchGeopoliticalMarkets();
 
-  if (!markets || markets.length === 0) {
+  if (markets && markets.length > 0) {
+    sections.push(markets
+      .map(m => `- ${m.title}: ${m.probability != null ? m.probability + '%' : 'N/A'} (vol: $${Math.round(m.volume).toLocaleString('en-US')})`)
+      .join('\n'));
+  }
+
+  // Enhance with MCP Polymarket for richer metadata
+  if (query && mcpGatewayConfigured()) {
+    const mcp = await searchMcpPredictions(query, { timeoutMs: 2000 });
+    if (mcp.observations.length > 0) {
+      const section = formatMcpObservationSection(`PREDICTION MARKETS: ${query}`, mcp.observations, 5);
+      if (section) sections.push(section);
+    }
+  }
+
+  if (sections.length === 0) {
     return query
       ? `No prediction markets found for "${query}".`
       : 'Prediction market data unavailable.';
   }
-
-  return markets
-    .map(m => `- ${m.title}: ${m.probability != null ? m.probability + '%' : 'N/A'} (vol: $${Math.round(m.volume).toLocaleString('en-US')})`)
-    .join('\n');
+  return sections.join('\n\n');
 }
 
 async function toolCheckEarthquakes() {
+  const sections = [];
   const data = await fetchEarthquakes();
-  if (!data || data.length === 0) return 'No significant earthquakes in the last hour.';
+  if (data && data.length > 0) {
+    sections.push(data
+      .map(eq => `- M${eq.mag.toFixed(1)} — ${eq.place} (${eq.time})`)
+      .join('\n'));
+  }
 
-  return data
-    .map(eq => `- M${eq.mag.toFixed(1)} — ${eq.place} (${eq.time})`)
-    .join('\n');
+  // Enhance with MCP for recent M4.5+ worldwide (uses the simpler earthquake_recent tool)
+  if (mcpGatewayConfigured()) {
+    const mcp = await invokeMcpTool('earthquake_recent', {}, { timeoutMs: 3000 });
+    if (mcp.ok && mcp.observations.length > 0) {
+      const section = formatMcpObservationSection('M4.5+ last 24h', mcp.observations, 6);
+      if (section) sections.push(section);
+    }
+  }
+
+  if (sections.length === 0) return 'No significant earthquakes in the last hour.';
+  return sections.join('\n\n');
 }
 
 async function toolCheckFlights(region) {
-  // Use GDELT military news as a proxy for military activity
+  const sections = [];
+
+  // GDELT military news as a proxy for military activity
   const query = region
     ? `(military OR "fighter jets" OR airspace OR deployment) AND ${region}`
     : '(military OR "fighter jets" OR airspace OR "carrier strike" OR deployment)';
@@ -338,17 +453,160 @@ async function toolCheckFlights(region) {
 
   try {
     const resp = await fetch(gdeltUrl, { signal: AbortSignal.timeout(8000) });
-    if (!resp.ok) return 'Military flight data unavailable.';
-    const data = await resp.json();
-    const articles = data?.articles || [];
-
-    if (articles.length === 0) return `No recent military activity news${region ? ` for ${region}` : ''}.`;
-
-    return articles
-      .slice(0, 8)
-      .map(a => `- ${(a.title || 'Untitled').substring(0, 120)} (${a.domain || 'unknown'})`)
-      .join('\n');
+    if (resp.ok) {
+      const data = await resp.json();
+      const articles = data?.articles || [];
+      if (articles.length > 0) {
+        sections.push(articles
+          .slice(0, 8)
+          .map(a => `- ${(a.title || 'Untitled').substring(0, 120)} (${a.domain || 'unknown'})`)
+          .join('\n'));
+      }
+    }
   } catch {
-    return 'Military flight data unavailable.';
+    // GDELT unavailable — continue with MCP
   }
+
+  // Enhance with MCP ADS-B flight data
+  if (mcpGatewayConfigured() && region) {
+    const mcp = await invokeMcpTool('flights_military', { region: region.toLowerCase() }, { timeoutMs: 3000 });
+    if (mcp.ok && mcp.observations.length > 0) {
+      const section = formatMcpObservationSection(`ADS-B MILITARY FLIGHTS: ${region}`, mcp.observations, 6);
+      if (section) sections.push(section);
+    }
+  }
+
+  if (sections.length === 0) return `No recent military activity${region ? ` for ${region}` : ''}.`;
+  return sections.join('\n\n');
+}
+
+async function toolSearchEarthquakes(region, minMagnitude, daysBack) {
+  const sections = [];
+
+  // Live USGS data
+  const liveData = await fetchEarthquakes();
+  if (liveData && liveData.length > 0) {
+    sections.push('RECENT (last hour):\n' + liveData
+      .map(eq => `- M${eq.mag.toFixed(1)} — ${eq.place} (${eq.time})`)
+      .join('\n'));
+  }
+
+  // MCP historical search
+  if (mcpGatewayConfigured()) {
+    const mcpArgs = {
+      region: region || '',
+      minmagnitude: minMagnitude || '4.5',
+      days_back: daysBack || '7',
+    };
+    const mcp = await invokeMcpTool('earthquake_search', mcpArgs, { timeoutMs: 3000 });
+    if (mcp.ok && mcp.observations.length > 0) {
+      const label = region ? `USGS SEARCH: ${region}` : 'USGS SEARCH: worldwide';
+      const section = formatMcpObservationSection(label, mcp.observations, 8);
+      if (section) sections.push(section);
+    }
+  }
+
+  if (sections.length === 0) return 'No significant earthquakes found.';
+  return sections.join('\n\n');
+}
+
+async function toolTrackFlights(region, militaryOnly) {
+  if (!mcpGatewayConfigured()) return 'Flight tracking requires MCP gateway. ADS-B data unavailable.';
+
+  const regionKey = (region || 'middle east').toLowerCase();
+  const useMilitary = militaryOnly !== false;
+
+  if (useMilitary) {
+    const mcp = await invokeMcpTool('flights_military', { region: regionKey }, { timeoutMs: 5000 });
+    if (!mcp.ok) return `Flight tracking unavailable for ${regionKey}: ${mcp.reason}`;
+    if (mcp.observations.length === 0) {
+      const totalInRegion = mcp.raw?.result?.structuredContent?.total_in_region || 'unknown';
+      return `No military callsign matches in ${regionKey}. Total aircraft in region: ${totalInRegion}`;
+    }
+    return formatMcpObservationSection(`MILITARY FLIGHTS: ${regionKey}`, mcp.observations, 10) || 'No results.';
+  }
+
+  // Non-military: return all aircraft in region bounding box
+  const regionBoxes = {
+    'middle east': { lamin: '20', lomin: '30', lamax: '42', lomax: '65' },
+    'taiwan strait': { lamin: '21', lomin: '115', lamax: '27', lomax: '125' },
+    'baltic': { lamin: '53', lomin: '12', lamax: '66', lomax: '30' },
+    'black sea': { lamin: '40', lomin: '27', lamax: '47', lomax: '42' },
+  };
+  const box = regionBoxes[regionKey];
+  if (!box) return `Unknown region "${regionKey}". Available: ${Object.keys(regionBoxes).join(', ')}`;
+
+  const mcp = await invokeMcpTool('flights_region', box, { timeoutMs: 5000 });
+  if (!mcp.ok) return `Flight tracking unavailable: ${mcp.reason}`;
+  return formatMcpObservationSection(`ALL FLIGHTS: ${regionKey}`, mcp.observations, 10) || 'No aircraft detected.';
+}
+
+async function toolSearchSanctions(query) {
+  const sections = [];
+
+  // MCP OFAC search
+  if (mcpGatewayConfigured()) {
+    const mcp = await searchMcpSanctions(query, { timeoutMs: 3000 });
+    if (mcp.observations.length > 0) {
+      sections.push(formatMcpObservationSection(`OFAC SDN MATCHES: ${query}`, mcp.observations, 10));
+    }
+  }
+
+  if (sections.length === 0) return `No OFAC sanctions matches found for "${query}".`;
+  return sections.filter(Boolean).join('\n\n');
+}
+
+async function toolSearchPredictionsMarket(query) {
+  const sections = [];
+
+  // Live Polymarket search
+  const liveMarkets = await searchPredictionMarkets(query);
+  if (liveMarkets && liveMarkets.length > 0) {
+    sections.push('LIVE MARKETS:\n' + liveMarkets
+      .map(m => `- ${m.title}: ${m.probability != null ? m.probability + '%' : 'N/A'} (vol: $${Math.round(m.volume).toLocaleString('en-US')})`)
+      .join('\n'));
+  }
+
+  // MCP enrichment with richer metadata
+  if (mcpGatewayConfigured()) {
+    const mcp = await searchMcpPredictions(query, { timeoutMs: 2000 });
+    if (mcp.observations.length > 0) {
+      const section = formatMcpObservationSection(`PREDICTION MARKETS: ${query}`, mcp.observations, 5);
+      if (section) sections.push(section);
+    }
+  }
+
+  if (sections.length === 0) return `No prediction markets found for "${query}".`;
+  return sections.join('\n\n');
+}
+
+async function toolTrackMaritime(region, port) {
+  if (!mcpGatewayConfigured()) return 'Maritime tracking requires MCP gateway. Vessel data unavailable.';
+
+  if (port) {
+    const mcp = await invokeMcpTool('maritime_port_activity', { port_name: port }, { timeoutMs: 5000 });
+    if (!mcp.ok) return `Maritime data unavailable for port "${port}": ${mcp.reason}`;
+    if (mcp.observations.length === 0) return `No vessel activity found at port "${port}".`;
+    return formatMcpObservationSection(`PORT ACTIVITY: ${port}`, mcp.observations, 10) || 'No results.';
+  }
+
+  if (region) {
+    // Map region names to bounding boxes for vessel search
+    const regionBoxes = {
+      'strait of hormuz': { lamin: '25', lomin: '54', lamax: '28', lomax: '58' },
+      'south china sea': { lamin: '5', lomin: '105', lamax: '25', lomax: '122' },
+      'red sea': { lamin: '12', lomin: '36', lamax: '30', lomax: '44' },
+      'black sea': { lamin: '40', lomin: '27', lamax: '47', lomax: '42' },
+      'baltic': { lamin: '53', lomin: '12', lamax: '66', lomax: '30' },
+    };
+    const box = regionBoxes[region.toLowerCase()];
+    if (!box) return `Unknown maritime region "${region}". Available: ${Object.keys(regionBoxes).join(', ')}`;
+
+    const mcp = await invokeMcpTool('maritime_vessels', box, { timeoutMs: 5000 });
+    if (!mcp.ok) return `Maritime data unavailable: ${mcp.reason}`;
+    if (mcp.observations.length === 0) return `No vessels detected in ${region}.`;
+    return formatMcpObservationSection(`VESSELS: ${region}`, mcp.observations, 10) || 'No results.';
+  }
+
+  return 'Specify a region or port to track maritime activity.';
 }

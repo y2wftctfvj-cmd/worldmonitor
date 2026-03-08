@@ -247,15 +247,242 @@ describe('mcp-adapter', { concurrency: 1 }, () => {
     }
   });
 
+  it('normalizes USGS earthquake features into wire-tier records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'earthquake_search',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          features: [{
+            magnitude: 5.8,
+            place: '120km SW of Bandar Abbas, Iran',
+            depth: 10,
+            time: '2026-03-07T08:30:00.000Z',
+            coordinates: [27.1, 55.3],
+            id: 'us7000test',
+            url: 'https://earthquake.usgs.gov/earthquakes/eventpage/us7000test',
+          }],
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('earthquake_search', { region: 'middle east' });
+      assert.equal(result.ok, true);
+      assert.equal(result.observations.length, 1);
+      assert.equal(result.observations[0].sourceId, 'usgsQuake');
+      assert.match(result.observations[0].text, /M5\.8/);
+      assert.equal(result.observations[0].meta.origin, 'mcp');
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('normalizes OpenSky flight states into domain-tier records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'flights_military',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          flights: [{
+            icao24: 'ae1234',
+            callsign: 'RCH501',
+            origin_country: 'United States',
+            latitude: 33.5,
+            longitude: 44.2,
+            altitude: 10000,
+            velocity: 250,
+            on_ground: false,
+          }],
+          total_in_region: 45,
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('flights_military', { region: 'middle east' });
+      assert.equal(result.ok, true);
+      assert.equal(result.observations.length, 1);
+      assert.equal(result.observations[0].sourceId, 'flightTrack');
+      assert.match(result.observations[0].text, /RCH501/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('normalizes OFAC sanctions results into wire-tier records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'sanctions_search',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          results: [{
+            name: 'ISLAMIC REVOLUTIONARY GUARD CORPS',
+            type: 'Organization',
+            program: 'IRAN',
+            aliases: ['IRGC', 'Pasdaran'],
+            id: '12345',
+          }],
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('sanctions_search', { query: 'IRGC' });
+      assert.equal(result.ok, true);
+      assert.equal(result.observations.length, 1);
+      assert.equal(result.observations[0].sourceId, 'ofacMcp');
+      assert.match(result.observations[0].text, /ISLAMIC REVOLUTIONARY/);
+      assert.match(result.observations[0].text, /IRAN/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('normalizes Polymarket markets into domain-tier records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'predictions_search',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          markets: [{
+            title: 'Iran nuclear deal by 2027?',
+            probability: 23,
+            volume: 150000,
+            outcomes: ['Yes', 'No'],
+            end_date: '2027-12-31',
+            url: 'https://polymarket.com/event/iran-nuclear-deal',
+          }],
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('predictions_search', { query: 'iran' });
+      assert.equal(result.ok, true);
+      assert.equal(result.observations.length, 1);
+      assert.equal(result.observations[0].sourceId, 'polymarketMcp');
+      assert.match(result.observations[0].text, /Iran nuclear deal/);
+      assert.match(result.observations[0].text, /23/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('normalizes maritime vessels into domain-tier records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'maritime_vessels',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          vessels: [{
+            mmsi: '123456789',
+            name: 'EVER GIVEN',
+            type: 'Container Ship',
+            flag: 'PA',
+            latitude: 30.0,
+            longitude: 32.5,
+            speed: 12.5,
+            heading: 180,
+            destination: 'ROTTERDAM',
+          }],
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('maritime_vessels', { lamin: '25', lomin: '30', lamax: '35', lomax: '40' });
+      assert.equal(result.ok, true);
+      assert.equal(result.observations.length, 1);
+      assert.equal(result.observations[0].sourceId, 'maritime');
+      assert.match(result.observations[0].text, /EVER GIVEN/);
+      assert.match(result.observations[0].text, /ROTTERDAM/);
+      assert.match(result.observations[0].text, /PA/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
+  it('passes through WikiData entity lookup as context without creating records', async () => {
+    const restoreEnv = withEnv({
+      MCP_GATEWAY_URL: 'https://mcp.test',
+      MCP_GATEWAY_TOKEN: 'secret',
+      MCP_ENABLED_TOOLS: 'entity_lookup',
+    });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = async () => jsonResponse({
+      ok: true,
+      result: {
+        structuredContent: {
+          found: true,
+          wikidata_id: 'Q794',
+          label: 'Iran',
+          description: 'country in Western Asia',
+          type: 'item',
+          wikipedia_summary: 'Iran is a country in Western Asia.',
+          properties: { instance_of: 'Q6256' },
+        },
+      },
+    });
+
+    try {
+      const result = await invokeMcpTool('entity_lookup', { query: 'Iran' });
+      // entity_lookup returns no normalized records (enrichment context only)
+      assert.equal(result.observations.length, 0);
+      // But the raw result is preserved for direct consumption
+      assert.equal(result.raw.result.structuredContent.found, true);
+      assert.equal(result.raw.result.structuredContent.label, 'Iran');
+    } finally {
+      globalThis.fetch = originalFetch;
+      restoreEnv();
+    }
+  });
+
   it('formats MCP observation sections for Telegram-safe output', () => {
-    const section = formatMcpObservationSection('MCP TEST', [{
+    const section = formatMcpObservationSection('Quake data', [{
       sourceId: 'mcpNews',
       text: '[reuters.com] Example story',
       timestamp: '2026-03-07T12:00:00.000Z',
       meta: { feedSource: 'Reuters' },
     }]);
 
-    assert.match(section, /\*MCP TEST\*/);
+    assert.match(section, /\*Quake data\*/);
     assert.match(section, /Reuters/);
     assert.match(section, /Example story/);
   });

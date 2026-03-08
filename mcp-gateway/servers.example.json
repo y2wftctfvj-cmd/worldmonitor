@@ -19,6 +19,39 @@
       "env": {
         "NEWSAPI_KEY": "${NEWSAPI_KEY}"
       }
+    },
+    "usgs": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/usgs-earthquake.mjs"]
+    },
+    "flights": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/flight-opensky.mjs"]
+    },
+    "sanctions": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/sanctions-ofac.mjs"]
+    },
+    "polymarket": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/polymarket.mjs"]
+    },
+    "maritime": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/maritime.mjs"],
+      "env": {
+        "DATALASTIC_API_KEY": "${DATALASTIC_API_KEY}"
+      }
+    },
+    "wikidata": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["mcp-gateway/servers/wikidata-entity.mjs"]
     }
   }
 }

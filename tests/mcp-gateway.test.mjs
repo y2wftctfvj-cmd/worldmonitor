@@ -88,6 +88,48 @@ describe('mcp-gateway', { concurrency: 1 }, () => {
     assert.equal(payload.result.structuredContent.results[0].title, 'Echo worldmonitor');
   });
 
+  it('boots and invokes a USGS earthquake MCP server via stdio', async () => {
+    // Create a separate gateway instance with the USGS server
+    const usgsConfigPath = join(tempDir, 'usgs-servers.json');
+    const usgsFixturePath = resolve('mcp-gateway/servers/usgs-earthquake.mjs');
+
+    writeFileSync(usgsConfigPath, JSON.stringify({
+      servers: {
+        usgs: {
+          transport: 'stdio',
+          command: process.execPath,
+          args: [usgsFixturePath],
+        },
+      },
+    }, null, 2));
+
+    const usgsRestoreEnv = withEnv({
+      MCP_GATEWAY_CONFIG: usgsConfigPath,
+      MCP_GATEWAY_TOKEN: 'secret',
+    });
+
+    let usgsGateway;
+    try {
+      usgsGateway = await startServer({ port: 0 });
+
+      // Verify the USGS tools appear in the catalog
+      const catalogResp = await fetch(`http://127.0.0.1:${usgsGateway.port}/v1/tools`, {
+        headers: { Authorization: 'Bearer secret' },
+      });
+      const catalog = await catalogResp.json();
+      assert.equal(catalog.ok, true);
+
+      const usgsServer = catalog.servers.find(s => s.server === 'usgs');
+      assert.ok(usgsServer, 'USGS server should be in catalog');
+      const toolNames = usgsServer.tools.map(t => t.name);
+      assert.ok(toolNames.includes('earthquake_recent'), 'Should have earthquake_recent tool');
+      assert.ok(toolNames.includes('earthquake_search'), 'Should have earthquake_search tool');
+    } finally {
+      await usgsGateway?.close();
+      usgsRestoreEnv();
+    }
+  });
+
   it('requires bearer auth when a gateway token is configured', async () => {
     const response = await fetch(`http://127.0.0.1:${gateway.port}/health`);
     const payload = await response.json();

@@ -29,6 +29,51 @@ const MCP_TOOL_MAP = {
     tool: 'news_gdelt_events',
     defaultArgs: { response_format: 'json', timespan: '7d' },
   },
+  earthquake_recent: {
+    server: 'usgs',
+    tool: 'earthquake_recent',
+    defaultArgs: {},
+  },
+  earthquake_search: {
+    server: 'usgs',
+    tool: 'earthquake_search',
+    defaultArgs: { minmagnitude: '4.5' },
+  },
+  flights_region: {
+    server: 'flights',
+    tool: 'flights_region',
+    defaultArgs: {},
+  },
+  flights_military: {
+    server: 'flights',
+    tool: 'flights_military',
+    defaultArgs: {},
+  },
+  sanctions_search: {
+    server: 'sanctions',
+    tool: 'sanctions_search',
+    defaultArgs: {},
+  },
+  predictions_search: {
+    server: 'polymarket',
+    tool: 'predictions_search',
+    defaultArgs: { limit: '5' },
+  },
+  maritime_vessels: {
+    server: 'maritime',
+    tool: 'maritime_vessels',
+    defaultArgs: {},
+  },
+  maritime_port_activity: {
+    server: 'maritime',
+    tool: 'maritime_port_activity',
+    defaultArgs: {},
+  },
+  entity_lookup: {
+    server: 'wikidata',
+    tool: 'entity_lookup',
+    defaultArgs: { language: 'en' },
+  },
 };
 
 function getMcpTimeoutMs(override) {
@@ -229,6 +274,156 @@ function normalizeGdeltEvents(payload) {
   return records;
 }
 
+function normalizeEarthquakeFeatures(features) {
+  if (!Array.isArray(features)) return [];
+  const records = [];
+  for (const quake of features) {
+    const mag = quake?.magnitude ?? quake?.mag;
+    const place = quake?.place || 'Unknown location';
+    const coords = Array.isArray(quake?.coordinates) ? quake.coordinates : [];
+    const depth = quake?.depth != null ? `, ${Math.round(quake.depth)}km deep` : '';
+    const text = `M${mag} — ${place}${depth}`;
+    const record = buildRecord(
+      'usgsQuake',
+      'wire',
+      text,
+      toIsoTimestamp(quake?.time),
+      {
+        magnitude: mag,
+        place,
+        depth: quake?.depth,
+        coordinates: coords,
+        quakeId: quake?.id || '',
+        link: quake?.url || null,
+        origin: 'mcp',
+        mcpTool: 'earthquake_search',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+function normalizeFlightStates(flights) {
+  if (!Array.isArray(flights)) return [];
+  const records = [];
+  for (const flight of flights) {
+    const callsign = (flight?.callsign || '').trim() || flight?.icao24 || 'unknown';
+    const country = flight?.origin_country || 'Unknown';
+    const alt = flight?.altitude != null ? `, FL${Math.round(flight.altitude / 30.48)}` : '';
+    const text = `${callsign} (${country})${alt}`;
+    const record = buildRecord(
+      'flightTrack',
+      'domain',
+      text,
+      new Date().toISOString(),
+      {
+        icao24: flight?.icao24 || '',
+        callsign,
+        origin_country: country,
+        latitude: flight?.latitude,
+        longitude: flight?.longitude,
+        altitude: flight?.altitude,
+        velocity: flight?.velocity,
+        on_ground: flight?.on_ground || false,
+        origin: 'mcp',
+        mcpTool: 'flights_military',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+function normalizeSanctionsResults(items) {
+  if (!Array.isArray(items)) return [];
+  const records = [];
+  for (const item of items) {
+    const name = item?.name || 'Unknown entity';
+    const type = item?.type || 'Unknown';
+    const program = item?.program || '';
+    const text = `${name} [${type}] — ${program}`;
+    const record = buildRecord(
+      'ofacMcp',
+      'wire',
+      text,
+      new Date().toISOString(),
+      {
+        sanctionedName: name,
+        entityType: type,
+        program,
+        aliases: item?.aliases || [],
+        sanctionId: item?.id || '',
+        origin: 'mcp',
+        mcpTool: 'sanctions_search',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+function normalizePolymarketMarkets(markets) {
+  if (!Array.isArray(markets)) return [];
+  const records = [];
+  for (const market of markets) {
+    const title = market?.title || 'Unknown market';
+    const prob = market?.probability != null ? `${market.probability}%` : 'N/A';
+    const text = `${title}: ${prob}`;
+    const record = buildRecord(
+      'polymarketMcp',
+      'domain',
+      text,
+      new Date().toISOString(),
+      {
+        marketTitle: title,
+        probability: market?.probability,
+        volume: market?.volume || 0,
+        outcomes: market?.outcomes || [],
+        endDate: market?.end_date || null,
+        link: market?.url || null,
+        origin: 'mcp',
+        mcpTool: 'predictions_search',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+function normalizeMaritimeVessels(vessels) {
+  if (!Array.isArray(vessels)) return [];
+  const records = [];
+  for (const vessel of vessels) {
+    const name = vessel?.name || vessel?.mmsi || 'Unknown vessel';
+    const type = vessel?.type || 'Unknown type';
+    const flag = vessel?.flag || '';
+    const dest = vessel?.destination ? ` → ${vessel.destination}` : '';
+    const text = `${name} (${flag}) ${type}${dest}`;
+    const record = buildRecord(
+      'maritime',
+      'domain',
+      text,
+      new Date().toISOString(),
+      {
+        mmsi: vessel?.mmsi || '',
+        vesselName: name,
+        vesselType: type,
+        flag,
+        latitude: vessel?.latitude,
+        longitude: vessel?.longitude,
+        speed: vessel?.speed,
+        heading: vessel?.heading,
+        destination: vessel?.destination || '',
+        origin: 'mcp',
+        mcpTool: 'maritime_vessels',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
 function normalizeMcpResult(toolKey, result) {
   const payload = extractPayload(result);
 
@@ -243,6 +438,25 @@ function normalizeMcpResult(toolKey, result) {
   }
   if (toolKey === 'news_gdelt_events') {
     return normalizeGdeltEvents(payload);
+  }
+  if (toolKey === 'earthquake_recent' || toolKey === 'earthquake_search') {
+    return normalizeEarthquakeFeatures(payload?.features || []);
+  }
+  if (toolKey === 'flights_region' || toolKey === 'flights_military') {
+    return normalizeFlightStates(payload?.flights || []);
+  }
+  if (toolKey === 'sanctions_search') {
+    return normalizeSanctionsResults(payload?.results || []);
+  }
+  if (toolKey === 'predictions_search') {
+    return normalizePolymarketMarkets(payload?.markets || []);
+  }
+  if (toolKey === 'maritime_vessels' || toolKey === 'maritime_port_activity') {
+    return normalizeMaritimeVessels(payload?.vessels || []);
+  }
+  if (toolKey === 'entity_lookup') {
+    // WikiData returns enrichment context, not signal records — pass through raw
+    return [];
   }
   return [];
 }
@@ -441,14 +655,16 @@ function buildCandidateQuery(candidate) {
 
 function summarizeObservation(record) {
   const source = record?.meta?.feedSource || formatSourceName(record?.sourceId || '');
-  const date = record?.timestamp ? new Date(record.timestamp).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
-  return `${source}${date ? ` | ${date}` : ''} | ${record.text}`;
+  const date = record?.timestamp ? new Date(record.timestamp).toISOString().slice(11, 16) + ' UTC' : '';
+  // Clean format: "Source HH:MM UTC: core text" — no pipes, no redundancy
+  return `${source}${date ? ` ${date}` : ''}: ${record.text}`;
 }
 
 export function formatMcpObservationSection(title, observations, limit = 4) {
   const items = Array.isArray(observations) ? observations.slice(0, limit) : [];
   if (items.length === 0) return '';
-  return `*${title}*\n${items.map((record) => `- ${summarizeObservation(record)}`).join('\n')}`;
+  // Clean header + compact bullet list
+  return `*${title}* (${items.length})\n${items.map((record) => `  ${summarizeObservation(record)}`).join('\n')}`;
 }
 
 export async function enrichCandidatesWithMcp(candidates, options = {}) {
@@ -471,16 +687,52 @@ export async function enrichCandidatesWithMcp(candidates, options = {}) {
     const query = buildCandidateQuery(candidate);
     if (!query) return;
 
-    const invocations = await Promise.all(toolKeys.map(async (toolKey) => {
+    // Core enrichment: reddit + news
+    const coreInvocations = await Promise.all(toolKeys.map(async (toolKey) => {
       const toolArgs = buildToolArgs(toolKey, query);
       const result = await invokeMcpTool(toolKey, toolArgs, options);
       result.toolKey = toolKey;
       return result;
     }));
 
-    const observations = invocations.flatMap((result) => result.observations || []).slice(0, 8);
+    // Extended enrichment: sanctions, predictions, entity context (run in parallel)
+    const extendedKeys = ['sanctions_search', 'predictions_search', 'entity_lookup'];
+    const extendedInvocations = await Promise.all(extendedKeys.map(async (toolKey) => {
+      const toolArgs = buildToolArgs(toolKey, query);
+      const result = await invokeMcpTool(toolKey, toolArgs, options);
+      result.toolKey = toolKey;
+      return result;
+    }));
+
+    const invocations = [...coreInvocations, ...extendedInvocations];
+    const observations = invocations.flatMap((result) => result.observations || []).slice(0, 12);
     flatResults.push(...invocations);
-    if (observations.length === 0) return;
+
+    // Attach extended enrichment metadata to the candidate
+    const sanctionsResult = extendedInvocations.find(r => r.toolKey === 'sanctions_search');
+    const predictionsResult = extendedInvocations.find(r => r.toolKey === 'predictions_search');
+    const entityResult = extendedInvocations.find(r => r.toolKey === 'entity_lookup');
+
+    const mcpMeta = {};
+    if (sanctionsResult?.ok && sanctionsResult.observations.length > 0) {
+      mcpMeta.sanctionsMatch = true;
+    }
+    if (predictionsResult?.ok && predictionsResult.observations.length > 0) {
+      const topPrediction = predictionsResult.observations[0]?.meta;
+      mcpMeta.marketProbability = topPrediction?.probability ?? null;
+    }
+    if (entityResult?.ok && entityResult.raw?.result) {
+      const entityPayload = extractPayload(entityResult.raw.result || {});
+      if (entityPayload?.found) {
+        mcpMeta.entityContext = {
+          label: entityPayload.label,
+          description: entityPayload.description,
+          summary: (entityPayload.wikipedia_summary || '').slice(0, 300),
+        };
+      }
+    }
+
+    if (observations.length === 0 && Object.keys(mcpMeta).length === 0) return;
 
     const mergedRecords = dedupeRecords([...candidate.records, ...observations]);
     const summaries = observations.slice(0, 2).map((record) => summarizeObservation(record));
@@ -493,6 +745,7 @@ export async function enrichCandidatesWithMcp(candidates, options = {}) {
         query,
         observationCount: observations.length,
         highlights: summaries,
+        ...mcpMeta,
       },
     };
   }));
@@ -517,6 +770,24 @@ function buildToolArgs(toolKey, query) {
   }
   if (toolKey === 'news_gdelt_events') {
     return { query, response_format: 'json', timespan: '30d' };
+  }
+  if (toolKey === 'earthquake_search') {
+    return { region: query, minmagnitude: '4.5', days_back: '7' };
+  }
+  if (toolKey === 'flights_military') {
+    return { region: query };
+  }
+  if (toolKey === 'sanctions_search') {
+    return { query };
+  }
+  if (toolKey === 'predictions_search') {
+    return { query, limit: '5' };
+  }
+  if (toolKey === 'maritime_vessels' || toolKey === 'maritime_port_activity') {
+    return { port_name: query };
+  }
+  if (toolKey === 'entity_lookup') {
+    return { query, language: 'en' };
   }
   return { query, response_format: 'json' };
 }
@@ -564,8 +835,8 @@ export async function buildMcpHistorySection(entity, options = {}) {
     searchMcpNews(entity, options),
   ]);
   const sections = [];
-  const redditSection = formatMcpObservationSection(`MCP REDDIT CONTEXT: ${entity}`, reddit.observations, 4);
-  const newsSection = formatMcpObservationSection(`MCP NEWS CONTEXT: ${entity}`, news.observations, 4);
+  const redditSection = formatMcpObservationSection(`REDDIT CONTEXT: ${entity}`, reddit.observations, 4);
+  const newsSection = formatMcpObservationSection(`NEWS CONTEXT: ${entity}`, news.observations, 4);
   if (redditSection) sections.push(redditSection);
   if (newsSection) sections.push(newsSection);
   return {
@@ -577,7 +848,31 @@ export async function buildMcpHistorySection(entity, options = {}) {
 export function buildMcpSnapshotSection(enrichment) {
   const highlights = Array.isArray(enrichment?.highlights) ? enrichment.highlights.filter(Boolean).slice(0, 5) : [];
   if (highlights.length === 0) return '';
-  return `MCP ENRICHMENT:\n${highlights.map((line) => `- ${line}`).join('\n')}`;
+  return `ENRICHMENT:\n${highlights.map((line) => `- ${line}`).join('\n')}`;
+}
+
+export async function searchMcpSanctions(query, options = {}) {
+  const result = await invokeMcpTool('sanctions_search', buildToolArgs('sanctions_search', query), options);
+  result.toolKey = 'sanctions_search';
+  return {
+    observations: result.observations || [],
+    sourceAssessments: aggregateServerAssessments([result]),
+  };
+}
+
+export async function searchMcpPredictions(query, options = {}) {
+  const result = await invokeMcpTool('predictions_search', buildToolArgs('predictions_search', query), options);
+  result.toolKey = 'predictions_search';
+  return {
+    observations: result.observations || [],
+    sourceAssessments: aggregateServerAssessments([result]),
+  };
+}
+
+export async function lookupMcpEntity(query, options = {}) {
+  const result = await invokeMcpTool('entity_lookup', buildToolArgs('entity_lookup', query), options);
+  const payload = result.ok ? extractPayload(result.raw?.result || {}) : null;
+  return payload?.found ? payload : null;
 }
 
 export function gatewayConfigured() {
