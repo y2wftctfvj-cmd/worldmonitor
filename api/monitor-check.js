@@ -72,6 +72,11 @@ import {
   buildCandidateFactLine,
   buildEvidenceNarrative,
 } from './_tools/alert-enrichment.js';
+import {
+  buildMcpSnapshotSection,
+  enrichCandidatesWithMcp,
+  gatewayConfigured as mcpGatewayConfigured,
+} from './_tools/mcp-adapter.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -205,7 +210,7 @@ export default async function handler(request) {
     // -----------------------------------------------------------------------
     // 1b. SOURCE HEALTH — track which sources succeeded/failed
     // -----------------------------------------------------------------------
-    const sourceHealth = await updateSourceHealth(redisUrl, redisToken, sourceAssessments);
+    let sourceHealth = await updateSourceHealth(redisUrl, redisToken, sourceAssessments);
 
     // -----------------------------------------------------------------------
     // 2. EVIDENCE FUSION — normalize, cluster, score, promote (individually timed)
@@ -298,12 +303,38 @@ export default async function handler(request) {
     // 3. LLM SUMMARIZE — only for promoted candidates (notable/urgent)
     // -----------------------------------------------------------------------
     let findings = [];
+    let mcpEnrichment = { candidates: promotedCandidates, sourceAssessments: {}, highlights: [] };
+    if (promotedCandidates.length > 0 && mcpGatewayConfigured()) {
+      mcpEnrichment = await telem.stage('mcp', async () => {
+        const enrichment = await enrichCandidatesWithMcp(promotedCandidates, {
+          redisUrl,
+          redisToken,
+          timeoutMs: 1200,
+          limit: 2,
+        });
+        return {
+          _meta: {
+            highlights: enrichment.highlights?.length || 0,
+            mcpSources: Object.keys(enrichment.sourceAssessments || {}).length,
+          },
+          _value: enrichment,
+        };
+      });
+
+      if (Object.keys(mcpEnrichment.sourceAssessments || {}).length > 0) {
+        sourceHealth = await updateSourceHealth(redisUrl, redisToken, mcpEnrichment.sourceAssessments);
+      }
+    }
+
     if (promotedCandidates.length > 0) {
       findings = await telem.stage('summarize', async () => {
         // Cap LLM input to top 5 by confidence — avoids prompt bloat that causes timeouts
         const LLM_CANDIDATE_LIMIT = 5;
-        const llmCandidates = promotedCandidates.slice(0, LLM_CANDIDATE_LIMIT);
-        const overflowCandidates = promotedCandidates.slice(LLM_CANDIDATE_LIMIT);
+        const summaryCandidates = Array.isArray(mcpEnrichment.candidates) && mcpEnrichment.candidates.length > 0
+          ? mcpEnrichment.candidates
+          : promotedCandidates;
+        const llmCandidates = summaryCandidates.slice(0, LLM_CANDIDATE_LIMIT);
+        const overflowCandidates = summaryCandidates.slice(LLM_CANDIDATE_LIMIT);
 
         const llmResult = await summarizeCandidates(
           llmCandidates,
@@ -333,10 +364,10 @@ export default async function handler(request) {
           return { _meta: { llmProvider: llmResult.provider }, _value: [...llmResult.findings, ...overflowFindings] };
         }
         // LLM failed entirely — fallback for all candidates
-        return {
-          _meta: { llmErrors: llmResult?.errors || ['unknown failure'] },
-          _value: promotedCandidates.map(buildFallback),
-        };
+          return {
+            _meta: { llmErrors: llmResult?.errors || ['unknown failure'] },
+            _value: summaryCandidates.map(buildFallback),
+          };
       });
     }
 
@@ -447,14 +478,22 @@ export default async function handler(request) {
 
     // Store snapshot for /brief and other features that use it
     if (records.length > 0) {
-      const currentSnapshot = buildSnapshot(collectResults);
+      const currentSnapshot = buildSnapshot(collectResults, { mcpSection: buildMcpSnapshotSection(mcpEnrichment) });
       await storeSnapshot(redisUrl, redisToken, currentSnapshot, SNAPSHOT_TTL_SECONDS);
     }
 
     // -----------------------------------------------------------------------
     // 5b. DIGEST-CACHE — save bounded daily cache for daily digest
     // -----------------------------------------------------------------------
-    await updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, sourceHealth, cycleTsBoundary);
+    await updateDigestCache(
+      redisUrl,
+      redisToken,
+      promotedCandidates,
+      allCandidates,
+      sourceHealth,
+      cycleTsBoundary,
+      mcpEnrichment,
+    );
 
     // Finalize and store telemetry
     const telemetry = telem.finish();
@@ -478,6 +517,7 @@ export default async function handler(request) {
         escalations: analysisResults.escalations?.length || 0,
         convergences: analysisResults.convergences?.length || 0,
       },
+      mcpHighlights: mcpEnrichment.highlights || [],
       telemetry,
     });
   } catch (err) {
@@ -789,7 +829,7 @@ async function updateSourceHealth(redisUrl, redisToken, sourceAssessments) {
  * Bounded: top 20 alerts, top 50 entities, latest source health.
  * TTL: 48h (timezone edge safety).
  */
-async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, currentSourceHealth, cycleTs) {
+async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, currentSourceHealth, cycleTs, mcpEnrichment = {}) {
   if (!redisUrl || !redisToken) return;
 
   try {
@@ -798,7 +838,7 @@ async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCa
     const DIGEST_CACHE_TTL = 172800; // 48h
 
     // Load existing cache for today (if any)
-    let existing = { topAlerts: [], entityCounts: {}, sourceHealth: null };
+    let existing = { topAlerts: [], entityCounts: {}, sourceHealth: null, mcpSignals: [] };
     try {
       const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(cacheKey)}`, {
         headers: { Authorization: `Bearer ${redisToken}` },
@@ -843,6 +883,9 @@ async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCa
       topAlerts: allAlerts,
       entityCounts: trimmedEntityCounts,
       sourceHealth: currentSourceHealth,
+      mcpSignals: Array.isArray(mcpEnrichment?.highlights)
+        ? [...new Set([...(existing.mcpSignals || []), ...mcpEnrichment.highlights])].slice(-10)
+        : (existing.mcpSignals || []),
       lastCycleTs: cycleTs,
     };
 

@@ -45,7 +45,8 @@
     "desktop:package:macos:tech:sign": "node scripts/desktop-package.mjs --os macos --variant tech --sign",
     "desktop:package:windows:full:sign": "node scripts/desktop-package.mjs --os windows --variant full --sign",
     "desktop:package:windows:tech:sign": "node scripts/desktop-package.mjs --os windows --variant tech --sign",
-    "desktop:package": "node scripts/desktop-package.mjs"
+    "desktop:package": "node scripts/desktop-package.mjs",
+    "mcp:gateway": "node mcp-gateway/server.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.52.0",
@@ -67,6 +68,7 @@
     "@deck.gl/geo-layers": "^9.2.6",
     "@deck.gl/layers": "^9.2.6",
     "@deck.gl/mapbox": "^9.2.6",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@sentry/browser": "^10.39.0",
     "@upstash/redis": "^1.36.1",
     "@vercel/analytics": "^1.6.1",
@@ -81,6 +83,7 @@
     "onnxruntime-web": "^1.23.2",
     "posthog-js": "^1.352.0",
     "topojson-client": "^3.1.0",
-    "youtubei.js": "^16.0.1"
+    "youtubei.js": "^16.0.1",
+    "zod": "^4.3.6"
   }
 }

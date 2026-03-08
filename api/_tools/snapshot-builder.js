@@ -9,7 +9,7 @@ import { redisSet } from './redis-helpers.js';
  * Build a text snapshot from all collected results.
  * Used by /brief command and stored in Redis for between-cycle access.
  */
-export function buildSnapshot(results) {
+export function buildSnapshot(results, options = {}) {
   const sections = [];
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
   sections.push(`TIMESTAMP: ${now}`);
@@ -61,6 +61,10 @@ export function buildSnapshot(results) {
   // Government/wire feeds
   if (results.govFeeds.status === 'fulfilled' && results.govFeeds.value?.length > 0) {
     sections.push(`WIRE SERVICES:\n${results.govFeeds.value.map(f => `- [${f.source}] ${f.title}`).join('\n')}`);
+  }
+
+  if (options.mcpSection) {
+    sections.push(options.mcpSection);
   }
 
   return sections.join('\n\n');

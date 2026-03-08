@@ -86,6 +86,10 @@ const SOURCE_DISPLAY_NAMES = {
   gpsJamming: 'GPS Jamming',
   sanctions: 'OFAC Sanctions',
   gdacsEnhanced: 'GDACS Alerts',
+  mcpNews: 'MCP News',
+  mcpEvents: 'MCP Events',
+  'mcp:reddit': 'MCP Reddit',
+  'mcp:news': 'MCP News',
   'multi-cycle analysis': 'Multi-cycle analysis',
 };
 
@@ -99,6 +103,7 @@ export function formatSourceName(sourceId) {
   if (sourceId.startsWith('reddit:')) return `r/${sourceId.split(':')[1]}`;
   if (sourceId.startsWith('twitter:')) return `@${sourceId.split(':')[1]}`;
   if (sourceId.startsWith('bluesky:')) return `@${sourceId.split(':')[1]}`;
+  if (sourceId.startsWith('mcp:')) return sourceId.replace(/^mcp:/, 'MCP ');
   return sourceId;
 }
 

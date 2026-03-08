@@ -1,0 +1,24 @@
+{
+  "servers": {
+    "reddit": {
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["-m", "reddit_mcp.server"],
+      "cwd": "${OSINT_SOCMINT_DIR}",
+      "env": {
+        "REDDIT_CLIENT_ID": "${REDDIT_CLIENT_ID}",
+        "REDDIT_CLIENT_SECRET": "${REDDIT_CLIENT_SECRET}",
+        "REDDIT_USER_AGENT": "WorldMonitor/2.7"
+      }
+    },
+    "news": {
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["-m", "news_mcp.server"],
+      "cwd": "${OSINT_SOCMINT_DIR}",
+      "env": {
+        "NEWSAPI_KEY": "${NEWSAPI_KEY}"
+      }
+    }
+  }
+}

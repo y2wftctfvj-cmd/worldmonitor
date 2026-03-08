@@ -41,6 +41,10 @@ import {
   hydrateWatchlistItems,
   normalizeWatchTerm,
 } from './_tools/watchlist-utils.js';
+import {
+  buildMcpHistorySection,
+  gatewayConfigured as mcpGatewayConfigured,
+} from './_tools/mcp-adapter.js';
 
 // ---------------------------------------------------------------------------
 // LLM settings
@@ -71,6 +75,7 @@ IDENTITY:
 
 CAPABILITIES:
 - You have tools to search news, markets, Telegram, Reddit, prediction markets, earthquake data, and flight anomalies. Use them when asked about topics not in your current context.
+- When available, your Reddit/news tool results may include MCP-backed archive context. Treat that as supporting evidence, not as a replacement for live strong-source reporting.
 - You remember conversations for 48 hours.
 - You maintain watchlists that trigger proactive alerts.
 - When analyzing a situation, always consider: What are the precursors? What would escalation look like? What are the leading indicators to watch?
@@ -260,7 +265,7 @@ async function handleCommand(text, chatId, botToken, redisUrl, redisToken, openR
 
   // /status — quick signal summary
   if (lower === '/status') {
-    const status = await generateStatus();
+    const status = await generateStatus(redisUrl, redisToken);
     await sendTelegramMessage(botToken, chatId, status);
     return true;
   }
@@ -476,10 +481,16 @@ async function callBriefLLM(messages, groqKey, openRouterKey) {
 // /status — Quick signal summary
 // ---------------------------------------------------------------------------
 
-async function generateStatus() {
-  const [markets, headlines] = await Promise.allSettled([
+async function generateStatus(redisUrl, redisToken) {
+  const [markets, headlines, sourceHealthResp] = await Promise.allSettled([
     fetchMarketQuotes(),
     fetchGoogleNewsHeadlines(),
+    redisUrl && redisToken
+      ? fetch(`${redisUrl}/get/monitor:source-health`, {
+        headers: { Authorization: `Bearer ${redisToken}` },
+        signal: AbortSignal.timeout(2000),
+      })
+      : null,
   ]);
 
   const parts = ['*MONITOR STATUS*\n'];
@@ -498,6 +509,21 @@ async function generateStatus() {
     parts.push(topHeadlines);
   }
 
+  if (sourceHealthResp.status === 'fulfilled' && sourceHealthResp.value?.ok) {
+    try {
+      const data = await sourceHealthResp.value.json();
+      const sourceHealth = data?.result ? JSON.parse(data.result) : null;
+      const mcpEntries = Object.entries(sourceHealth || {}).filter(([name]) => name.startsWith('mcp:'));
+      if (mcpEntries.length > 0) {
+        const summary = mcpEntries.map(([name, value]) => `${name.replace(/^mcp:/, '')}: ${value.status}`).join(', ');
+        parts.push('');
+        parts.push(`*MCP:* ${summary}`);
+      }
+    } catch {
+      // Non-critical
+    }
+  }
+
   parts.push('\n_Use /brief for full analysis._');
   return parts.join('\n');
 }
@@ -511,8 +537,18 @@ async function generateStatus() {
  */
 async function handleHistoryCommand(entity, redisUrl, redisToken) {
   const ledger = await getEntityHistory(entity, redisUrl, redisToken);
+  const canUseMcp = mcpGatewayConfigured();
 
   if (!ledger) {
+    if (!canUseMcp) {
+      return `No history found for "${entity}". The entity may not have appeared in recent monitoring cycles, or the ledger hasn't accumulated enough data yet.`;
+    }
+
+    const mcpHistory = await buildMcpHistorySection(entity, { redisUrl, redisToken, timeoutMs: 1200 });
+    if (mcpHistory.text) {
+      return [`*ENTITY HISTORY: ${entity}*`, '', mcpHistory.text].join('\n');
+    }
+
     return `No history found for "${entity}". The entity may not have appeared in recent monitoring cycles, or the ledger hasn't accumulated enough data yet.`;
   }
 
@@ -556,6 +592,14 @@ async function handleHistoryCommand(entity, redisUrl, redisToken) {
     parts.push(`${sev}: ${count}`);
   }
 
+  if (canUseMcp) {
+    const mcpHistory = await buildMcpHistorySection(entity, { redisUrl, redisToken, timeoutMs: 1200 });
+    if (mcpHistory.text) {
+      parts.push('');
+      parts.push(mcpHistory.text);
+    }
+  }
+
   return parts.join('\n');
 }
 
@@ -593,6 +637,8 @@ async function handleAnomaliesCommand(redisUrl, redisToken) {
 
   const parts = ['*ANOMALY REPORT*', ''];
   let foundAnomalies = 0;
+  let topAnomalyEntity = '';
+  let topAnomalyRatio = 0;
 
   for (const [entity, baseline] of baselines) {
     if (baseline.insufficient) continue;
@@ -603,11 +649,23 @@ async function handleAnomaliesCommand(redisUrl, redisToken) {
       const ratio = Math.round((recentCount / baseline.avgDailyMentions) * 100);
       parts.push(`\u26A1 *${entity}*: ${recentCount} alerts (${ratio}% of daily baseline ${baseline.avgDailyMentions})`);
       foundAnomalies++;
+      if (ratio > topAnomalyRatio) {
+        topAnomalyRatio = ratio;
+        topAnomalyEntity = entity;
+      }
     }
   }
 
   if (foundAnomalies === 0) {
     parts.push('No anomalies detected. All entities are within normal baseline ranges.');
+  }
+
+  if (topAnomalyEntity && mcpGatewayConfigured()) {
+    const mcpHistory = await buildMcpHistorySection(topAnomalyEntity, { redisUrl, redisToken, timeoutMs: 1200 });
+    if (mcpHistory.text) {
+      parts.push('');
+      parts.push(mcpHistory.text);
+    }
   }
 
   parts.push('');
@@ -660,17 +718,33 @@ async function handleConvergenceCommand(redisUrl, redisToken) {
 
   // Show entities with 3+ source types (proxy for cross-domain)
   let found = 0;
+  let topEntity = '';
   const sorted = [...entitySourceTypes.entries()].sort((a, b) => b[1].types.size - a[1].types.size);
   for (const [entity, data] of sorted) {
     if (data.types.size >= 3) {
       parts.push(`\u{1F500} *${data.displayName}*: ${[...data.types].join(' + ')} (${data.types.size} source types)`);
       found++;
+      if (!topEntity) topEntity = data.displayName;
     }
     if (found >= 10) break;
   }
 
   if (found === 0) {
     parts.push('No multi-domain convergence detected in today\'s data.');
+  }
+
+  if (Array.isArray(cache.mcpSignals) && cache.mcpSignals.length > 0) {
+    parts.push('');
+    parts.push('*MCP CONTEXT*');
+    for (const line of cache.mcpSignals.slice(-3)) {
+      parts.push(`- ${line}`);
+    }
+  } else if (topEntity && mcpGatewayConfigured()) {
+    const mcpHistory = await buildMcpHistorySection(topEntity, { redisUrl, redisToken, timeoutMs: 1200 });
+    if (mcpHistory.text) {
+      parts.push('');
+      parts.push(mcpHistory.text);
+    }
   }
 
   parts.push('');
@@ -780,6 +854,14 @@ async function handleSitrepCommand(redisUrl, redisToken, openRouterKey, groqKey)
     }
     if (failed.length > 0) {
       parts.push(`Failed: ${failed.join(', ')}`);
+    }
+    parts.push('');
+  }
+
+  if (Array.isArray(cache?.mcpSignals) && cache.mcpSignals.length > 0) {
+    parts.push('*MCP CONTEXT*');
+    for (const line of cache.mcpSignals.slice(-5)) {
+      parts.push(`- ${line}`);
     }
     parts.push('');
   }

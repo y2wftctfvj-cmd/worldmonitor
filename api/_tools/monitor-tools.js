@@ -60,6 +60,12 @@ import {
   fetchAllRedditPosts,
 } from './fetchers/social.js';
 import { fetchEarthquakes } from './fetchers/signals.js';
+import {
+  formatMcpObservationSection,
+  gatewayConfigured as mcpGatewayConfigured,
+  searchMcpNews,
+  searchMcpReddit,
+} from './mcp-adapter.js';
 
 // ---------------------------------------------------------------------------
 // Tool definitions (OpenAI function-calling format)
@@ -202,9 +208,20 @@ export async function runTool(toolName, args) {
 // ---------------------------------------------------------------------------
 
 async function toolSearchNews(query) {
+  const sections = [];
   const headlines = await fetchTopicNews(query);
-  if (!headlines) return `No recent news found for "${query}".`;
-  return headlines;
+  if (headlines) {
+    sections.push(headlines);
+  }
+
+  if (query && mcpGatewayConfigured()) {
+    const mcp = await searchMcpNews(query, { timeoutMs: 1200 });
+    const section = formatMcpObservationSection(`MCP NEWS ARCHIVE: ${query}`, mcp.observations, 5);
+    if (section) sections.push(section);
+  }
+
+  if (sections.length === 0) return `No recent news found for "${query}".`;
+  return sections.join('\n\n');
 }
 
 async function toolCheckMarkets(symbols) {
@@ -240,6 +257,8 @@ async function toolSearchTelegram(query) {
 }
 
 async function toolSearchReddit(query) {
+  const sections = [];
+
   // Use Reddit search API across tracked subreddits — batch 4 at a time to avoid rate limits
   const allResults = [];
   const BATCH_SIZE = 4;
@@ -266,13 +285,22 @@ async function toolSearchReddit(query) {
     }
   }
 
-  if (allResults.length === 0) return `No Reddit results for "${query}" in the last 24 hours.`;
+  if (allResults.length > 0) {
+    sections.push(allResults
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8)
+      .map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`)
+      .join('\n'));
+  }
 
-  return allResults
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 8)
-    .map(p => `- [r/${p.sub}, ${p.score}pts] ${p.title}`)
-    .join('\n');
+  if (query && mcpGatewayConfigured()) {
+    const mcp = await searchMcpReddit(query, { timeoutMs: 1200 });
+    const section = formatMcpObservationSection(`MCP REDDIT ARCHIVE: ${query}`, mcp.observations, 5);
+    if (section) sections.push(section);
+  }
+
+  if (sections.length === 0) return `No Reddit results for "${query}" in the last 24 hours.`;
+  return sections.join('\n\n');
 }
 
 async function toolCheckPredictions(query) {

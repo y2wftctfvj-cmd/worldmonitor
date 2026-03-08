@@ -62,6 +62,8 @@ const SOURCE_MAP = {
   gpsJamming:      'domain',         // gpsjam.org — derived data, not primary source
   sanctions:       'wire',           // OFAC SDN list — US Treasury
   gdacsEnhanced:   'wire',           // GDACS with alert level metadata
+  mcpNews:         'domain',         // MCP-backed GDELT/news archive search
+  mcpEvents:       'domain',         // MCP-backed event overlap search
 };
 
 /**
