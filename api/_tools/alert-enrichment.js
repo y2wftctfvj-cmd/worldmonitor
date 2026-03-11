@@ -1,5 +1,6 @@
 import { formatSourceName } from './alert-sender.js';
 import { getReliability, isStrongTier, isVerifiedTier } from './source-reliability.js';
+import { buildEvidenceProfile, buildTriggerExplanation } from './evidence-gate.js';
 
 const SUPPORT_EXCERPT_MAX = 120;
 
@@ -179,4 +180,71 @@ export function buildEvidenceNarrative(finding) {
   }
 
   return 'Multiple supporting sources align on the core event.';
+}
+
+/**
+ * Derive a grounded title from the highest-reliability source record.
+ * Strips RSS feed prefixes and trailing mainstream source suffixes.
+ *
+ * @param {Object} candidate - Fusion candidate with records
+ * @returns {string} Clean, grounded title (max 110 chars)
+ */
+export function deriveGroundedTitle(candidate) {
+  const bestRecord = candidate?.records
+    ?.filter((record) => record.text && record.text.length > 15)
+    .sort((a, b) => {
+      const relA = getReliability(a.sourceId, a.meta);
+      const relB = getReliability(b.sourceId, b.meta);
+      return (relB?.score || 0) - (relA?.score || 0);
+    })[0];
+
+  if (!bestRecord?.text) {
+    return candidate?.entities?.slice(0, 3).join(', ') + ': developing situation';
+  }
+
+  return bestRecord.text
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/\s+-\s+(Reuters|AP News|Associated Press|BBC News|Bloomberg|The Guardian|Guardian|CNN|CNBC|CBS News|NBC News)$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 110);
+}
+
+/**
+ * Build a structured finding by merging fusion candidate data with LLM output.
+ * Combines evidence profile, support records, change summary, and analysis.
+ *
+ * @param {Object} candidate - Fusion candidate
+ * @param {Object} [llmFinding={}] - LLM-generated fields (analysis, watch_next, etc.)
+ * @param {Object} [analysisResults={}] - Deterministic analysis results
+ * @returns {Object} Structured finding ready for alert delivery
+ */
+export function buildStructuredFinding(candidate, llmFinding = {}, analysisResults = {}) {
+  const sources = [...new Set(candidate.records.map((record) => record.sourceId))];
+  const sourceProfile = candidate.sourceProfile || buildEvidenceProfile(candidate.records);
+  const whyTriggered = buildTriggerExplanation(sourceProfile, candidate.watchlistMatch);
+  const support = buildCandidateSupport(candidate);
+
+  return {
+    severity: candidate.severity,
+    title: deriveGroundedTitle(candidate),
+    fact_line: buildCandidateFactLine(candidate, llmFinding.fact_line || ''),
+    analysis: llmFinding.analysis || '',
+    why_matters: llmFinding.why_matters || llmFinding.why_now || '',
+    why_i_believe: buildEvidenceNarrative({ support, _sourceProfile: sourceProfile }),
+    what_changed: buildCandidateChangeSummary(candidate),
+    uncertainty: buildCandidateUncertaintySummary(candidate, llmFinding.uncertainty || ''),
+    sources,
+    support,
+    watchlist_match: candidate.watchlistMatch,
+    watch_next: Array.isArray(llmFinding.watch_next)
+      ? llmFinding.watch_next.filter((item) => typeof item === 'string' && item.trim()).slice(0, 4)
+      : [],
+    _confidence: candidate.confidence,
+    _scoreBreakdown: candidate.scoreBreakdown,
+    _entities: candidate.entities,
+    _analysis: analysisResults || {},
+    _sourceProfile: sourceProfile,
+    _whyTriggered: whyTriggered,
+  };
 }

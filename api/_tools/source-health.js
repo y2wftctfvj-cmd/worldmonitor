@@ -144,3 +144,42 @@ function getDegradedReason(sourceName, value) {
   }
   return 'unusable_payload';
 }
+
+/**
+ * Track per-source health across cycles in Redis.
+ * Stores a hash map: sourceId -> { status, lastSuccessAt, lastNonEmptyAt, ... }.
+ * TTL: 24 hours (for daily digest).
+ *
+ * @param {string} redisUrl - Upstash Redis REST URL
+ * @param {string} redisToken - Upstash Redis REST token
+ * @param {Object} sourceAssessments - Fresh assessments from this cycle
+ * @returns {Promise<Object>} Merged source health map
+ */
+export async function updateSourceHealth(redisUrl, redisToken, sourceAssessments) {
+  if (!redisUrl || !redisToken) return {};
+
+  // Import redisSet inline to avoid circular dependency
+  const { redisSet } = await import('./redis-helpers.js');
+
+  try {
+    // Load existing health data
+    const resp = await fetch(`${redisUrl}/get/monitor:source-health`, {
+      headers: { Authorization: `Bearer ${redisToken}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    let existing = {};
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.result) existing = JSON.parse(data.result);
+    }
+
+    const merged = mergeSourceHealth(existing, sourceAssessments, Date.now());
+
+    // Store with 24h TTL
+    await redisSet(redisUrl, redisToken, 'monitor:source-health', JSON.stringify(merged), 86400);
+    return merged;
+  } catch {
+    // Non-critical — don't block the cycle
+    return {};
+  }
+}

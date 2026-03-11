@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { deriveGroundedTitle } from '../api/monitor-check.js';
+import { deriveGroundedTitle } from '../api/_tools/alert-enrichment.js';
 
 describe('deriveGroundedTitle', () => {
   it('prefers the highest-reliability source text and strips feed prefixes', () => {

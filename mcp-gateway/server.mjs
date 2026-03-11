@@ -62,15 +62,28 @@ async function loadConfig() {
 
 function ensureAuthorized(req) {
   const authToken = process.env.MCP_GATEWAY_TOKEN || '';
-  if (!authToken) return true;
+  if (!authToken) {
+    // No token configured — reject all requests instead of silently allowing
+    console.error('[mcp-gateway] MCP_GATEWAY_TOKEN not set — rejecting request');
+    return false;
+  }
   const header = req.headers.authorization || '';
   return header === `Bearer ${authToken}`;
 }
 
+const MAX_BODY_SIZE = 1_000_000; // 1MB — prevents memory exhaustion from oversized payloads
+
 async function readJson(req) {
   const chunks = [];
+  let totalSize = 0;
   for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    totalSize += buf.length;
+    if (totalSize > MAX_BODY_SIZE) {
+      req.destroy();
+      throw Object.assign(new Error('Payload too large'), { statusCode: 413 });
+    }
+    chunks.push(buf);
   }
   const body = Buffer.concat(chunks).toString('utf8');
   if (!body) return {};
@@ -351,6 +364,10 @@ async function route(req, res) {
 
     send(res, json(404, { ok: false, error: 'not_found' }));
   } catch (error) {
+    if (error.statusCode === 413) {
+      send(res, json(413, { ok: false, error: 'payload_too_large' }));
+      return;
+    }
     send(res, json(500, { ok: false, error: serializeError(error) }));
   }
 }
@@ -372,6 +389,9 @@ function startIdleReaper() {
 }
 
 async function startServer({ port = DEFAULT_PORT } = {}) {
+  if (!process.env.MCP_GATEWAY_TOKEN) {
+    console.warn('[mcp-gateway] WARNING: MCP_GATEWAY_TOKEN not set — all requests will be rejected');
+  }
   await loadConfig();
   startIdleReaper();
 
@@ -380,7 +400,7 @@ async function startServer({ port = DEFAULT_PORT } = {}) {
   });
 
   await new Promise((resolvePromise) => {
-    server.listen(port, () => resolvePromise());
+    server.listen(port, '127.0.0.1', () => resolvePromise());
   });
 
   const actualPort = server.address()?.port || port;

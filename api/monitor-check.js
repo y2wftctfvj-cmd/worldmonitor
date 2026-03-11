@@ -45,14 +45,13 @@ import {
 
 import {
   loadAllWatchlists,
-  redisSet,
   loadPreviousRecordIds,
   storeRecordIds,
   updateWatchlistMatchStats,
 } from './_tools/redis-helpers.js';
 
 import { normalize, cluster, score, promote } from './_tools/evidence-fusion.js';
-import { getReliability, TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED } from './_tools/source-reliability.js';
+import { TELEGRAM_MAINSTREAM, TELEGRAM_OSINT_VERIFIED } from './_tools/source-reliability.js';
 import { createCycleTelemetry, storeTelemetry } from './_tools/telemetry.js';
 import { updateLedger, loadLedgerEntries, computeBaselines } from './_tools/event-ledger.js';
 import { detectAnomalies, detectEscalation, detectConvergence, generateHistoricalContext } from './_tools/intel-analysis.js';
@@ -61,22 +60,18 @@ import { buildSnapshot, storeSnapshot } from './_tools/snapshot-builder.js';
 import { isDuplicateAlert, loadRecentAlerts, saveRecentAlert } from './_tools/alert-dedup.js';
 import { formatSourceName, sendIntelAlert } from './_tools/alert-sender.js';
 import { loadDevelopingItems, updateDevelopingItems, checkDevelopingAlerts } from './_tools/developing-tracker.js';
-import { buildEvidenceProfile, buildTriggerExplanation } from './_tools/evidence-gate.js';
 import { filterLowSignalRecords } from './_tools/intel-noise.js';
-import { classifySourceResult, mergeSourceHealth } from './_tools/source-health.js';
+import { classifySourceResult } from './_tools/source-health.js';
 import { findCandidateWatchlistMatches } from './_tools/watchlist-utils.js';
-import {
-  buildCandidateSupport,
-  buildCandidateChangeSummary,
-  buildCandidateUncertaintySummary,
-  buildCandidateFactLine,
-  buildEvidenceNarrative,
-} from './_tools/alert-enrichment.js';
+import { buildStructuredFinding } from './_tools/alert-enrichment.js';
 import {
   buildMcpSnapshotSection,
   enrichCandidatesWithMcp,
   gatewayConfigured as mcpGatewayConfigured,
 } from './_tools/mcp-adapter.js';
+import { summarizeCandidates } from './_tools/llm-summarizer.js';
+import { updateDigestCache } from './_tools/digest-cache.js';
+import { updateSourceHealth } from './_tools/source-health.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -341,7 +336,8 @@ export default async function handler(request) {
           developingItems,
           openRouterKey,
           groqKey,
-          analysisResults
+          analysisResults,
+          buildStructuredFinding,
         );
 
         // Build fallback findings for overflow candidates (or all if LLM failed)
@@ -528,372 +524,6 @@ export default async function handler(request) {
 }
 
 
-// ---------------------------------------------------------------------------
-// AI analysis cycle
-// ---------------------------------------------------------------------------
-
-/**
- * Build analysis context section for the LLM prompt.
- * Contains anomalies, convergences, and historical context from deterministic analysis.
- */
-function buildAnalysisSection(analysisResults) {
-  const sections = [];
-
-  if (analysisResults.anomalies?.length > 0) {
-    const lines = analysisResults.anomalies.map(a =>
-      `- ${a.displayName}: ${a.ratio}x above baseline (${a.currentSources} sources, normally ${a.baselineDaily}/day)`
-    );
-    sections.push(`ANOMALIES DETECTED:\n${lines.join('\n')}`);
-  }
-
-  if (analysisResults.convergences?.length > 0) {
-    const lines = analysisResults.convergences.map(c =>
-      `- ${c.displayName}: signals from ${c.domains.join(' + ')} (${c.domainCount} domains)`
-    );
-    sections.push(`CROSS-DOMAIN CONVERGENCE:\n${lines.join('\n')}`);
-  }
-
-  if (analysisResults.escalations?.length > 0) {
-    const lines = analysisResults.escalations.map(e =>
-      `- ${e.displayName}: severity rising (delta +${e.severityDelta}), ${e.escalationsThisMonth} notable+ events this month`
-    );
-    sections.push(`ESCALATION DETECTED:\n${lines.join('\n')}`);
-  }
-
-  if (analysisResults.historicalContext?.length > 0) {
-    sections.push(`HISTORICAL CONTEXT:\n${analysisResults.historicalContext.map(l => `- ${l}`).join('\n')}`);
-  }
-
-  return sections.length > 0 ? '\n' + sections.join('\n\n') : '';
-}
-
-export function deriveGroundedTitle(candidate) {
-  const bestRecord = candidate?.records
-    ?.filter((record) => record.text && record.text.length > 15)
-    .sort((a, b) => {
-      const relA = getReliability(a.sourceId, a.meta);
-      const relB = getReliability(b.sourceId, b.meta);
-      return (relB?.score || 0) - (relA?.score || 0);
-    })[0];
-
-  if (!bestRecord?.text) {
-    return candidate?.entities?.slice(0, 3).join(', ') + ': developing situation';
-  }
-
-  return bestRecord.text
-    .replace(/^\[[^\]]+\]\s*/, '')
-    .replace(/\s+-\s+(Reuters|AP News|Associated Press|BBC News|Bloomberg|The Guardian|Guardian|CNN|CNBC|CBS News|NBC News)$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 110);
-}
-
-function buildStructuredFinding(candidate, llmFinding = {}, analysisResults = {}) {
-  const sources = [...new Set(candidate.records.map((record) => record.sourceId))];
-  const sourceProfile = candidate.sourceProfile || buildEvidenceProfile(candidate.records);
-  const whyTriggered = buildTriggerExplanation(sourceProfile, candidate.watchlistMatch);
-  const support = buildCandidateSupport(candidate);
-
-  return {
-    severity: candidate.severity,
-    title: deriveGroundedTitle(candidate),
-    fact_line: buildCandidateFactLine(candidate, llmFinding.fact_line || ''),
-    analysis: llmFinding.analysis || '',
-    why_matters: llmFinding.why_matters || llmFinding.why_now || '',
-    why_i_believe: buildEvidenceNarrative({ support, _sourceProfile: sourceProfile }),
-    what_changed: buildCandidateChangeSummary(candidate),
-    uncertainty: buildCandidateUncertaintySummary(candidate, llmFinding.uncertainty || ''),
-    sources,
-    support,
-    watchlist_match: candidate.watchlistMatch,
-    watch_next: Array.isArray(llmFinding.watch_next)
-      ? llmFinding.watch_next.filter((item) => typeof item === 'string' && item.trim()).slice(0, 4)
-      : [],
-    _confidence: candidate.confidence,
-    _scoreBreakdown: candidate.scoreBreakdown,
-    _entities: candidate.entities,
-    _analysis: analysisResults || {},
-    _sourceProfile: sourceProfile,
-    _whyTriggered: whyTriggered,
-  };
-}
-
-/**
- * Summarize pre-scored fusion candidates using LLM.
- *
- * The LLM writes analysis + watch_next for each candidate.
- * It does NOT set severity or confidence — those come from the fusion engine.
- * This cuts LLM input tokens by ~60% vs the old full-dump approach.
- */
-async function summarizeCandidates(promotedCandidates, developingItems, openRouterKey, groqKey, analysisResults) {
-  const developingSection = developingItems.length > 0
-    ? `\nDEVELOPING ITEMS FROM PREVIOUS CYCLES:\n${developingItems.map(d => `- "${d.topic}" (${d.count} consecutive cycles)`).join('\n')}`
-    : '';
-
-  // Build analysis context from deterministic intel analysis
-  const analysisSection = buildAnalysisSection(analysisResults || {});
-
-  // Build compact candidate summaries for the LLM
-  const candidateSummaries = promotedCandidates.map((c, i) => {
-    const sources = [...new Set(c.records.map(r => formatSourceName(r.sourceId)))];
-    const sampleTexts = c.records.slice(0, 5).map(r => {
-      const timeLabel = r.timestamp ? new Date(r.timestamp).toISOString().slice(11, 16) + ' UTC' : '';
-      return `  - [${formatSourceName(r.sourceId)}] ${timeLabel ? `[${timeLabel}] ` : ''}${r.text.substring(0, 350)}`;
-    }).join('\n');
-    return `EVENT ${i + 1} (severity: ${c.severity}, confidence: ${c.confidence}, entities: ${c.entities.join(', ')}):
-Sources: ${sources.join(', ')}
-Score breakdown: reliability=${c.scoreBreakdown.reliability}, corroboration=${c.scoreBreakdown.corroboration}, recency=${c.scoreBreakdown.recency}, cross_domain=${c.scoreBreakdown.crossDomain}, novelty=${c.scoreBreakdown.novelty}, contradiction=${c.scoreBreakdown.contradiction}
-${c.watchlistMatch ? `Watchlist match: "${c.watchlistMatch}"` : ''}
-Sample records:
-${sampleTexts}`;
-  }).join('\n\n');
-
-  const analysisPrompt = `You are writing intelligence alert briefs. Read the SOURCE RECORDS below and write:
-
-1. A single-sentence FACT LINE — concrete, factual, and anchored in the strongest reporting
-2. A 3-5 sentence analysis: SITUATION (cite facts from records) -> ASSESSMENT (meaning) -> IMPLICATIONS (consequences)
-3. A single-sentence WHY IT MATTERS summary
-4. A single-sentence UNCERTAINTY line — what is not confirmed yet
-5. 2-3 specific, measurable indicators to watch next
-
-PRE-SCORED EVENTS WITH SOURCE RECORDS:
-${candidateSummaries}
-${developingSection}
-
-ADDITIONAL CONTEXT (reference in assessment section, NEVER use in titles):
-${analysisSection || 'No anomaly or escalation data available.'}
-
-OUTPUT FORMAT (respond ONLY with valid JSON, no markdown code fences):
-{
-  "findings": [
-    {
-      "fact_line": "Single factual sentence anchored in the source records.",
-      "analysis": "SITUATION: [what happened, cite sources]. ASSESSMENT: [what this means]. IMPLICATIONS: [consequences].",
-      "why_matters": "Short sentence on why this matters now.",
-      "uncertainty": "Short sentence on what remains unconfirmed.",
-      "watch_next": ["specific measurable indicator", "concrete trigger to monitor"]
-    }
-  ]
-}
-
-OTHER RULES:
-- Output exactly ${promotedCandidates.length} findings, one per event, in the same order.
-- Reference specific details from source records — names, numbers, locations, times.
-- Telegram-only claims should note "UNVERIFIED" in analysis.
-- FACT LINE must be a plain factual sentence, not analysis or speculation.
-- UNCERTAINTY must describe what is still unknown, not repeat the confirmed facts.
-- watch_next must be specific. BAD: "further developments". GOOD: "IAEA Board emergency session".
-- Never use: "situation developing", "remains to be seen", "could potentially escalate", "bears watching".`;
-
-  const messages = [
-    { role: 'system', content: `You are Monitor, a senior intelligence analyst writing alerts for a geopolitical dashboard.
-
-Your job: turn raw multi-source intelligence into concise, actionable analysis.
-
-Writing style:
-- Lead with specific facts, not vague summaries
-- Name specific actors, locations, numbers, dates from the source data
-- Structure: WHAT is happening -> WHY it matters -> SO WHAT (implications)
-- If sources disagree or only one domain reports, say so explicitly
-- Include one line on what remains unknown
-- Never use filler: "situation developing", "remains to be seen", "could escalate"
-
-Output ONLY valid JSON. No markdown fences.` },
-    { role: 'user', content: analysisPrompt },
-  ];
-
-  // Call LLM — provider cascade: Groq 70B (fast, best) → Groq 8B (fastest, good enough) → OpenRouter
-  const llmErrors = [];
-  const providers = [];
-  if (groqKey) {
-    providers.push({
-      name: 'Groq-70B',
-      url: 'https://api.groq.com/openai/v1/chat/completions',
-      model: 'llama-3.3-70b-versatile',
-      apiKey: groqKey,
-    });
-    providers.push({
-      name: 'Groq-8B',
-      url: 'https://api.groq.com/openai/v1/chat/completions',
-      model: 'llama-3.1-8b-instant',
-      apiKey: groqKey,
-    });
-  }
-  if (openRouterKey) {
-    providers.push({
-      name: 'Llama-OpenRouter',
-      url: 'https://openrouter.ai/api/v1/chat/completions',
-      model: 'meta-llama/llama-3.3-70b-instruct',
-      apiKey: openRouterKey,
-    });
-  }
-
-  for (const provider of providers) {
-    try {
-      const fetchStart = Date.now();
-      const resp = await fetch(provider.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${provider.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: provider.model,
-          messages,
-          temperature: 0.2,
-          max_tokens: MAX_TOKENS,
-          response_format: { type: 'json_object' },
-        }),
-        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-      });
-      console.log(`[monitor-check] ${provider.name} responded in ${Date.now() - fetchStart}ms (status: ${resp.status})`);
-
-      if (!resp.ok) {
-        const errBody = await resp.text();
-        throw new Error(`${provider.name} returned ${resp.status}: ${errBody.substring(0, 300)}`);
-      }
-
-      const data = await resp.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) throw new Error(`${provider.name} returned no content`);
-
-      const parsed = JSON.parse(content);
-
-      // Merge LLM output back into fusion candidates
-      const mergedFindings = promotedCandidates.map((candidate, i) => {
-        const llmFinding = parsed.findings?.[i] || {};
-        return buildStructuredFinding(candidate, llmFinding, analysisResults);
-      });
-
-      // Log first finding so we can verify LLM output quality in Vercel logs
-      if (mergedFindings.length > 0) {
-        const sample = mergedFindings[0];
-        console.log(`[monitor-check] Sample finding: "${sample.title}" | fact: ${(sample.fact_line || '').substring(0, 160)} | uncertainty: ${(sample.uncertainty || '').substring(0, 120)} | watch_next: ${JSON.stringify(sample.watch_next)}`);
-      }
-      console.log(`[monitor-check] ${provider.name} summarized ${mergedFindings.length} candidates`);
-      return { findings: mergedFindings, provider: provider.name };
-    } catch (err) {
-      const errMsg = `${provider.name}: ${(err.message || String(err)).substring(0, 200)}`;
-      console.error(`[monitor-check] ${errMsg}`);
-      llmErrors.push(errMsg);
-    }
-  }
-
-  console.error('[monitor-check] All LLM providers failed for summarization');
-  return { findings: null, errors: llmErrors };
-}
-
-
-
-// ---------------------------------------------------------------------------
-// Source health tracking — intelligence gap reporting
-// ---------------------------------------------------------------------------
-
-/**
- * Track per-source health across cycles in Redis.
- * Stores a hash map: sourceId -> { status, lastSuccessAt, lastNonEmptyAt, ... }.
- * TTL: 24 hours (for daily digest).
- */
-async function updateSourceHealth(redisUrl, redisToken, sourceAssessments) {
-  if (!redisUrl || !redisToken) return {};
-
-  try {
-    // Load existing health data
-    const resp = await fetch(`${redisUrl}/get/monitor:source-health`, {
-      headers: { Authorization: `Bearer ${redisToken}` },
-      signal: AbortSignal.timeout(2000),
-    });
-    let existing = {};
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.result) existing = JSON.parse(data.result);
-    }
-
-    const merged = mergeSourceHealth(existing, sourceAssessments, Date.now());
-
-    // Store with 24h TTL
-    await redisSet(redisUrl, redisToken, 'monitor:source-health', JSON.stringify(merged), 86400);
-    return merged;
-  } catch {
-    // Non-critical — don't block the cycle
-    return {};
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Digest cache — bounded daily cache for the daily digest
-// ---------------------------------------------------------------------------
-
-/**
- * Save cycle data to a per-day digest cache key for the daily digest to read.
- * Bounded: top 20 alerts, top 50 entities, latest source health.
- * TTL: 48h (timezone edge safety).
- */
-async function updateDigestCache(redisUrl, redisToken, promotedCandidates, allCandidates, currentSourceHealth, cycleTs, mcpEnrichment = {}) {
-  if (!redisUrl || !redisToken) return;
-
-  try {
-    const dateStr = new Date(cycleTs).toISOString().slice(0, 10); // YYYY-MM-DD
-    const cacheKey = `monitor:digest-cache:${dateStr}`;
-    const DIGEST_CACHE_TTL = 172800; // 48h
-
-    // Load existing cache for today (if any)
-    let existing = { topAlerts: [], entityCounts: {}, sourceHealth: null, mcpSignals: [] };
-    try {
-      const resp = await fetch(`${redisUrl}/get/${encodeURIComponent(cacheKey)}`, {
-        headers: { Authorization: `Bearer ${redisToken}` },
-        signal: AbortSignal.timeout(2000),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.result) existing = JSON.parse(data.result);
-      }
-    } catch {
-      // Start fresh if cache is corrupted
-    }
-
-    // Append promoted candidates to topAlerts (capped at 20, sorted by confidence)
-    const newAlerts = promotedCandidates.map(c => ({
-      entities: c.entities.slice(0, 5),
-      severity: c.severity,
-      confidence: c.confidence,
-      sourceCount: new Set(c.records.map(r => r.sourceId)).size,
-      sourceTypes: [...new Set(c.records.map(r => r.sourceId.split(':')[0]))],
-      ts: cycleTs,
-    }));
-    const allAlerts = [...(existing.topAlerts || []), ...newAlerts]
-      .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, 20);
-
-    // Accumulate entity counts (top 50 by frequency)
-    const entityCounts = { ...(existing.entityCounts || {}) };
-    for (const candidate of allCandidates) {
-      for (const entity of candidate.entities) {
-        entityCounts[entity] = (entityCounts[entity] || 0) + 1;
-      }
-    }
-    // Keep only top 50 entities
-    const sortedEntities = Object.entries(entityCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 50);
-    const trimmedEntityCounts = Object.fromEntries(sortedEntities);
-
-    // Latest source health (overwritten each cycle, not accumulated)
-    const cache = {
-      topAlerts: allAlerts,
-      entityCounts: trimmedEntityCounts,
-      sourceHealth: currentSourceHealth,
-      mcpSignals: Array.isArray(mcpEnrichment?.highlights)
-        ? [...new Set([...(existing.mcpSignals || []), ...mcpEnrichment.highlights])].slice(-10)
-        : (existing.mcpSignals || []),
-      lastCycleTs: cycleTs,
-    };
-
-    await redisSet(redisUrl, redisToken, cacheKey, JSON.stringify(cache), DIGEST_CACHE_TTL);
-  } catch (err) {
-    console.error('[monitor-check] Failed to update digest cache:', err.message);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Utilities
