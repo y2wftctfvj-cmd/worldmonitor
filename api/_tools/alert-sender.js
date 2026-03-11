@@ -102,6 +102,8 @@ const SOURCE_DISPLAY_NAMES = {
   'mcp:polymarket': 'Polymarket',
   'mcp:maritime': 'Maritime',
   'mcp:wikidata': 'WikiData',
+  acled: 'ACLED',
+  'mcp:acled': 'ACLED',
   'multi-cycle analysis': 'Multi-cycle analysis',
 };
 

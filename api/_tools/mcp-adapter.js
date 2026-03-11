@@ -2,6 +2,7 @@ import { extractEntities } from './entity-dictionary.js';
 import { formatSourceName } from './alert-sender.js';
 import { normalizeEntity } from './event-ledger.js';
 import { redisSet } from './redis-helpers.js';
+import { directInvoke, hasDirectHandler } from './direct-enrichment.js';
 
 const DEFAULT_TIMEOUT_MS = 1500;
 const DEFAULT_BREAKER_OPEN_MS = 5 * 60 * 1000;
@@ -73,6 +74,11 @@ const MCP_TOOL_MAP = {
     server: 'wikidata',
     tool: 'entity_lookup',
     defaultArgs: { language: 'en' },
+  },
+  acled_events: {
+    server: 'acled',
+    tool: 'acled_events',
+    defaultArgs: { days_back: '7', limit: '30' },
   },
 };
 
@@ -424,6 +430,40 @@ function normalizeMaritimeVessels(vessels) {
   return records;
 }
 
+function normalizeAcledEvents(events) {
+  if (!Array.isArray(events)) return [];
+  const records = [];
+  for (const event of events) {
+    const type = event?.event_type || 'Unknown';
+    const subType = event?.sub_event_type ? ` (${event.sub_event_type})` : '';
+    const location = [event?.location, event?.admin1, event?.country].filter(Boolean).join(', ');
+    const fatalities = event?.fatalities > 0 ? ` — ${event.fatalities} fatalities` : '';
+    const actors = [event?.actor1, event?.actor2].filter(Boolean).join(' vs ');
+    const text = `${type}${subType}: ${actors || 'Unknown actors'} in ${location || 'Unknown location'}${fatalities}`;
+    const record = buildRecord(
+      'acled',
+      'domain',
+      text,
+      event?.event_date ? new Date(event.event_date).toISOString() : new Date().toISOString(),
+      {
+        eventType: type,
+        subEventType: event?.sub_event_type || '',
+        actor1: event?.actor1 || '',
+        actor2: event?.actor2 || '',
+        country: event?.country || '',
+        location: location,
+        fatalities: event?.fatalities || 0,
+        notes: event?.notes || '',
+        source: event?.source || '',
+        origin: 'direct',
+        mcpTool: 'acled_events',
+      },
+    );
+    if (record) records.push(record);
+  }
+  return records;
+}
+
 function normalizeMcpResult(toolKey, result) {
   const payload = extractPayload(result);
 
@@ -457,6 +497,9 @@ function normalizeMcpResult(toolKey, result) {
   if (toolKey === 'entity_lookup') {
     // WikiData returns enrichment context, not signal records — pass through raw
     return [];
+  }
+  if (toolKey === 'acled_events') {
+    return normalizeAcledEvents(payload?.events || []);
   }
   return [];
 }
@@ -515,6 +558,44 @@ function buildAssessment(status, sampleSize, reason = '') {
   return { status: 'failed', sampleSize: 0, reason: reason || 'request_failed' };
 }
 
+/**
+ * Direct API fallback — calls source APIs directly when MCP gateway is unavailable.
+ * Returns the same shape as a successful gateway call so callers don't need to change.
+ */
+async function directFallback(toolKey, mergedArgs) {
+  try {
+    const raw = await directInvoke(toolKey, mergedArgs);
+    if (!raw) {
+      return {
+        ok: false,
+        status: 'degraded',
+        reason: 'direct_no_result',
+        assessment: buildAssessment('degraded', 0, 'direct_no_result'),
+        observations: [],
+      };
+    }
+    const observations = normalizeMcpResult(toolKey, raw);
+    return {
+      ok: true,
+      status: observations.length > 0 ? 'ok' : 'degraded',
+      reason: observations.length > 0 ? '' : 'no_items',
+      observations,
+      raw,
+      assessment: observations.length > 0
+        ? buildAssessment('ok', observations.length)
+        : buildAssessment('degraded', 0, 'no_items'),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 'degraded',
+      reason: 'direct_error',
+      assessment: buildAssessment('degraded', 0, 'direct_error'),
+      observations: [],
+    };
+  }
+}
+
 export async function invokeMcpTool(toolKey, args = {}, options = {}) {
   const definition = MCP_TOOL_MAP[toolKey];
   if (!definition) {
@@ -529,6 +610,10 @@ export async function invokeMcpTool(toolKey, args = {}, options = {}) {
 
   const gateway = getGatewayConfig();
   if (!gateway.enabled || !isToolEnabled(toolKey)) {
+    // No MCP gateway — fall back to direct API calls if a handler exists
+    if (hasDirectHandler(toolKey)) {
+      return directFallback(toolKey, { ...definition.defaultArgs, ...(args || {}) });
+    }
     return {
       ok: false,
       status: 'disabled',
@@ -603,6 +688,13 @@ export async function invokeMcpTool(toolKey, args = {}, options = {}) {
       ? 'timeout'
       : 'request_failed';
     await recordBreakerFailure(toolKey, reason, options.redisUrl, options.redisToken);
+
+    // Gateway failed — try direct API fallback before giving up
+    if (hasDirectHandler(toolKey)) {
+      const mergedArgs = { ...definition.defaultArgs, ...(args || {}) };
+      return directFallback(toolKey, mergedArgs);
+    }
+
     return {
       ok: false,
       status: reason === 'timeout' ? 'degraded' : 'failed',
@@ -672,11 +764,7 @@ export async function enrichCandidatesWithMcp(candidates, options = {}) {
     return { candidates: [], sourceAssessments: {}, highlights: [] };
   }
 
-  const gateway = getGatewayConfig();
-  if (!gateway.enabled) {
-    return { candidates, sourceAssessments: {}, highlights: [] };
-  }
-
+  // Enrichment works with MCP gateway OR direct API fallback — no gateway check needed
   const candidateLimit = Math.min(Number.parseInt(String(options.limit || 2), 10) || 2, candidates.length);
   const toolKeys = ['reddit_search', 'reddit_historical_search', 'news_gdelt_search'];
   const enriched = [...candidates];
@@ -695,8 +783,8 @@ export async function enrichCandidatesWithMcp(candidates, options = {}) {
       return result;
     }));
 
-    // Extended enrichment: sanctions, predictions, entity context (run in parallel)
-    const extendedKeys = ['sanctions_search', 'predictions_search', 'entity_lookup'];
+    // Extended enrichment: sanctions, predictions, entity context, conflict events
+    const extendedKeys = ['sanctions_search', 'predictions_search', 'entity_lookup', 'acled_events'];
     const extendedInvocations = await Promise.all(extendedKeys.map(async (toolKey) => {
       const toolArgs = buildToolArgs(toolKey, query);
       const result = await invokeMcpTool(toolKey, toolArgs, options);
@@ -722,14 +810,22 @@ export async function enrichCandidatesWithMcp(candidates, options = {}) {
       mcpMeta.marketProbability = topPrediction?.probability ?? null;
     }
     if (entityResult?.ok && entityResult.raw?.result) {
-      const entityPayload = extractPayload(entityResult.raw.result || {});
+      const entityPayload = extractPayload(entityResult.raw.result || entityResult.raw || {});
       if (entityPayload?.found) {
         mcpMeta.entityContext = {
           label: entityPayload.label,
           description: entityPayload.description,
-          summary: (entityPayload.wikipedia_summary || '').slice(0, 300),
+          summary: (entityPayload.summary || entityPayload.wikipedia_summary || '').slice(0, 300),
         };
       }
+    }
+
+    // ACLED conflict events
+    const acledResult = extendedInvocations.find(r => r.toolKey === 'acled_events');
+    if (acledResult?.ok && acledResult.observations.length > 0) {
+      mcpMeta.conflictEvents = acledResult.observations.length;
+      const topEvent = acledResult.observations[0];
+      mcpMeta.conflictSummary = topEvent?.text || '';
     }
 
     if (observations.length === 0 && Object.keys(mcpMeta).length === 0) return;
@@ -788,6 +884,10 @@ function buildToolArgs(toolKey, query) {
   }
   if (toolKey === 'entity_lookup') {
     return { query, language: 'en' };
+  }
+  if (toolKey === 'acled_events') {
+    // Extract country from query for targeted ACLED search
+    return { country: query.split(/\s+AND\s+/i)[0], days_back: '7', limit: '20' };
   }
   return { query, response_format: 'json' };
 }
@@ -875,6 +975,12 @@ export async function lookupMcpEntity(query, options = {}) {
   return payload?.found ? payload : null;
 }
 
+/**
+ * Returns true if enrichment is available — either via MCP gateway OR direct API fallback.
+ * Direct fallback covers all core enrichment tools (Reddit, GDELT, sanctions, predictions,
+ * earthquakes, flights, entity lookup) without requiring the gateway infrastructure.
+ */
 export function gatewayConfigured() {
-  return getGatewayConfig().enabled;
+  // Always true — direct enrichment fallback handles gateway-less deployments
+  return true;
 }

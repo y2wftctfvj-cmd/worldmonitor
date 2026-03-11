@@ -76,7 +76,8 @@ export async function summarizeCandidates(promotedCandidates, developingItems, o
     if (c.mcp?.sanctionsMatch) mcpLines.push('OFAC SANCTIONS MATCH: Entity appears on US Treasury SDN list');
     if (c.mcp?.marketProbability != null) mcpLines.push(`PREDICTION MARKET: ${c.mcp.marketProbability}% probability`);
     if (c.mcp?.entityContext?.summary) mcpLines.push(`ENTITY CONTEXT: ${c.mcp.entityContext.description} — ${c.mcp.entityContext.summary.substring(0, 200)}`);
-    const mcpSection = mcpLines.length > 0 ? `MCP intelligence:\n${mcpLines.map(l => `  - ${l}`).join('\n')}\n` : '';
+    if (c.mcp?.conflictEvents > 0) mcpLines.push(`ACLED CONFLICT DATA: ${c.mcp.conflictEvents} recent events. Latest: ${c.mcp.conflictSummary || 'N/A'}`);
+    const mcpSection = mcpLines.length > 0 ? `Intelligence enrichment:\n${mcpLines.map(l => `  - ${l}`).join('\n')}\n` : '';
 
     return `EVENT ${i + 1} (severity: ${c.severity}, confidence: ${c.confidence}, entities: ${c.entities.join(', ')}):
 Sources: ${sources.join(', ')}

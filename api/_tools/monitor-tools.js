@@ -249,6 +249,22 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'search_conflict_events',
+      description: 'Search ACLED armed conflict events database — battles, explosions, violence, protests. The gold standard for conflict data.',
+      parameters: {
+        type: 'object',
+        properties: {
+          country: { type: 'string', description: 'Country name (e.g., "Syria", "Ukraine", "Ethiopia")' },
+          region: { type: 'string', description: 'Region name (e.g., "Middle East", "Eastern Europe")' },
+          days_back: { type: 'number', description: 'Days to look back (default: 7, max: 30)' },
+        },
+        required: [],
+      },
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -285,6 +301,8 @@ export async function runTool(toolName, args) {
       return await toolSearchPredictionsMarket(args.query);
     case 'track_maritime':
       return await toolTrackMaritime(args.region, args.port);
+    case 'search_conflict_events':
+      return await toolSearchConflictEvents(args.country, args.region, args.days_back);
     default:
       return `Unknown tool: ${toolName}`;
   }
@@ -511,7 +529,6 @@ async function toolSearchEarthquakes(region, minMagnitude, daysBack) {
 }
 
 async function toolTrackFlights(region, militaryOnly) {
-  if (!mcpGatewayConfigured()) return 'Flight tracking requires MCP gateway. ADS-B data unavailable.';
 
   const regionKey = (region || 'middle east').toLowerCase();
   const useMilitary = militaryOnly !== false;
@@ -581,7 +598,6 @@ async function toolSearchPredictionsMarket(query) {
 }
 
 async function toolTrackMaritime(region, port) {
-  if (!mcpGatewayConfigured()) return 'Maritime tracking requires MCP gateway. Vessel data unavailable.';
 
   if (port) {
     const mcp = await invokeMcpTool('maritime_port_activity', { port_name: port }, { timeoutMs: 5000 });
@@ -609,4 +625,26 @@ async function toolTrackMaritime(region, port) {
   }
 
   return 'Specify a region or port to track maritime activity.';
+}
+
+async function toolSearchConflictEvents(country, region, daysBack) {
+  const args = {};
+  if (country) args.country = country;
+  if (region) args.region = region;
+  if (daysBack) args.days_back = Math.min(Number(daysBack) || 7, 30);
+
+  const mcp = await invokeMcpTool('acled_events', args, { timeoutMs: 5000 });
+
+  if (!mcp.ok) {
+    if (mcp.reason === 'direct_no_result') {
+      return 'ACLED conflict data unavailable — ACLED_ACCESS_TOKEN not configured.';
+    }
+    return `Conflict event search failed: ${mcp.reason}`;
+  }
+  if (mcp.observations.length === 0) {
+    return `No conflict events found${country ? ` in ${country}` : ''}${region ? ` (${region})` : ''} in the last ${daysBack || 7} days.`;
+  }
+
+  const label = country || region || 'global';
+  return formatMcpObservationSection(`CONFLICT EVENTS: ${label}`, mcp.observations, 15) || 'No results.';
 }

@@ -71,6 +71,7 @@ const SOURCE_MAP = {
   ofacMcp:         'wire',           // OFAC SDN sanctions list — US Treasury official
   polymarketMcp:   'domain',         // Polymarket prediction market probabilities
   maritime:        'domain',         // Datalastic vessel tracking data
+  acled:           'osint_verified', // ACLED conflict event data — academic research standard
 };
 
 /**
