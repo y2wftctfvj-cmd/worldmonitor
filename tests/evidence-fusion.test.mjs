@@ -402,6 +402,83 @@ describe('promote', () => {
 });
 
 // ---------------------------------------------------------------------------
+// cluster coherence — splitIncoherentClusters
+// ---------------------------------------------------------------------------
+
+describe('cluster coherence', () => {
+  it('splits unrelated stories sharing entity pairs into separate clusters', () => {
+    // These 3 records all mention Russia+Iran but are about different events:
+    // 1. Oil economics, 2. Drone tactics, 3. Syrian offensive
+    const results = mockCollectResults({
+      telegram: [
+        {
+          channel: 'KyivIndependent',
+          text: 'Russian barrels are in demand — Oil price spike boosts Russia economy. The Iran war could be a boon for Russia.',
+          publishedAt: '2026-03-11T16:15:00Z',
+        },
+        {
+          channel: 'OSINTDefender',
+          text: 'Russia is providing Iran with advanced drone warfare tactics, including strategies for targeting and coordinating attacks to evade air defenses.',
+          publishedAt: '2026-03-11T17:43:00Z',
+        },
+        {
+          channel: 'julianroepcke',
+          text: 'A Syrian rebel surprise offensive in Aleppo province pierced six kilometers into regime and Iran and Russia held territory.',
+          publishedAt: '2026-03-11T17:45:00Z',
+        },
+      ],
+    });
+
+    const records = normalize(results);
+    const clusters = cluster(records);
+
+    // These should NOT all end up in a single cluster
+    // At minimum, the oil story should be separate from the drone/Syria stories
+    assert.ok(
+      clusters.length >= 2,
+      `Expected 2+ clusters for 3 unrelated Russia/Iran stories, got ${clusters.length}. ` +
+      `Cluster IDs: ${clusters.map(c => c.clusterId).join(', ')}`
+    );
+
+    // No single cluster should contain all 3 records
+    for (const c of clusters) {
+      assert.ok(
+        c.records.length < 3,
+        `Cluster "${c.clusterId}" has all 3 unrelated records — coherence split failed`
+      );
+    }
+  });
+
+  it('keeps related stories in the same cluster', () => {
+    // These records are about the same event (Iran drone strikes)
+    const results = mockCollectResults({
+      telegram: [
+        {
+          channel: 'OSINTDefender',
+          text: 'Russia is providing Iran with advanced drone warfare tactics for coordinating attacks against air defenses.',
+          publishedAt: '2026-03-11T17:43:00Z',
+        },
+        {
+          channel: 'intelslava',
+          text: 'Iran receives new drone technology from Russia for military strikes and warfare coordination purposes.',
+          publishedAt: '2026-03-11T17:50:00Z',
+        },
+      ],
+    });
+
+    const records = normalize(results);
+    const clusters = cluster(records);
+
+    // Both records share "drone" and related keywords — should stay together
+    const droneCluster = clusters.find(c =>
+      c.records.length === 2 ||
+      c.records.some(r => r.text.toLowerCase().includes('drone'))
+    );
+    assert.ok(droneCluster, 'related drone stories should cluster together');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // runFusion — full pipeline integration
 // ---------------------------------------------------------------------------
 

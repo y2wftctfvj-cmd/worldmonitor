@@ -277,9 +277,15 @@ export function cluster(records) {
   // Pass 1: merge clusters that share >50% of records
   const recordMerged = mergeOverlappingClusters(clusterMap);
 
-  // Pass 2: merge clusters that share entities (Jaccard >= 0.35)
+  // Pass 2: split clusters where records share zero content keywords.
+  // Prevents "Russia+Iran oil story" from merging with "Russia+Iran drone story"
+  // just because they share entity names.
+  const coherent = splitIncoherentClusters(recordMerged);
+
+  // Pass 3: merge clusters that share entities (Jaccard >= 0.5)
   // This catches "Iran+Khamenei" + "Iran+Israel" + "Iran+Netanyahu" = one event
-  const merged = mergeByEntityOverlap(recordMerged);
+  // Tighter than before (was 0.35) to avoid merging unrelated stories.
+  const merged = mergeByEntityOverlap(coherent);
 
   // Convert to EventCandidate shape with empty scores
   return merged.map(({ clusterId, entities, records: clusterRecords }) => ({
@@ -593,6 +599,125 @@ function addToCluster(clusterMap, key, entities, record) {
 }
 
 /**
+ * Extract significant keywords from text, excluding entity names and stopwords.
+ * Used to check whether records in the same cluster are about the same event.
+ *
+ * @param {string} text - Record text
+ * @param {string[]} entityNames - Entity names to exclude (e.g., ["Russia", "Iran"])
+ * @returns {Set<string>} Significant lowercase keywords (5+ chars)
+ */
+const STOPWORDS = new Set([
+  'about', 'after', 'again', 'against', 'along', 'could', 'would', 'should',
+  'every', 'first', 'found', 'great', 'still', 'their', 'there', 'these',
+  'think', 'those', 'three', 'today', 'under', 'until', 'using', 'where',
+  'which', 'while', 'world', 'years', 'being', 'doing', 'going', 'other',
+  'since', 'through', 'during', 'before', 'between', 'people', 'makes',
+  'based', 'according', 'report', 'reports', 'reported', 'source', 'sources',
+  'including', 'according',
+]);
+
+function getSignificantKeywords(text, entityNames) {
+  // Build set of entity words to exclude (e.g., "South Korea" → "south", "korea")
+  const entityWords = new Set(
+    entityNames.flatMap(e => e.toLowerCase().split(/\s+/))
+  );
+
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 5 && !STOPWORDS.has(w) && !entityWords.has(w))
+  );
+}
+
+/**
+ * Split clusters where records share no significant content keywords.
+ *
+ * After entity-pair clustering, a cluster like "Iran+Russia" may contain
+ * records about completely different events (oil economics, drone tactics,
+ * Syrian offensive). This function checks keyword overlap and splits
+ * incoherent clusters into sub-clusters.
+ *
+ * @param {Array<{clusterId, entities, records}>} clusters
+ * @returns {Array<{clusterId, entities, records}>}
+ */
+function splitIncoherentClusters(clusters) {
+  const result = [];
+
+  for (const cluster of clusters) {
+    // Clusters with 0-1 records don't need splitting
+    if (cluster.records.length <= 1) {
+      result.push(cluster);
+      continue;
+    }
+
+    // Extract keywords for each record (cache for reuse)
+    const recordKeywords = cluster.records.map(r =>
+      getSignificantKeywords(r.text, cluster.entities)
+    );
+
+    // Greedy grouping: place each record into the first group it overlaps with
+    const groups = []; // Array of { indices: number[] }
+
+    for (let i = 0; i < cluster.records.length; i++) {
+      const keywords = recordKeywords[i];
+      let placed = false;
+
+      // Records with no significant keywords (very short text) — put in first group
+      if (keywords.size === 0) {
+        if (groups.length === 0) groups.push({ indices: [] });
+        groups[0].indices.push(i);
+        placed = true;
+        continue;
+      }
+
+      for (const group of groups) {
+        // Check keyword overlap with any record already in this group
+        for (const existingIdx of group.indices) {
+          const existingKw = recordKeywords[existingIdx];
+          let overlap = 0;
+          for (const kw of keywords) {
+            if (existingKw.has(kw)) {
+              overlap++;
+              if (overlap >= 1) break; // One shared keyword is enough
+            }
+          }
+          if (overlap >= 1) {
+            group.indices.push(i);
+            placed = true;
+            break;
+          }
+        }
+        if (placed) break;
+      }
+
+      if (!placed) {
+        groups.push({ indices: [i] });
+      }
+    }
+
+    // If all records ended up in one group, keep cluster as-is
+    if (groups.length <= 1) {
+      result.push(cluster);
+    } else {
+      // Split into sub-clusters
+      for (let g = 0; g < groups.length; g++) {
+        const groupRecords = groups[g].indices.map(i => cluster.records[i]);
+        const subEntities = [...new Set(groupRecords.flatMap(r => r.entities))];
+        result.push({
+          clusterId: g === 0 ? cluster.clusterId : `${cluster.clusterId}~${g}`,
+          entities: subEntities,
+          records: groupRecords,
+        });
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Merge clusters that share records (de-overlap).
  * If two clusters share >50% of records, merge them.
  */
@@ -647,12 +772,35 @@ function mergeOverlappingClusters(clusterMap) {
 }
 
 /**
- * Merge clusters whose entity sets overlap significantly (Jaccard >= 0.35).
+ * Check if two sets of records share at least one content keyword.
+ * Prevents re-merging clusters that were split for incoherence.
+ */
+function checkKeywordBridge(recordsA, recordsB, allEntityNames) {
+  const entityNames = [...new Set(allEntityNames)];
+  const keywordsA = new Set();
+  for (const r of recordsA) {
+    for (const kw of getSignificantKeywords(r.text, entityNames)) {
+      keywordsA.add(kw);
+    }
+  }
+  for (const r of recordsB) {
+    for (const kw of getSignificantKeywords(r.text, entityNames)) {
+      if (keywordsA.has(kw)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Merge clusters whose entity sets overlap significantly (Jaccard >= 0.5).
  *
  * Solves the "same event, different clusters" problem:
  *   Iran+Khamenei, Iran+Israel, Iran+Netanyahu → all about the same crisis.
- *   They share "Iran" — Jaccard("Iran,Khamenei", "Iran,Israel") = 1/3 ≈ 0.33
- *   but with 3+ entity overlap it's clearly the same story.
+ *   They share "Iran" and their records share content keywords.
+ *
+ * Tighter than before (was Jaccard >= 0.35, single entity absorption).
+ * Now requires Jaccard >= 0.5, or 2+ shared entities with keyword bridge.
+ * This prevents merging unrelated stories that happen to mention the same country.
  *
  * Uses a greedy merge: largest clusters absorb smaller ones first.
  */
@@ -682,12 +830,19 @@ function mergeByEntityOverlap(clusters) {
       const union = new Set([...currentSet, ...otherSet]).size;
       const jaccard = union > 0 ? intersection / union : 0;
 
-      // Merge if entities overlap enough. Two thresholds:
-      //   Standard: Jaccard >= 0.35
-      //   Absorption: small cluster shares an entity with a cluster 5x bigger
+      // Merge if entities overlap enough AND records share content keywords.
+      // The keyword bridge check prevents merging unrelated stories that happen
+      // to mention the same countries (e.g., "Russia oil economics" vs "Russia drone tactics").
+      //
+      // Two entity thresholds:
+      //   Standard: Jaccard >= 0.5 (requires majority entity overlap)
+      //   Absorption: 2+ shared entities with a cluster 5x bigger
+      // Both require at least one shared content keyword between records.
       const sizeRatio = current.records.length / Math.max(other.records.length, 1);
-      const sharesEntity = intersection > 0;
-      const shouldMerge = jaccard >= 0.35 || (sharesEntity && sizeRatio >= 5);
+      const allEntityNames = [...new Set([...currentSet, ...otherSet])];
+      const keywordBridge = intersection > 0 && checkKeywordBridge(current.records, other.records, allEntityNames);
+      const hasStrongEntityOverlap = intersection >= 2;
+      const shouldMerge = keywordBridge && (jaccard >= 0.5 || (hasStrongEntityOverlap && sizeRatio >= 5));
 
       if (shouldMerge) {
         // Merge: combine records (dedup by ID) and entities
